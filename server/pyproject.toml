@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+# 以 server/ 为导入根目录，使 tests 能与生产启动命令一样导入 app 包。
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["app"]

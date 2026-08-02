@@ -1,0 +1,2 @@
+This harmless fixture is intentionally not a real video stream.
+It exists only to verify the V1 browser multipart upload route before media validation is introduced.

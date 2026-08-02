@@ -1,0 +1,14 @@
+# 运行时配置和密钥不得提交。
+.env
+infra/compose.env
+infra/backend.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+server/data/
+server/tests/.runtime/
+web/node_modules/
+web/dist/
+*.sqlite3
+.DS_Store

@@ -1,0 +1,12 @@
+# 不把开发缓存、测试素材、密钥或本地数据打进 API/Worker 镜像。
+.git
+.env
+.venv
+**/__pycache__
+**/.pytest_cache
+server/data
+server/tests
+web/node_modules
+web/dist
+*.sqlite3
+.DS_Store

@@ -1,0 +1,151 @@
+# 本编排用于接近生产的本机验收：独立 API、RQ Worker、迁移任务、PostgreSQL、Redis
+# 与 MinIO 都各自运行。不要把此文件中的开发密码直接用于生产环境。
+name: ai-drama-workflow
+
+x-backend-environment: &backend-environment
+  DATABASE_URL: postgresql+psycopg://ai_drama:${POSTGRES_PASSWORD:-change-me-in-local-env}@postgres:5432/ai_drama
+  DATABASE_SCHEMA_MODE: migrate
+  TASK_EXECUTION_MODE: rq
+  REDIS_URL: redis://redis:6379/0
+  RQ_QUEUE_NAME: ai_drama
+  LOCAL_STORAGE_PATH: /var/lib/ai-drama/assets
+  SOURCE_VIDEO_STORAGE_MODE: local
+  GENERATED_IMAGE_DELIVERY_MODE: direct
+  FINAL_VIDEO_DELIVERY_MODE: local
+  CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+  MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-524288000}
+  WORKER_JOB_TIMEOUT_SECONDS: ${WORKER_JOB_TIMEOUT_SECONDS:-1800}
+  WORKFLOW_STALE_AFTER_SECONDS: ${WORKFLOW_STALE_AFTER_SECONDS:-2100}
+
+x-backend-common: &backend-common
+  build:
+    context: .
+    dockerfile: server/Dockerfile
+  image: ai-drama-workflow-server:local
+  # 此文件只在操作者从示例复制后出现，可放模型 Key、S3 凭据等运行时密钥。
+  env_file:
+    - ./infra/backend.env
+  environment: *backend-environment
+  volumes:
+    # API 与 Worker 必须共享本地素材目录；正式多机部署应改为 SOURCE_VIDEO_STORAGE_MODE=s3。
+    - media_data:/var/lib/ai-drama/assets
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ai_drama
+      POSTGRES_USER: ai_drama
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-in-local-env}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ai_drama -d ai_drama"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-me-in-local-env}
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio_data:/data
+
+  # 仅创建本地演示 Bucket；该 HTTP MinIO 地址不能当作真实图生视频的公网首帧来源。
+  minio-create-bucket:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_started
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-me-in-local-env}
+      S3_BUCKET: ${S3_BUCKET:-ai-drama-media}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        until mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"; do sleep 1; done
+        mc mb --ignore-existing "local/$${S3_BUCKET}"
+    restart: "no"
+
+  # 迁移是一次性发布步骤。API/Worker 都依赖它成功，避免服务进程争抢数据库 DDL。
+  migrate:
+    <<: *backend-common
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *backend-common
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/ready', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  worker:
+    <<: *backend-common
+    command: ["rq", "worker", "--url", "redis://redis:6379/0", "ai_drama"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  # Vue 构建产物通过 Nginx 提供，并把浏览器的 /api 请求同源代理到 API 容器。
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    image: ai-drama-workflow-web:local
+    ports:
+      - "127.0.0.1:5173:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  media_data:

@@ -1,0 +1,22 @@
+# Web API 与请求校验
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+python-multipart>=0.0.9,<1.0
+python-dotenv>=1.0,<2.0
+
+# 数据持久化；PostgreSQL 驱动仅在生产 DATABASE_URL 指向 PostgreSQL 时使用。
+SQLAlchemy>=2.0,<3.0
+psycopg[binary]>=3.2,<4.0
+
+# 数据库版本迁移。生产部署先执行 `alembic upgrade head`，再启动 API/Worker。
+alembic>=1.14,<2.0
+
+# 生产对象存储适配。只在 GENERATED_IMAGE_DELIVERY_MODE=s3 时由服务端按需导入。
+boto3>=1.35,<2.0
+
+# Redis/RQ 独立 Worker。仅在 TASK_EXECUTION_MODE=rq 时由 API 与 Worker 使用。
+rq>=2.0,<3.0
+
+# 测试依赖
+pytest>=8.0,<9.0
+httpx>=0.27,<1.0

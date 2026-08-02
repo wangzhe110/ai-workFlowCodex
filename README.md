@@ -26,7 +26,7 @@
 3. 启动 API：`uvicorn app.main:app --reload --port 8000`。
 4. 在 `web/` 安装依赖后执行 `npm run dev`。
 
-开发模式使用进程内 Worker 以降低首次启动门槛；生产环境可设置 `TASK_EXECUTION_MODE=rq`，由 Redis/RQ 独立 Worker 消费任务。生产发布还须设置 `DATABASE_SCHEMA_MODE=migrate`，先运行 `cd server && alembic upgrade head`，再启动 API/Worker。若要在一台电脑先验收完整前端、独立 API、Worker、PostgreSQL、Redis 与 MinIO，可将 `infra/compose.env.example`、`infra/backend.env.example` 各复制为不提交的同名无 `.example` 文件，再执行 `docker compose --env-file infra/compose.env up --build`，然后打开 `http://127.0.0.1:5173`。详细规则见 `infra/README.md`、`docs/Redis_RQ_Worker部署说明.md` 和 `server/migrations/README.md`。
+开发模式使用进程内 Worker 以降低首次启动门槛；生产环境可设置 `TASK_EXECUTION_MODE=rq`，由 Redis/RQ 独立 Worker 消费任务。生产发布还须设置 `DATABASE_SCHEMA_MODE=migrate`，先运行 `cd server && alembic upgrade head`，再启动 API/Worker。若要在一台电脑先验收完整前端、独立 API、Worker、PostgreSQL、Redis 与 MinIO，可将 `infra/compose.env.example`、`infra/backend.env.example` 各复制为不提交的同名无 `.example` 文件，再执行 `docker compose --env-file infra/compose.env up --build`，然后打开 `http://127.0.0.1:5173`。没有部署经验时，优先按 `docs/部署与模型配置快速指南.md` 操作；它将启动、模型类型、密钥配置、预检和启用步骤串成了一条可执行路径。详细规则见 `infra/README.md`、`docs/Redis_RQ_Worker部署说明.md` 和 `server/migrations/README.md`。
 
 上线前要同时准备数据库和媒体对象的备份。仓库提供本机 Compose 的 PostgreSQL 备份/恢复脚本；媒体对象必须由 S3/MinIO 的版本化与复制策略保护。详见 `docs/运维备份恢复说明.md`。
 

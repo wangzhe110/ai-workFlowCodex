@@ -1,5 +1,11 @@
 <script setup lang="ts">
-/** 模型配置中心：管理每个步骤的候选配置，不接收真实 API Key。 */
+/**
+ * 模型配置中心。
+ *
+ * 这一页优先服务第一次接触模型配置的制作负责人：常用操作只需选择用途、填写模型名，
+ * API 地址、密钥变量名和资源预算均使用安全模板。中转站差异较大的视频参数仍保留在
+ * 折叠的高级设置中，避免普通用户误填并产生付费任务。
+ */
 import { computed, onMounted, ref, watch } from 'vue'
 import ModelEvaluationPanel from '@/components/ModelEvaluationPanel.vue'
 import { useModelProfilesStore } from '@/stores/model-profiles'
@@ -8,7 +14,7 @@ const store = useModelProfilesStore()
 const stepKey = ref('generate_story_package')
 const providerKey = ref('openai_compatible')
 const modelKey = ref('')
-const displayName = ref('云雾 OpenAI 兼容 API')
+const displayName = ref('云雾文本模型')
 const apiBaseUrl = ref('https://yunwu.ai/v1')
 const secretEnvName = ref('YUNWU_API_KEY')
 const timeoutSeconds = ref<number | null>(null)
@@ -38,15 +44,16 @@ const maxPollSeconds = ref(900)
 const activate = ref(false)
 const comparisonStepKey = ref('generate_story_package')
 
+/** 页面只展示中文用途；内部步骤标识仍由程序保存，避免用户接触无意义的英文 Key。 */
 const steps = [
-  ['transcribe_reference_audio', '参考视频语音转写'],
-  ['analyze_reference_mechanisms', '参考视频分析'],
+  ['transcribe_reference_audio', '参考视频里的语音'],
+  ['analyze_reference_mechanisms', '参考视频的画面与爆点规律'],
   ['generate_original_topics', '原创选题'],
-  ['generate_story_package', '故事包'],
+  ['generate_story_package', '故事创作'],
   ['generate_storyboard', '分镜细纲'],
   ['generate_storyboard_images', '分镜图片'],
   ['generate_storyboard_video_groups', '视频片段'],
-  ['assemble_final_video', '完整成片导出'],
+  ['assemble_final_video', '合成完整 MP4'],
 ] as const
 const stepLabels: Record<string, string> = Object.fromEntries(steps)
 const stepName = computed(() => stepLabels[stepKey.value] || stepKey.value)
@@ -56,45 +63,87 @@ const isVisionStep = computed(() => stepKey.value === 'analyze_reference_mechani
 const isTranscriptionStep = computed(() => stepKey.value === 'transcribe_reference_audio')
 const isFinalVideoStep = computed(() => stepKey.value === 'assemble_final_video')
 
-onMounted(() => void store.load())
-watch(stepKey, (nextStep) => {
+/** 根据业务用途给出非技术化的说明，让使用者先理解“为什么需要这个模型”。 */
+const stepHelp = computed(() => {
+  if (isFinalVideoStep.value) {
+    return '这一步不选 AI 模型。系统会把已经生成成功的视频片段按顺序合成为一个 MP4 文件。'
+  }
+  if (isVideoStep.value) {
+    return '这是最容易因不同中转站接口而出错、也可能产生费用的一步。请先让有 API 文档的人填写高级设置，再只生成 1 组镜头测试。'
+  }
+  if (isImageStep.value) {
+    return '填写你在中转站后台看到的图片模型名称。首次测试只生成 1–2 张图片，确认尺寸和风格后再启用。'
+  }
+  if (isVisionStep.value) {
+    return '填写支持“看图片”的视觉模型名称。它只提炼开头钩子、冲突和节奏等抽象规律，不应复述原视频。'
+  }
+  if (isTranscriptionStep.value) {
+    return '填写语音转写模型名称。系统只临时分析参考视频开头的声音，原台词不会保存到页面。'
+  }
+  return '填写支持中文和 JSON 输出的文本模型名称。这个模型负责生成原创内容，不会直接复制参考视频。'
+})
+
+const providerLabels: Record<string, string> = {
+  mock_provider: '本地模拟（不消耗模型额度）',
+  openai_compatible: '文本模型（OpenAI 兼容）',
+  openai_compatible_image: '图片模型（OpenAI 兼容）',
+  openai_compatible_vision: '视觉分析模型（OpenAI 兼容）',
+  openai_compatible_transcription: '语音转写模型（OpenAI 兼容）',
+  configurable_async_video: '异步图生视频模型',
+  ffmpeg_concat: '本地 FFmpeg 合成',
+}
+
+function providerLabel(key: string): string {
+  return providerLabels[key] || key
+}
+
+/**
+ * 选择用途后恢复推荐模板。真实密钥不在这里出现；YUNWU_API_KEY 只是服务器里的变量名。
+ * 切换步骤时清空模型名，防止把文本模型误用于图片或视频步骤。
+ */
+function applyStepTemplate(nextStep: string) {
+  modelKey.value = ''
+  timeoutSeconds.value = null
+  secretEnvName.value = 'YUNWU_API_KEY'
+  apiBaseUrl.value = 'https://yunwu.ai/v1'
+
   if (nextStep === 'transcribe_reference_audio') {
     providerKey.value = 'openai_compatible_transcription'
-    displayName.value = 'OpenAI 兼容语音转写'
-    apiBaseUrl.value = 'https://yunwu.ai/v1'
+    displayName.value = '云雾语音转写模型'
+    return
+  }
+  if (nextStep === 'analyze_reference_mechanisms') {
+    providerKey.value = 'openai_compatible_vision'
+    displayName.value = '云雾视觉分析模型'
+    return
+  }
+  if (nextStep === 'generate_storyboard_images') {
+    providerKey.value = 'openai_compatible_image'
+    displayName.value = '云雾图片模型'
+    return
+  }
+  if (nextStep === 'generate_storyboard_video_groups') {
+    providerKey.value = 'configurable_async_video'
+    displayName.value = '云雾图生视频模型'
+    apiBaseUrl.value = 'https://yunwu.ai'
     return
   }
   if (nextStep === 'assemble_final_video') {
     providerKey.value = 'ffmpeg_concat'
     modelKey.value = 'ffmpeg-concat-v1'
-    displayName.value = 'FFmpeg 完整成片合成'
+    displayName.value = '完整 MP4 合成'
     apiBaseUrl.value = ''
     secretEnvName.value = ''
     return
   }
-  if (nextStep === 'analyze_reference_mechanisms') {
-    providerKey.value = 'openai_compatible_vision'
-    displayName.value = 'OpenAI 兼容视觉视频分析'
-    apiBaseUrl.value = 'https://yunwu.ai/v1'
-    return
-  }
-  if (nextStep === 'generate_storyboard_video_groups') {
-    providerKey.value = 'configurable_async_video'
-    displayName.value = '异步图生视频 API'
-    apiBaseUrl.value = 'https://yunwu.ai'
-    return
-  }
-  if (nextStep === 'generate_storyboard_images') {
-    providerKey.value = 'openai_compatible_image'
-    apiBaseUrl.value = 'https://yunwu.ai/v1'
-    return
-  }
   providerKey.value = 'openai_compatible'
-  displayName.value = '云雾 OpenAI 兼容 API'
-  apiBaseUrl.value = 'https://yunwu.ai/v1'
-})
+  displayName.value = '云雾文本模型'
+}
 
-/** 仅组装非敏感配置；真实密钥只能在服务器环境变量中设置。 */
+onMounted(() => void store.load())
+watch(stepKey, applyStepTemplate)
+
+/** 仅组装非敏感配置；真实密钥只能由服务器读取，永远不进入浏览器。 */
 function providerConfig(): Record<string, unknown> {
   const parseObject = (value: string, label: string): Record<string, unknown> => {
     try {
@@ -102,7 +151,7 @@ function providerConfig(): Record<string, unknown> {
       if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error('not-object')
       return parsed as Record<string, unknown>
     } catch {
-      throw new Error(`${label}必须是合法的 JSON 对象，例如 {"duration":"5s"}`)
+      throw new Error(`${label}格式不正确。若你不确定，请保持系统提供的默认内容并联系有 API 文档的人。`)
     }
   }
   let videoRequestOptions: Record<string, unknown> = {}
@@ -110,11 +159,11 @@ function providerConfig(): Record<string, unknown> {
   let visionRequestOptions: Record<string, unknown> = {}
   let transcriptionRequestOptions: Record<string, unknown> = {}
   if (isVideoStep.value) {
-    videoRequestOptions = parseObject(videoRequestOptionsText.value, '视频固定请求参数')
-    videoResponseMapping = parseObject(videoResponseMappingText.value, '视频响应映射')
+    videoRequestOptions = parseObject(videoRequestOptionsText.value, '视频固定参数')
+    videoResponseMapping = parseObject(videoResponseMappingText.value, '视频返回结果对应关系')
   }
-  if (isVisionStep.value) visionRequestOptions = parseObject(visionRequestOptionsText.value, '视觉模型扩展参数')
-  if (isTranscriptionStep.value) transcriptionRequestOptions = parseObject(transcriptionRequestOptionsText.value, '语音转写扩展参数')
+  if (isVisionStep.value) visionRequestOptions = parseObject(visionRequestOptionsText.value, '视觉模型高级参数')
+  if (isTranscriptionStep.value) transcriptionRequestOptions = parseObject(transcriptionRequestOptionsText.value, '语音转写高级参数')
   return {
     ...(displayName.value.trim() ? { display_name: displayName.value.trim() } : {}),
     ...(apiBaseUrl.value.trim() ? { api_base_url: apiBaseUrl.value.trim() } : {}),
@@ -155,8 +204,8 @@ function providerConfig(): Record<string, unknown> {
 }
 
 async function submit() {
-  if (!providerKey.value.trim() || !modelKey.value.trim()) {
-    store.error = '请填写供应商标识和模型标识'
+  if (!modelKey.value.trim()) {
+    store.error = isFinalVideoStep.value ? '请保留系统自动填写的合成器名称' : '请从中转站后台复制并填写“模型名称”'
     return
   }
   let config: Record<string, unknown>
@@ -174,7 +223,9 @@ async function submit() {
     activate: activate.value,
   })
   if (created) {
-    modelKey.value = ''; timeoutSeconds.value = null; activate.value = false
+    modelKey.value = isFinalVideoStep.value ? 'ffmpeg-concat-v1' : ''
+    timeoutSeconds.value = null
+    activate.value = false
   }
 }
 </script>
@@ -184,121 +235,199 @@ async function submit() {
     <div>
       <RouterLink class="muted" to="/">← 返回项目</RouterLink>
       <h1>模型配置中心</h1>
-      <p>每个生产步骤独立配置和版本化；真实 API Key 永远不填写在这里。</p>
+      <p>只要按用途选择、填模型名称、测试后启用。真实 API Key 不需要、也不能填写在本页。</p>
     </div>
   </section>
 
   <section class="panel stack">
-    <div class="meta-row"><h2>模型实测对比</h2><span>仅比较相同测试场景</span></div>
-    <label class="field">工作流步骤
-      <select v-model="comparisonStepKey">
-        <option v-for="[key, label] in steps" :key="key" :value="key">{{ label }}</option>
-      </select>
-    </label>
-    <button class="button secondary" :disabled="store.comparisonLoading" @click="store.loadComparisons(comparisonStepKey)">
-      {{ store.comparisonLoading ? '读取中…' : '查看此步骤实测对比' }}
-    </button>
-    <p v-if="store.comparisons.length === 0 && !store.comparisonLoading" class="muted">选择步骤后查看已保存的实测记录；不同测试场景会并列显示，不能直接混合比较。</p>
-    <article v-for="record in store.comparisons" :key="record.id" class="panel stack">
-      <div class="meta-row">
-        <strong>{{ record.display_name || record.model_key }} · v{{ record.profile_version }}</strong>
-        <span>质量 {{ record.quality_score }}/100</span>
-      </div>
-      <p>{{ record.scenario }}</p>
-      <small class="muted">
-        {{ record.provider_key }} / {{ record.model_key }} · 成功率 {{ record.success_rate }}% ·
-        平均耗时 {{ record.average_latency_seconds }} 秒 · 单样本 ¥{{ record.average_cost_yuan.toFixed(4) }} ·
-        单成功样本 {{ record.cost_per_success_yuan === null ? '—' : `¥${record.cost_per_success_yuan.toFixed(4)}` }}
-      </small>
-    </article>
+    <h2>第一次配置，只做这 4 件事</h2>
+    <ol class="setup-steps">
+      <li>先由负责人把 API Key 写入服务器的 <code>infra/backend.env</code> 文件。</li>
+      <li>在下方选择要使用的功能，例如“故事创作”。</li>
+      <li>从云雾/中转站后台复制模型名称，粘贴到“模型名称”。</li>
+      <li>保存为候选 → 点击基础预检 → 用小样本测试 → 确认后启用。</li>
+    </ol>
+    <p class="notice info">你不需要理解“供应商标识、JSON、请求路径”等词。除非视频中转站的文档要求，否则保持高级设置默认值即可。</p>
   </section>
 
   <div class="grid">
     <form class="panel stack" @submit.prevent="submit">
-      <h2>新增候选配置</h2>
-      <label class="field">工作流步骤<select v-model="stepKey"><option v-for="[key, label] in steps" :key="key" :value="key">{{ label }}（{{ key }}）</option></select></label>
-      <label class="field">供应商标识<input v-model="providerKey" placeholder="openai_compatible" maxlength="80" /></label>
-      <label class="field">模型标识<input v-model="modelKey" placeholder="例如 video-model-2026" maxlength="160" /></label>
-      <label class="field">显示名称（可选）<input v-model="displayName" placeholder="例如 云雾视频模型" /></label>
-      <label class="field">API 地址（可选）<input v-model="apiBaseUrl" type="url" placeholder="https://…" /></label>
-      <label class="field">密钥环境变量名（可选）<input v-model="secretEnvName" placeholder="例如 YUNWU_API_KEY" /></label>
-      <label class="field">超时秒数（可选）<input v-model.number="timeoutSeconds" type="number" min="1" max="1800" /></label>
-      <label v-if="isImageStep" class="field">图片尺寸（可选）<input v-model="imageSize" placeholder="例如 1728x2304" /></label>
-      <template v-if="isVisionStep">
-        <label class="field">抽帧数量<input v-model.number="frameSampleCount" type="number" min="1" max="12" /></label>
-        <label class="field">单帧提取超时（秒）<input v-model.number="frameExtractionTimeoutSeconds" type="number" min="5" max="300" /></label>
-        <label class="field">单帧请求体上限（字节）<input v-model.number="frameMaxBytes" type="number" min="65536" :max="8 * 1024 * 1024" /></label>
-        <label class="field">视觉模型扩展参数（JSON）<textarea v-model="visionRequestOptionsText" rows="4" placeholder='例如 {"top_p":0.9}' /></label>
-      </template>
-      <template v-if="isTranscriptionStep">
-        <label class="field">分析开头音频上限（秒）<input v-model.number="audioMaxDurationSeconds" type="number" min="5" max="600" /></label>
-        <label class="field">音轨提取超时（秒）<input v-model.number="audioExtractionTimeoutSeconds" type="number" min="5" max="300" /></label>
-        <label class="field">音频请求体上限（字节）<input v-model.number="audioMaxBytes" type="number" min="65536" :max="50 * 1024 * 1024" /></label>
-        <label class="field">语音转写扩展参数（JSON）<textarea v-model="transcriptionRequestOptionsText" rows="4" placeholder='例如 {"language":"zh"}' /></label>
-      </template>
+      <h2>添加一个模型</h2>
+      <label class="field">这台模型要做什么？
+        <select v-model="stepKey">
+          <option v-for="[key, label] in steps" :key="key" :value="key">{{ label }}</option>
+        </select>
+      </label>
+      <p class="notice info">{{ stepHelp }}</p>
+
       <template v-if="isFinalVideoStep">
-        <label class="field">单片段下载超时（秒）<input v-model.number="finalVideoDownloadTimeoutSeconds" type="number" min="5" max="600" /></label>
-        <label class="field">单片段体积上限（字节）<input v-model.number="finalVideoMaxClipBytes" type="number" min="1048576" :max="2 * 1024 * 1024 * 1024" /></label>
-        <label class="field">完整成片体积上限（字节）<input v-model.number="finalVideoMaxOutputBytes" type="number" min="1048576" :max="10 * 1024 * 1024 * 1024" /></label>
-        <label class="field">FFmpeg 合成超时（秒）<input v-model.number="finalVideoRenderTimeoutSeconds" type="number" min="30" max="7200" /></label>
+        <p class="notice info">已自动选择本机 MP4 合成器。不消耗模型额度，也不需要填写 API Key。</p>
       </template>
-      <template v-if="isVideoStep">
-        <label class="field">提交路径<input v-model="videoSubmitPath" placeholder="例如 /luma/generations" /></label>
-        <label class="field">查询路径模板<input v-model="videoQueryPath" placeholder="例如 /luma/generations/{task_id}" /></label>
-        <label class="field">提示词字段<input v-model="videoPromptField" placeholder="例如 user_prompt 或 prompt" /></label>
-        <label class="field">首帧请求格式<select v-model="videoImageInputMode"><option value="top_level_url">顶层图片地址（image_url 等）</option><option value="luma_keyframe">keyframes.frame0 格式</option></select></label>
-        <label class="field">模型字段（可选）<input v-model="videoModelField" placeholder="例如 model 或 model_name；不需要则留空" /></label>
-        <label class="field">结束帧字段（可选）<input v-model="videoEndImageField" placeholder="例如 image_end_url；不支持则留空" /></label>
-        <label class="field">固定请求参数（JSON）<textarea v-model="videoRequestOptionsText" rows="4" placeholder='例如 {"duration":"5s","aspect_ratio":"9:16"}' /></label>
-        <label class="field">响应映射（JSON）<textarea v-model="videoResponseMappingText" rows="6" placeholder='例如 {"task_id_path":"id","state_path":"state","video_url_paths":["video.url"]}' /></label>
-        <label class="field">轮询间隔（秒）<input v-model.number="pollIntervalSeconds" type="number" min="1" max="60" /></label>
-        <label class="field">最长轮询（秒）<input v-model.number="maxPollSeconds" type="number" min="10" max="1800" /></label>
+      <template v-else>
+        <label class="field">模型名称
+          <input v-model="modelKey" placeholder="从云雾或中转站后台复制模型名称" maxlength="160" />
+        </label>
+        <small class="muted">不要猜模型名称；复制中转站后台实际显示的名称即可。</small>
       </template>
-      <label class="field"><span><input v-model="activate" type="checkbox" /> 创建后立即启用（仅已接入适配器可用）</span></label>
-      <p v-if="isImageStep" class="notice info">分镜图片使用 <code>openai_compatible_image</code>，默认云雾地址与 <code>YUNWU_API_KEY</code>。图片模型名、尺寸和是否支持水印必须以云雾后台实际能力为准。</p>
-      <p v-else-if="isFinalVideoStep" class="notice info">完整成片使用 <code>ffmpeg_concat</code>：Worker 下载按顺序冻结的 HTTPS 视频片段，用 FFmpeg 合成为 MP4，并保留成片版本。此步骤不需要 API 地址或密钥；生产环境需要 FFmpeg 和可持久化的媒体存储。</p>
-      <p v-else-if="isTranscriptionStep" class="notice info">语音转写使用 <code>openai_compatible_transcription</code>：后端只提取开头有限时长的音轨，转写文本只在本次 Worker 内存中用于综合分析，不写入数据库或返回浏览器。请确认模型支持标准 <code>/v1/audio/transcriptions</code> JSON 响应。</p>
-      <p v-else-if="isVisionStep" class="notice info">参考视频分析使用 <code>openai_compatible_vision</code>：后端 Worker 用 FFmpeg 均匀抽帧并发送给视觉模型，只保存抽象开头机制、冲突与节奏。请确认模型支持图片输入和 JSON 输出；不会把原视频帧保存到数据库或返回浏览器。</p>
-      <p v-else-if="isVideoStep" class="notice info">视频使用 <code>configurable_async_video</code>：先提交任务、再按任务号轮询。请依据当前模型的云雾/API 文档确认路径、提示词字段、首帧格式和固定参数；真实运行要求分镜图片为供应商能访问的 HTTPS 地址。</p>
-      <p v-else class="notice info">选题、故事、分镜已支持 <code>openai_compatible</code>。云雾可使用默认地址与 <code>YUNWU_API_KEY</code>；密钥只写服务器 .env，模型名以云雾后台实际列表为准。</p>
+
+      <template v-if="isImageStep">
+        <label class="field">图片尺寸
+          <select v-model="imageSize">
+            <option value="1728x2304">竖屏短剧（1728 × 2304，推荐）</option>
+            <option value="1024x1536">竖屏测试（1024 × 1536，成本较低）</option>
+            <option value="1024x1024">方图测试（1024 × 1024）</option>
+          </select>
+        </label>
+        <small class="muted">如果模型后台不支持所选尺寸，请改选它支持的尺寸，或在高级设置中填写。</small>
+      </template>
+
+      <label class="field">给自己看的备注（可不填）
+        <input v-model="displayName" placeholder="例如：云雾文本模型-测试版" />
+      </label>
+      <label class="field"><span><input v-model="activate" type="checkbox" /> 我已经测试过，保存后立即启用</span></label>
+      <p class="muted">第一次请不要勾选。先保存为候选，预检和小样本都通过后，再点击右侧的“启用此版本”。</p>
+
+      <details class="advanced-settings">
+        <summary>高级设置（第一次通常不用打开）</summary>
+        <div class="stack advanced-content">
+          <p class="notice info">只有更换中转站、模型文档明确要求不同参数，或有技术人员协助时，才修改这里。API Key 的真实内容永远不能填在这里。</p>
+          <template v-if="!isFinalVideoStep">
+            <label class="field">中转站类型<input v-model="providerKey" maxlength="80" /></label>
+            <label class="field">API 地址<input v-model="apiBaseUrl" type="url" placeholder="https://…" /></label>
+            <label class="field">服务器密钥变量名<input v-model="secretEnvName" placeholder="例如 YUNWU_API_KEY" /></label>
+            <label class="field">最长等待时间（秒，可不填）<input v-model.number="timeoutSeconds" type="number" min="1" max="1800" /></label>
+          </template>
+          <label v-if="isImageStep" class="field">自定义图片尺寸<input v-model="imageSize" placeholder="例如 1728x2304" /></label>
+
+          <template v-if="isVisionStep">
+            <label class="field">抽取多少张画面<input v-model.number="frameSampleCount" type="number" min="1" max="12" /></label>
+            <label class="field">抽帧最长等待（秒）<input v-model.number="frameExtractionTimeoutSeconds" type="number" min="5" max="300" /></label>
+            <label class="field">每张画面最大体积（字节）<input v-model.number="frameMaxBytes" type="number" min="65536" :max="8 * 1024 * 1024" /></label>
+            <label class="field">模型额外参数（JSON）<textarea v-model="visionRequestOptionsText" rows="3" placeholder='例如 {"top_p":0.9}' /></label>
+          </template>
+
+          <template v-if="isTranscriptionStep">
+            <label class="field">分析开头声音时长（秒）<input v-model.number="audioMaxDurationSeconds" type="number" min="5" max="600" /></label>
+            <label class="field">提取声音最长等待（秒）<input v-model.number="audioExtractionTimeoutSeconds" type="number" min="5" max="300" /></label>
+            <label class="field">声音文件最大体积（字节）<input v-model.number="audioMaxBytes" type="number" min="65536" :max="50 * 1024 * 1024" /></label>
+            <label class="field">模型额外参数（JSON）<textarea v-model="transcriptionRequestOptionsText" rows="3" placeholder='例如 {"language":"zh"}' /></label>
+          </template>
+
+          <template v-if="isVideoStep">
+            <p class="notice error">视频模型的下面参数必须以中转站当前 API 文档为准；不知道含义时，不要保存或启用。请把 API 文档交给技术人员配置，并先只测试 1 组镜头。</p>
+            <label class="field">提交任务的路径<input v-model="videoSubmitPath" placeholder="例如 /luma/generations" /></label>
+            <label class="field">查询任务结果的路径<input v-model="videoQueryPath" placeholder="例如 /luma/generations/{task_id}" /></label>
+            <label class="field">提示词字段名<input v-model="videoPromptField" placeholder="例如 user_prompt 或 prompt" /></label>
+            <label class="field">首帧图片格式<select v-model="videoImageInputMode"><option value="top_level_url">普通图片地址</option><option value="luma_keyframe">关键帧格式</option></select></label>
+            <label class="field">模型字段名（可不填）<input v-model="videoModelField" placeholder="例如 model" /></label>
+            <label class="field">结束帧字段名（可不填）<input v-model="videoEndImageField" placeholder="例如 image_end_url" /></label>
+            <label class="field">固定参数（JSON）<textarea v-model="videoRequestOptionsText" rows="3" placeholder='例如 {"duration":"5s","aspect_ratio":"9:16"}' /></label>
+            <label class="field">返回结果对应关系（JSON）<textarea v-model="videoResponseMappingText" rows="6" /></label>
+            <label class="field">每隔几秒查询一次<input v-model.number="pollIntervalSeconds" type="number" min="1" max="60" /></label>
+            <label class="field">最长等多久（秒）<input v-model.number="maxPollSeconds" type="number" min="10" max="1800" /></label>
+          </template>
+
+          <template v-if="isFinalVideoStep">
+            <label class="field">单段视频下载最长等待（秒）<input v-model.number="finalVideoDownloadTimeoutSeconds" type="number" min="5" max="600" /></label>
+            <label class="field">单段视频最大体积（字节）<input v-model.number="finalVideoMaxClipBytes" type="number" min="1048576" :max="2 * 1024 * 1024 * 1024" /></label>
+            <label class="field">完整 MP4 最大体积（字节）<input v-model.number="finalVideoMaxOutputBytes" type="number" min="1048576" :max="10 * 1024 * 1024 * 1024" /></label>
+            <label class="field">合成最长等待（秒）<input v-model.number="finalVideoRenderTimeoutSeconds" type="number" min="30" max="7200" /></label>
+          </template>
+        </div>
+      </details>
+
       <p v-if="store.error" class="notice error">{{ store.error }}</p>
-      <button class="button" :disabled="store.submitting">{{ store.submitting ? '保存中…' : `新增「${stepName}」配置` }}</button>
+      <button class="button" :disabled="store.submitting">{{ store.submitting ? '保存中…' : `保存「${stepName}」模型` }}</button>
     </form>
 
     <section class="panel stack">
-      <div class="meta-row"><h2>配置版本</h2><span>{{ store.profiles.length }} 项</span></div>
+      <div class="meta-row"><h2>已经保存的模型</h2><span>{{ store.profiles.length }} 项</span></div>
+      <p class="muted">建议顺序：先点击“基础预检”，再用一个小项目测试；确认没有问题后才启用。</p>
       <p v-if="store.loading" class="muted">正在加载…</p>
       <article v-for="profile in store.profiles" :key="profile.id" class="panel stack">
         <div class="meta-row">
-          <strong>{{ stepLabels[profile.step_key] || profile.step_key }} · v{{ profile.version }}</strong>
-          <span class="status" :class="profile.is_active ? 'SUCCEEDED' : 'PENDING'">{{ profile.is_active ? '当前启用' : '候选配置' }}</span>
+          <strong>{{ stepLabels[profile.step_key] || profile.step_key }} · 第 {{ profile.version }} 版</strong>
+          <span class="status" :class="profile.is_active ? 'SUCCEEDED' : 'PENDING'">{{ profile.is_active ? '正在使用' : '候选，尚未启用' }}</span>
         </div>
-        <p>{{ profile.provider_key }} / {{ profile.model_key }}</p>
-        <small class="muted">{{ profile.adapter_available ? '适配器已接通' : '适配器尚未接通' }} · {{ profile.provider_config.display_name || '未命名' }}</small>
+        <p>{{ profile.provider_config.display_name || profile.model_key }}</p>
+        <small class="muted">模型名称：{{ profile.model_key }} · {{ providerLabel(profile.provider_key) }} · {{ profile.adapter_available ? '系统已支持' : '当前系统尚不支持' }}</small>
         <button class="button secondary" :disabled="store.preflightingProfileId === profile.id" @click="store.preflight(profile.id)">
-          {{ store.preflightingProfileId === profile.id ? '预检中…' : '基础预检（不生成内容）' }}
+          {{ store.preflightingProfileId === profile.id ? '正在检查…' : '第一步：基础预检（不生成、不扣费）' }}
         </button>
         <div v-if="store.preflights[profile.id]" class="stack">
           <p class="notice" :class="store.preflights[profile.id].ready ? 'info' : 'error'">
-            {{ store.preflights[profile.id].ready ? '基础预检通过，可按需启用或进行小样本任务验收。' : '基础预检未通过，请先按下方提示修正。' }}
+            {{ store.preflights[profile.id].ready ? '基础检查通过。现在请用少量内容测试，满意后再启用。' : '基础检查没有通过。请根据下方说明修正后重试。' }}
           </p>
           <ul class="muted">
             <li v-for="check in store.preflights[profile.id].checks" :key="check.key">
-              {{ check.status === 'passed' ? '通过' : check.status === 'warning' ? '提示' : '未通过' }}：{{ check.message }}
+              {{ check.status === 'passed' ? '通过' : check.status === 'warning' ? '注意' : '需要处理' }}：{{ check.message }}
             </li>
           </ul>
         </div>
-        <ModelEvaluationPanel
-          :profile-id="profile.id"
-          :profile-label="`${stepLabels[profile.step_key] || profile.step_key} v${profile.version}`"
-          :evaluations="store.evaluations[profile.id] || []"
-          :loading="store.evaluationLoadingProfileId === profile.id"
-          :saving="store.evaluationSavingProfileId === profile.id"
-          :load-evaluations="(profileId) => store.loadEvaluations(profileId)"
-          :save-evaluation="(profileId, payload) => store.createEvaluation(profileId, payload)"
-        />
-        <button v-if="!profile.is_active" class="button secondary" :disabled="!profile.adapter_available || store.submitting" @click="store.activate(profile.id)">启用此版本</button>
+        <details class="advanced-settings">
+          <summary>记录/查看这台模型的测试结果（可选）</summary>
+          <div class="advanced-content">
+            <ModelEvaluationPanel
+              :profile-id="profile.id"
+              :profile-label="`${stepLabels[profile.step_key] || profile.step_key} 第 ${profile.version} 版`"
+              :evaluations="store.evaluations[profile.id] || []"
+              :loading="store.evaluationLoadingProfileId === profile.id"
+              :saving="store.evaluationSavingProfileId === profile.id"
+              :load-evaluations="(profileId) => store.loadEvaluations(profileId)"
+              :save-evaluation="(profileId, payload) => store.createEvaluation(profileId, payload)"
+            />
+          </div>
+        </details>
+        <button v-if="!profile.is_active" class="button secondary" :disabled="!profile.adapter_available || store.submitting" @click="store.activate(profile.id)">最后一步：启用此版本</button>
       </article>
     </section>
   </div>
+
+  <details class="panel advanced-settings">
+    <summary>模型测试结果对比（可选）</summary>
+    <div class="stack advanced-content">
+      <p class="muted">同一种用途、同一个测试场景的模型才适合比较。刚开始使用时可以先跳过这里。</p>
+      <label class="field">想比较哪一种用途？
+        <select v-model="comparisonStepKey">
+          <option v-for="[key, label] in steps" :key="key" :value="key">{{ label }}</option>
+        </select>
+      </label>
+      <button class="button secondary" :disabled="store.comparisonLoading" @click="store.loadComparisons(comparisonStepKey)">
+        {{ store.comparisonLoading ? '读取中…' : '查看测试结果对比' }}
+      </button>
+      <p v-if="store.comparisons.length === 0 && !store.comparisonLoading" class="muted">选择用途后查看已保存的测试记录。</p>
+      <article v-for="record in store.comparisons" :key="record.id" class="panel stack">
+        <div class="meta-row">
+          <strong>{{ record.display_name || record.model_key }} · 第 {{ record.profile_version }} 版</strong>
+          <span>人工质量评分 {{ record.quality_score }}/100</span>
+        </div>
+        <p>{{ record.scenario }}</p>
+        <small class="muted">成功率 {{ record.success_rate }}% · 平均耗时 {{ record.average_latency_seconds }} 秒 · 单样本 ¥{{ record.average_cost_yuan.toFixed(4) }} · 单成功样本 {{ record.cost_per_success_yuan === null ? '—' : `¥${record.cost_per_success_yuan.toFixed(4)}` }}</small>
+      </article>
+    </div>
+  </details>
 </template>
+
+<style scoped>
+.setup-steps {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0;
+  padding-left: 1.35rem;
+}
+
+.advanced-settings {
+  border: 1px solid var(--line, #d9dfeb);
+  border-radius: 0.6rem;
+  padding: 0.75rem 1rem;
+}
+
+.advanced-settings summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.advanced-content {
+  margin-top: 1rem;
+}
+</style>

@@ -20,7 +20,7 @@ from app.services.story_service import execute_story_generation
 from app.services.storyboard_service import execute as execute_storyboard
 from app.services.topic_service import execute_topic_generation
 from app.services.video_service import execute_video_generation
-from app.services.v1_execution_service import execute_v1_workflow
+from app.services.v1_execution_service import execute_v1_video_child, execute_v1_workflow
 from app.services.workflow_service import execute_video_analysis
 
 
@@ -83,6 +83,35 @@ def dispatch_workflow(background_tasks: BackgroundTasks, workflow_key: str, run_
     raise RuntimeError("TASK_EXECUTION_MODE 仅支持 inline 或 rq")
 
 
+def dispatch_v1_video_children(background_tasks: BackgroundTasks, run_id: str) -> None:
+    """按镜头投递独立视频 Job，父 WorkflowRun 仅聚合子任务终态。
+
+    这里不投递一个可能等待数十分钟的串行父 Job。每个子任务有自己的
+    ``provider_task_id``，Worker 重启后可安全恢复轮询已存在的供应商任务。
+    """
+
+    db: Session = SessionLocal()
+    try:
+        run = db.get(WorkflowRun, run_id)
+        if run is None:
+            raise RuntimeError("视频工作流不存在")
+        steps = [step for step in run.steps if step.step_key == "VIDEO_SHOT" and step.status == RunStatus.PENDING]
+        if settings.task_execution_mode == "inline":
+            for step in steps:
+                background_tasks.add_task(execute_v1_video_child, run.id, step.id)
+            return
+        if settings.task_execution_mode == "rq":
+            for step in steps:
+                _enqueue_v1_video_child(run.id, step.id)
+            return
+        raise RuntimeError("TASK_EXECUTION_MODE 仅支持 inline 或 rq")
+    except Exception as exc:
+        _mark_dispatch_failure(run_id, f"无法投递视频镜头子任务：{exc}")
+        raise
+    finally:
+        db.close()
+
+
 def execute_workflow_job(workflow_key: str, run_id: str) -> None:
     """独立 RQ Worker 和本地 BackgroundTask 共用的实际任务入口。
 
@@ -118,6 +147,27 @@ def _enqueue_rq_job(workflow_key: str, run_id: str) -> None:
         execute_workflow_job,
         workflow_key,
         run_id,
+        job_timeout=settings.worker_job_timeout_seconds,
+        result_ttl=0,
+        failure_ttl=7 * 24 * 60 * 60,
+    )
+
+
+def _enqueue_v1_video_child(run_id: str, step_id: str) -> None:
+    """视频单镜头任务使用独立 RQ Job，避免一个 Job 超过 Worker 超时。"""
+
+    if not settings.redis_url:
+        raise RuntimeError("TASK_EXECUTION_MODE=rq 需要 REDIS_URL")
+    try:
+        from redis import Redis
+        from rq import Queue
+    except ImportError as exc:
+        raise RuntimeError("RQ Worker 依赖未安装；请按 server/requirements.txt 安装") from exc
+    queue = Queue(settings.rq_queue_name, connection=Redis.from_url(settings.redis_url))
+    queue.enqueue(
+        execute_v1_video_child,
+        run_id,
+        step_id,
         job_timeout=settings.worker_job_timeout_seconds,
         result_ttl=0,
         failure_ttl=7 * 24 * 60 * 60,

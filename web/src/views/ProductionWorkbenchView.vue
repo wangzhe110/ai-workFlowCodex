@@ -58,6 +58,7 @@ const uploading = ref(false)
 const actionId = ref('')
 const generatingKey = ref('')
 const error = ref('')
+const backgroundNotice = ref('')
 
 /** 正式主链路固定顺序；只用于进度展示，真正的放行规则始终由后端状态机判断。 */
 const stages: Array<{ key: ProductionStage; label: string; description: string }> = [
@@ -153,18 +154,26 @@ async function review(id: string, operation: () => Promise<unknown>) {
   }
 }
 
-/** 创建后台任务后轮询其平台运行状态；真实模型耗时较长时页面不会假装同步完成。 */
-async function startGeneration(runKey: string, label: string) {
-  generatingKey.value = runKey
+/**
+ * 创建后台任务后只做短时状态刷新。真实视频可能耗时数分钟，页面停止等待不代表
+ * 后台失败；刷新页面会继续读取同一个 WorkflowRun 的子任务状态。
+ */
+async function startGeneration(runKey: string, label: string, shotPlanIds: string[] = []) {
+  const actionKey = shotPlanIds.length ? `${runKey}:${shotPlanIds.join(',')}` : runKey
+  generatingKey.value = actionKey
   error.value = ''
+  backgroundNotice.value = ''
   try {
-    const created = await startProductionRun(props.projectId, runKey)
+    const created = await startProductionRun(props.projectId, runKey, shotPlanIds)
     let latest = created
-    for (let attempt = 0; attempt < 300 && ['PENDING', 'RUNNING'].includes(latest.status); attempt += 1) {
-      await new Promise((resolve) => window.setTimeout(resolve, 1000))
+    for (let attempt = 0; attempt < 15 && ['PENDING', 'RUNNING'].includes(latest.status); attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 2000))
       latest = await getWorkflowRun(created.id)
     }
-    if (latest.status !== 'SUCCEEDED') throw new Error(latest.steps.find((item) => item.error_message)?.error_message || `${label}没有完成`)
+    if (latest.status === 'FAILED') throw new Error(latest.steps.find((item) => item.error_message)?.error_message || `${label}没有完成`)
+    if (['PENDING', 'RUNNING'].includes(latest.status)) {
+      backgroundNotice.value = `${label}仍在后台执行。关闭或刷新本页不会取消任务，稍后刷新即可查看每个镜头的状态。`
+    }
     await loadWorkbench()
   } catch (caught) {
     error.value = caught instanceof Error ? caught.message : `${label}创建失败，请检查模型配置后重试`
@@ -214,6 +223,7 @@ watch(() => props.projectId, () => void loadWorkbench())
     </section>
 
     <p v-if="error" class="notice error">{{ error }}</p>
+    <p v-if="backgroundNotice" class="notice info">{{ backgroundNotice }}</p>
 
     <section class="panel stack">
       <div class="meta-row"><h2>V1 生产链路</h2><span class="muted">每一步都需要完成或人工确认后才会放行</span></div>
@@ -273,7 +283,7 @@ watch(() => props.projectId, () => void loadWorkbench())
         </template>
         <template v-else-if="state?.active_stage === 'VIDEO_GENERATION'">
           <p class="notice info">全部关键帧已锁定。Seedance 将使用锁定的角色图、场景图、关键帧和动作描述生成视频片段。</p>
-          <button class="button" :disabled="Boolean(generatingKey)" @click="startGeneration('video_generation', '视频片段')">{{ generatingKey === 'video_generation' ? '正在生成…' : '生成视频片段' }}</button>
+          <button class="button" :disabled="Boolean(generatingKey)" @click="startGeneration('video_generation', '视频片段')">{{ generatingKey === 'video_generation' ? '正在创建任务…' : '生成未通过的视频片段' }}</button>
         </template>
         <template v-else-if="state?.active_stage === 'FINAL_EXPORT'">
           <p class="notice info">目标视频片段均已审核通过，可以创建一版新的完整成片。</p>
@@ -363,10 +373,12 @@ watch(() => props.projectId, () => void loadWorkbench())
     <section v-if="videoClips.length" class="panel stack review-panel">
       <div class="meta-row"><h2>视频片段审核</h2><span>{{ videoClips.length }} 个版本</span></div>
       <article v-for="clip in videoClips" :key="clip.id" class="asset-card stack">
-        <div class="meta-row"><strong>镜头 {{ clip.shot_number }} · 视频 v{{ clip.version }}</strong><span class="status" :class="clip.review_status === 'APPROVED' ? 'SUCCEEDED' : 'PENDING'">{{ clip.review_status || '等待生成' }}</span></div>
+        <div class="meta-row"><strong>镜头 {{ clip.shot_number }} · 视频 v{{ clip.version }}<template v-if="clip.is_current">（当前采用）</template></strong><span class="status" :class="clip.review_status === 'APPROVED' ? 'SUCCEEDED' : 'PENDING'">{{ clip.review_status || '等待生成' }}</span></div>
         <a v-if="safeExternalUrl(clip.video_url)" class="button secondary" :href="safeExternalUrl(clip.video_url) || undefined" target="_blank" rel="noreferrer">打开视频预览</a>
+        <small class="muted">生成任务：{{ clip.task_status || 'PENDING' }}<template v-if="clip.provider_task_id"> · 供应商任务号：{{ clip.provider_task_id }}</template></small>
         <small v-if="clip.review_note" class="muted">上次审核备注：{{ clip.review_note }}</small>
         <div v-if="clip.review_status === 'PENDING_REVIEW' && state?.active_stage === 'VIDEO_REVIEW'" class="action-row"><button class="button" :disabled="Boolean(actionId)" @click="review(`video-approve-${clip.id}`, () => approveV1VideoClip(clip.id, reviewPayload()))">{{ actionId === `video-approve-${clip.id}` ? '正在确认…' : '通过此视频片段' }}</button><button class="button danger" :disabled="Boolean(actionId)" @click="review(`video-reject-${clip.id}`, () => rejectV1VideoClip(clip.id, reviewPayload()))">驳回并生成新版本</button></div>
+        <button v-if="clip.review_status === 'REJECTED' && state?.active_stage === 'VIDEO_GENERATION'" class="button" :disabled="Boolean(generatingKey)" @click="startGeneration('video_generation', `镜头 ${clip.shot_number} 重做`, [clip.shot_plan_id])">{{ generatingKey ? '正在创建任务…' : '仅重做此镜头' }}</button>
       </article>
     </section>
   </template>

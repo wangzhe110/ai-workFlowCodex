@@ -3,6 +3,7 @@
 from fastapi.testclient import TestClient
 
 from app.main import app
+from conftest import real_video_bytes
 
 
 def test_quality_report_uses_review_score_without_auto_switching_models() -> None:
@@ -12,7 +13,7 @@ def test_quality_report_uses_review_score_without_auto_switching_models() -> Non
         project_id = client.post("/api/v1/projects", json={"title": "质量报表小样"}).json()["id"]
         uploaded = client.post(
             f"/api/v1/projects/{project_id}/source-video",
-            files={"file": ("reference.mp4", b"quality-report-video", "video/mp4")},
+            files={"file": ("reference.mp4", real_video_bytes(), "video/mp4")},
         )
         assert uploaded.status_code == 201
 

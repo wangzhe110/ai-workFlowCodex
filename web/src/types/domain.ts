@@ -331,6 +331,8 @@ export interface VideoClipV1 {
   version: number
   video_url: string | null
   provider_task_id: string | null
+  task_status: string | null
+  is_current: boolean
   generation_status: string | null
   review_status: 'PENDING_REVIEW' | 'APPROVED' | 'REJECTED' | null
   review_note: string | null

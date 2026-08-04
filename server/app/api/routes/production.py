@@ -5,6 +5,8 @@
 真实生成结果的查看、审核和锁定入口。
 """
 
+from typing import Optional
+
 from fastapi import APIRouter, BackgroundTasks, Depends, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -31,10 +33,11 @@ from app.schemas import (
     ShotKeyframeV1Response,
     StoryProposalV1Response,
     VideoClipV1Response,
+    V1GenerationRunRequest,
     WorkflowRunResponse,
 )
 from app.api.routes.projects import _run_response
-from app.services.worker_runtime import dispatch_workflow
+from app.services.worker_runtime import dispatch_v1_video_children, dispatch_workflow
 from app.services.v1_execution_service import RUN_SPECS, create_v1_run
 from app.services.v1_production_service import (
     approve_video_clip,
@@ -114,6 +117,7 @@ def create_v1_generation_run_endpoint(
     project_id: str,
     run_key: str,
     background_tasks: BackgroundTasks,
+    payload: Optional[V1GenerationRunRequest] = None,
     db: Session = Depends(get_db),
 ) -> WorkflowRunResponse:
     """创建并投递一个 V1 生成节点。
@@ -127,8 +131,13 @@ def create_v1_generation_run_endpoint(
         from fastapi import HTTPException
 
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="未知的 V1 生成节点")
-    run = create_v1_run(db, project_id=project_id, run_key=run_key)
-    dispatch_workflow(background_tasks, run.workflow_key, run.id)
+    requested_shots = payload.shot_plan_ids if payload and run_key == "video_generation" else None
+    run = create_v1_run(db, project_id=project_id, run_key=run_key, shot_plan_ids=requested_shots)
+    if getattr(run, "_created", True):
+        if run_key == "video_generation":
+            dispatch_v1_video_children(background_tasks, run.id)
+        else:
+            dispatch_workflow(background_tasks, run.workflow_key, run.id)
     return _run_response(run)
 
 
@@ -416,23 +425,7 @@ def list_v1_video_clips_endpoint(
         .where(VideoClip.project_id == project_id)
         .order_by(ShotPlan.shot_number, VideoClip.version.desc())
     ).all()
-    return [
-        VideoClipV1Response(
-            id=clip.id,
-            project_id=clip.project_id,
-            shot_plan_id=shot.id,
-            shot_number=shot.shot_number,
-            version=clip.version,
-            video_url=clip.video_url,
-            provider_task_id=clip.provider_task_id,
-            generation_status=clip.generation_status,
-            review_status=clip.review_status,
-            review_note=clip.review_note,
-            input_asset_snapshot=clip.input_asset_snapshot,
-            created_at=clip.created_at,
-        )
-        for clip, shot in rows
-    ]
+    return [_video_clip_response(db, clip, shot) for clip, shot in rows]
 
 
 @router.post("/video-clips/{clip_id}/approve", response_model=VideoClipV1Response)
@@ -448,20 +441,7 @@ def approve_video_clip_endpoint(
     )
     shot = db.get(ShotPlan, clip.shot_plan_id)
     assert shot is not None
-    return VideoClipV1Response(
-        id=clip.id,
-        project_id=clip.project_id,
-        shot_plan_id=shot.id,
-        shot_number=shot.shot_number,
-        version=clip.version,
-        video_url=clip.video_url,
-        provider_task_id=clip.provider_task_id,
-        generation_status=clip.generation_status,
-        review_status=clip.review_status,
-        review_note=clip.review_note,
-        input_asset_snapshot=clip.input_asset_snapshot,
-        created_at=clip.created_at,
-    )
+    return _video_clip_response(db, clip, shot)
 
 
 @router.post("/video-clips/{clip_id}/reject", response_model=VideoClipV1Response)
@@ -477,6 +457,25 @@ def reject_video_clip_endpoint(
     )
     shot = db.get(ShotPlan, clip.shot_plan_id)
     assert shot is not None
+    return _video_clip_response(db, clip, shot)
+
+
+def _masked_provider_task_id(value: Optional[str]) -> Optional[str]:
+    """任务号仅用于制作人排查，列表展示时不暴露完整第三方标识。"""
+
+    if not value:
+        return None
+    if len(value) <= 8:
+        return "***"
+    return f"{value[:4]}…{value[-4:]}"
+
+
+def _video_clip_response(db: Session, clip: VideoClip, shot: ShotPlan) -> VideoClipV1Response:
+    """统一输出视频历史、当前采用标识及其子任务状态。"""
+
+    from app.models import WorkflowStep
+
+    task = db.scalars(select(WorkflowStep).where(WorkflowStep.video_clip_id == clip.id)).first()
     return VideoClipV1Response(
         id=clip.id,
         project_id=clip.project_id,
@@ -484,7 +483,9 @@ def reject_video_clip_endpoint(
         shot_number=shot.shot_number,
         version=clip.version,
         video_url=clip.video_url,
-        provider_task_id=clip.provider_task_id,
+        provider_task_id=_masked_provider_task_id(clip.provider_task_id),
+        task_status=_enum_value(task.status) if task else clip.generation_status,
+        is_current=shot.selected_video_clip_id == clip.id,
         generation_status=clip.generation_status,
         review_status=clip.review_status,
         review_note=clip.review_note,

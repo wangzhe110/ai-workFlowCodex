@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from app.core.database import SessionLocal
 from app.main import app
 from app.models import ModelInvocation
+from conftest import real_video_bytes
 
 
 def _run(client: TestClient, project_id: str, run_key: str) -> None:
@@ -21,7 +22,7 @@ def test_mock_v1_adapter_runs_full_reviewed_production_closure() -> None:
         project_id = client.post("/api/v1/projects", json={"title": "V1 本地闭环"}).json()["id"]
         uploaded = client.post(
             f"/api/v1/projects/{project_id}/source-video",
-            files={"file": ("reference.mp4", b"mock-video-content", "video/mp4")},
+            files={"file": ("reference.mp4", real_video_bytes(), "video/mp4")},
         )
         assert uploaded.status_code == 201
 

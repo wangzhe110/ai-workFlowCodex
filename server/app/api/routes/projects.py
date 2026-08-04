@@ -16,7 +16,14 @@ from app.services.workflow_service import add_source_video, create_project, get_
 
 router = APIRouter(prefix="/api/v1/projects", tags=["项目"])
 
-ALLOWED_VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm"}
+# MIME 与扩展名必须同时匹配，不能再用“二者任一像视频即可”的宽松逻辑。真正的
+# 可解码性会由真实视频分析前的 FFprobe/FFmpeg 检查再次确认。
+ALLOWED_VIDEO_CONTENT_TYPES = {
+    ".mp4": {"video/mp4"},
+    ".mov": {"video/quicktime"},
+    ".mkv": {"video/x-matroska", "video/mkv"},
+    ".webm": {"video/webm"},
+}
 
 
 def _asset_response(asset) -> AssetResponse:
@@ -151,9 +158,13 @@ def upload_source_video_endpoint(
     """
 
     suffix = Path(file.filename or "").suffix.lower()
-    content_type = file.content_type or "application/octet-stream"
-    if not content_type.startswith("video/") and suffix not in ALLOWED_VIDEO_SUFFIXES:
-        raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="仅支持常见视频文件")
+    content_type = (file.content_type or "application/octet-stream").lower()
+    accepted_types = ALLOWED_VIDEO_CONTENT_TYPES.get(suffix)
+    if accepted_types is None or content_type not in accepted_types:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="文件扩展名与视频 MIME 类型必须匹配（支持 MP4、MOV、MKV、WebM）",
+        )
 
     # 先验证项目存在，避免非法 project_id 在对象存储留下孤儿文件。
     get_project_or_404(db, project_id)
@@ -161,7 +172,7 @@ def upload_source_video_endpoint(
     try:
         storage_key, byte_size = asset_storage.save_source_video(project_id, file)
     except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail=str(exc)) from exc
     except OSError as exc:
         raise HTTPException(status_code=status.HTTP_507_INSUFFICIENT_STORAGE, detail="素材存储失败") from exc
     finally:

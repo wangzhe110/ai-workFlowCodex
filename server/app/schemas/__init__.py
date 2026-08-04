@@ -44,6 +44,7 @@ from app.schemas.contracts import (
     ShotKeyframeV1Response,
     VideoClipV1Response,
     WorkflowRunResponse,
+    V1GenerationRunRequest,
     WorkflowStepResponse,
 )
 
@@ -91,5 +92,6 @@ __all__ = [
     "ShotKeyframeV1Response",
     "VideoClipV1Response",
     "WorkflowRunResponse",
+    "V1GenerationRunRequest",
     "WorkflowStepResponse",
 ]

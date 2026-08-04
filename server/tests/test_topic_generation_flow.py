@@ -3,6 +3,7 @@
 from fastapi.testclient import TestClient
 
 from app.main import app
+from conftest import real_video_bytes
 
 
 def test_completed_analysis_can_generate_and_select_original_topic() -> None:
@@ -12,7 +13,7 @@ def test_completed_analysis_can_generate_and_select_original_topic() -> None:
         project_id = client.post("/api/v1/projects", json={"title": "选题测试", "description": "悬疑情感"}).json()["id"]
         client.post(
             f"/api/v1/projects/{project_id}/source-video",
-            files={"file": ("reference.mp4", b"fixture", "video/mp4")},
+            files={"file": ("reference.mp4", real_video_bytes(), "video/mp4")},
         )
         analysis = client.post(f"/api/v1/projects/{project_id}/analysis-runs")
         assert analysis.status_code == 202

@@ -463,18 +463,33 @@ def lock_shot_keyframe(
 
 
 def _current_v1_clips(db: Session, state: ProjectProductionState) -> list[VideoClip]:
-    """仅统计当前导演方案的 V1 片段，历史按组视频不会混入审核闸门。"""
+    """仅统计每镜头明确采用的视频版本，历史版本不参与审核闸门。"""
 
     if state.director_plan_id is None:
         return []
     return list(
         db.scalars(
             select(VideoClip)
-            .join(ShotPlan, VideoClip.shot_plan_id == ShotPlan.id)
+            .join(ShotPlan, VideoClip.id == ShotPlan.selected_video_clip_id)
             .where(
                 VideoClip.project_id == state.project_id,
                 ShotPlan.director_plan_id == state.director_plan_id,
             )
+            .order_by(ShotPlan.shot_number)
+        ).all()
+    )
+
+
+def _current_v1_shots(db: Session, state: ProjectProductionState) -> list[ShotPlan]:
+    """当前导演方案的完整镜头集合，用于防止“只通过一镜就可合成”的漏闸门。"""
+
+    if state.director_plan_id is None:
+        return []
+    return list(
+        db.scalars(
+            select(ShotPlan)
+            .where(ShotPlan.project_id == state.project_id, ShotPlan.director_plan_id == state.director_plan_id)
+            .order_by(ShotPlan.shot_number)
         ).all()
     )
 
@@ -489,14 +504,21 @@ def approve_video_clip(
     _require_stage(state, [ProductionStage.VIDEO_REVIEW], "通过视频片段")
     if clip.generation_status != RunStatus.SUCCEEDED.value or clip.review_status != VideoReviewStatus.PENDING_REVIEW.value:
         _conflict("视频片段不是待审核的成功结果")
-    clips = _current_v1_clips(db, state)
-    if clip.id not in {item.id for item in clips}:
+    shot = _get_or_404(db, ShotPlan, clip.shot_plan_id, "视频所属镜头")
+    if shot.director_plan_id != state.director_plan_id:
         _conflict("视频片段不属于当前导演方案")
 
     clip.review_status = VideoReviewStatus.APPROVED.value
     clip.reviewed_at = utcnow()
     clip.review_note = note.strip() if note else None
-    if clips and all(item.id == clip.id or item.review_status == VideoReviewStatus.APPROVED.value for item in clips):
+    # “采用版本”只能由人工通过操作切换。旧 REJECTED 版本仍保留在历史列表，
+    # 但后续审核闸门和最终合成只读该指针所指的版本。
+    shot.selected_video_clip_id = clip.id
+    # Session 关闭了 autoflush；闸门查询前必须把本次指针更新写入当前事务。
+    db.flush()
+    clips = _current_v1_clips(db, state)
+    shots = _current_v1_shots(db, state)
+    if shots and len(clips) == len(shots) and all(item.review_status == VideoReviewStatus.APPROVED.value for item in clips):
         state.active_stage = ProductionStage.FINAL_EXPORT
     _review(
         db,
@@ -523,12 +545,16 @@ def reject_video_clip(
     _require_stage(state, [ProductionStage.VIDEO_REVIEW], "驳回视频片段")
     if clip.generation_status != RunStatus.SUCCEEDED.value or clip.review_status != VideoReviewStatus.PENDING_REVIEW.value:
         _conflict("视频片段不是待审核的成功结果")
-    if clip.id not in {item.id for item in _current_v1_clips(db, state)}:
+    shot = _get_or_404(db, ShotPlan, clip.shot_plan_id, "视频所属镜头")
+    if shot.director_plan_id != state.director_plan_id:
         _conflict("视频片段不属于当前导演方案")
 
     clip.review_status = VideoReviewStatus.REJECTED.value
     clip.reviewed_at = utcnow()
     clip.review_note = note.strip() if note else None
+    # 若历史数据曾把待审核版错误指为当前采用，驳回后清空指针而不删除版本。
+    if shot.selected_video_clip_id == clip.id:
+        shot.selected_video_clip_id = None
     state.active_stage = ProductionStage.VIDEO_GENERATION
     _review(
         db,

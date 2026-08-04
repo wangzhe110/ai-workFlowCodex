@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.core.database import SessionLocal
 from app.main import app
+from conftest import real_video_bytes
 from app.models import RunStatus, WorkflowStep
 from app.services.workflow_service import create_video_analysis_run, utcnow
 
@@ -17,7 +18,7 @@ def test_stale_running_workflow_becomes_failed_and_can_be_retried() -> None:
         project = client.post("/api/v1/projects", json={"title": "卡死任务测试"}).json()
         upload = client.post(
             f"/api/v1/projects/{project['id']}/source-video",
-            files={"file": ("authorized.mp4", b"fixture", "video/mp4")},
+            files={"file": ("authorized.mp4", real_video_bytes(), "video/mp4")},
         )
         assert upload.status_code == 201
 

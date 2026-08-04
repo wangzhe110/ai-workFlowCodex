@@ -70,6 +70,12 @@ class WorkflowRunResponse(BaseModel):
     steps: list[WorkflowStepResponse]
 
 
+class V1GenerationRunRequest(BaseModel):
+    """仅视频阶段可选指定镜头，其他 V1 节点不接受浏览器指定模型或 Prompt。"""
+
+    shot_plan_ids: list[str] = Field(default_factory=list, max_length=80)
+
+
 class HealthResponse(BaseModel):
     """部署监测使用的健康检查响应。"""
 
@@ -406,6 +412,8 @@ class VideoClipV1Response(BaseModel):
     version: int
     video_url: Optional[str]
     provider_task_id: Optional[str]
+    task_status: Optional[str]
+    is_current: bool
     generation_status: Optional[str]
     review_status: Optional[str]
     review_note: Optional[str]

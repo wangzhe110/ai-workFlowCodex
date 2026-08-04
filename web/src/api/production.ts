@@ -35,8 +35,10 @@ export function getProjectModelInvocations(projectId: string, limit = 200): Prom
 }
 
 /** 创建一个 V1 后台生成节点；模型、Prompt 和 Workflow 快照由服务端冻结。 */
-export function startProductionRun(projectId: string, runKey: string): Promise<WorkflowRun> {
-  return jsonPost<WorkflowRun>(`/production/projects/${projectId}/generation-runs/${encodeURIComponent(runKey)}`)
+export function startProductionRun(projectId: string, runKey: string, shotPlanIds: string[] = []): Promise<WorkflowRun> {
+  return jsonPost<WorkflowRun>(`/production/projects/${projectId}/generation-runs/${encodeURIComponent(runKey)}`, {
+    shot_plan_ids: shotPlanIds,
+  })
 }
 
 export function getReferenceAnalyses(projectId: string): Promise<ReferenceAnalysis[]> {

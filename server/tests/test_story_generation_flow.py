@@ -1,12 +1,13 @@
 """故事包生成闭环测试。"""
 from fastapi.testclient import TestClient
 from app.main import app
+from conftest import real_video_bytes
 
 def test_selected_topic_can_generate_and_confirm_story_package() -> None:
     """故事必须依赖人工确认选题，确认后才成为后续分镜输入。"""
     with TestClient(app) as client:
         project_id = client.post("/api/v1/projects", json={"title": "故事测试"}).json()["id"]
-        client.post(f"/api/v1/projects/{project_id}/source-video", files={"file": ("source.mp4", b"fixture", "video/mp4")})
+        client.post(f"/api/v1/projects/{project_id}/source-video", files={"file": ("source.mp4", real_video_bytes(), "video/mp4")})
         client.post(f"/api/v1/projects/{project_id}/analysis-runs")
         client.post(f"/api/v1/projects/{project_id}/topic-generation-runs")
         topic = client.get(f"/api/v1/projects/{project_id}/topic-candidates").json()[0]

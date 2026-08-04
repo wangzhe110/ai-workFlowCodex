@@ -9,11 +9,13 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timezone
+from hashlib import sha256
 from time import perf_counter
 from typing import Any, Callable
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal
@@ -114,58 +116,190 @@ def _conflict(message: str) -> None:
     raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=message)
 
 
-def create_v1_run(db: Session, *, project_id: str, run_key: str) -> WorkflowRun:
-    """创建异步 V1 运行并冻结 Workflow、槽位、模型配置和 Prompt 版本。"""
+def create_v1_run(
+    db: Session,
+    *,
+    project_id: str,
+    run_key: str,
+    shot_plan_ids: list[str] | None = None,
+) -> WorkflowRun:
+    """创建 V1 运行，并在数据库提交前冻结本次执行的全部可变配置。
+
+    ``_created`` 是仅供路由/投递层读取的瞬时标记：重复请求返回现有运行而不再次
+    投递。它不会写入数据库，因此不会污染历史可复现快照。
+    """
 
     if run_key not in RUN_SPECS:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="未知的 V1 生成任务")
     get_project_or_404(db, project_id)
     state = get_project_production_state(db, project_id)
+    workflow_key = f"{V1_WORKFLOW_PREFIX}{run_key}"
+    existing = db.scalars(
+        select(WorkflowRun)
+        .where(
+            WorkflowRun.project_id == project_id,
+            WorkflowRun.workflow_key == workflow_key,
+            WorkflowRun.status.in_((RunStatus.PENDING, RunStatus.RUNNING)),
+        )
+        .order_by(WorkflowRun.created_at.asc())
+    ).first()
+    if existing is not None:
+        setattr(existing, "_created", False)
+        return existing
     if state.active_stage not in ALLOWED_STAGES[run_key]:
         _conflict(f"当前阶段为 {state.active_stage.value}，不能创建 {RUN_SPECS[run_key][2]} 任务")
-    _validate_inputs(db, state, run_key)
+    _validate_inputs(db, state, run_key, shot_plan_ids=shot_plan_ids)
 
     slot_key, task_type, _ = RUN_SPECS[run_key]
     bindings = enabled_profiles_for_slot(db, slot_key)
     if not bindings:
         _conflict(f"模型槽位 {slot_key} 尚无启用配置，请先在模型中心绑定并验收模型")
     definition = get_v1_definition(db)
+    frozen_context = _freeze_run_context(db, state, run_key, shot_plan_ids=shot_plan_ids)
+    frozen_models = _freeze_model_bindings(db, bindings, slot_key=slot_key)
+    frozen_prompt = _freeze_prompt(db, task_type)
+    input_snapshot = {
+        "frozen_at": utcnow().isoformat(),
+        "stage": state.active_stage.value,
+        "run_key": run_key,
+        "slot_key": slot_key,
+        "task_type": task_type,
+        "workflow_definition": {
+            "id": definition.id,
+            "workflow_code": definition.workflow_code,
+            "version": definition.version,
+            "definition_json": deepcopy(definition.definition_json),
+        },
+        "model_bindings": {slot_key: frozen_models},
+        "prompt_templates": {task_type: frozen_prompt},
+        "context": frozen_context,
+    }
     run = WorkflowRun(
         project_id=project_id,
-        workflow_key=f"{V1_WORKFLOW_PREFIX}{run_key}",
+        workflow_key=workflow_key,
         workflow_definition_id=definition.id,
-        workflow_version=V1_WORKFLOW_VERSION,
-        input_snapshot={
-            "stage": state.active_stage.value,
-            "slot_key": slot_key,
-            "task_type": task_type,
-            "model_profile_ids": [item.model_profile_id for item in bindings],
-            "locked_reference_analysis_id": state.locked_reference_analysis_id,
-            "selected_story_proposal_id": state.selected_story_proposal_id,
-            "director_plan_id": state.director_plan_id,
-        },
+        workflow_version=definition.version,
+        idempotency_key=_run_idempotency_key(project_id, run_key, frozen_context),
+        input_snapshot=input_snapshot,
     )
     step = WorkflowStep(
         workflow_run=run,
         step_key=slot_key,
         position=1,
-        input_payload=deepcopy(run.input_snapshot),
-        # 多模型故事的逐模型快照会写入 ModelInvocation；这里仅保存第一个作为运行摘要。
-        model_profile_snapshot=_profile_snapshot(bindings[0].model_profile_id, db),
+        input_payload=deepcopy(input_snapshot),
+        # 多模型故事的逐模型快照会写入 ModelInvocation；这里保存完整有序列表摘要。
+        model_profile_snapshot={"bindings": deepcopy(frozen_models)},
     )
     db.add_all([run, step])
-    db.commit()
+    try:
+        db.flush()
+        if run_key == "video_generation":
+            _create_video_child_steps(db, run, step)
+        db.commit()
+    except IntegrityError:
+        # PostgreSQL 的部分唯一索引负责处理并发双击/网络重试的最终竞争条件。
+        db.rollback()
+        existing = db.scalars(
+            select(WorkflowRun)
+            .where(
+                WorkflowRun.project_id == project_id,
+                WorkflowRun.workflow_key == workflow_key,
+                WorkflowRun.status.in_((RunStatus.PENDING, RunStatus.RUNNING)),
+            )
+            .order_by(WorkflowRun.created_at.asc())
+        ).first()
+        if existing is None:
+            raise
+        setattr(existing, "_created", False)
+        return existing
     db.refresh(run)
+    setattr(run, "_created", True)
     return run
 
 
-def _validate_inputs(db: Session, state, run_key: str) -> None:
+def _create_video_child_steps(db: Session, run: WorkflowRun, parent_step: WorkflowStep) -> None:
+    """为冻结的每个镜头创建独立子任务与待生成 VideoClip。
+
+    子任务在供应商提交前就拥有稳定的 Clip ID 和幂等键；因此即使 Worker 中断，
+    下一次只会基于已有记录查询或继续，不会盲目重提付费任务。
+    """
+
+    context = _frozen_context(run)
+    binding = _frozen_bindings(run, "VIDEO_GENERATE")[0]
+    shots = context.get("shots")
+    if not isinstance(shots, list) or not shots:
+        raise RuntimeError("视频任务没有可生成的冻结镜头")
+    child_ids: list[str] = []
+    for position, frozen_shot in enumerate(shots, start=2):
+        if not isinstance(frozen_shot, dict):
+            raise RuntimeError("冻结镜头快照格式无效")
+        shot_id = frozen_shot.get("shot_plan_id")
+        keyframe = frozen_shot.get("locked_keyframe")
+        if not isinstance(shot_id, str) or not isinstance(keyframe, dict) or not isinstance(keyframe.get("id"), str):
+            raise RuntimeError("冻结镜头缺少锁定关键帧")
+        shot_number = frozen_shot.get("shot_number")
+        if not isinstance(shot_number, int):
+            raise RuntimeError("冻结镜头缺少编号")
+        version = (db.scalar(select(func.max(VideoClip.version)).where(VideoClip.shot_plan_id == shot_id)) or 0) + 1
+        child_key = f"{run.idempotency_key}:shot:{shot_id}:v{version}"
+        clip = VideoClip(
+            project_id=run.project_id,
+            storyboard_package_id=None,
+            shot_plan_id=shot_id,
+            generation_run_id=run.id,
+            group_number=shot_number,
+            start_shot_number=shot_number,
+            end_shot_number=shot_number,
+            shots_per_group=1,
+            version=version,
+            image_ids=[keyframe["id"]],
+            prompt=str(frozen_shot.get("video_action_prompt") or ""),
+            status=VideoClipStatus.PENDING,
+            generation_status=RunStatus.PENDING.value,
+            review_status=VideoReviewStatus.PENDING_REVIEW.value,
+            input_asset_snapshot={
+                "shot_keyframe_id": keyframe["id"],
+                "character_reference_image_ids": deepcopy(frozen_shot.get("character_reference_image_ids") or []),
+                "scene_reference_image_ids": deepcopy(frozen_shot.get("scene_reference_image_ids") or []),
+            },
+            idempotency_key=child_key,
+        )
+        db.add(clip)
+        db.flush()
+        db.add(VideoClipAssetBinding(video_clip_id=clip.id, asset_type="SHOT_KEYFRAME", shot_keyframe_id=keyframe["id"]))
+        for image_id in frozen_shot.get("character_reference_image_ids") or []:
+            db.add(VideoClipAssetBinding(video_clip_id=clip.id, asset_type="CHARACTER_REFERENCE", character_reference_image_id=image_id))
+        for image_id in frozen_shot.get("scene_reference_image_ids") or []:
+            db.add(VideoClipAssetBinding(video_clip_id=clip.id, asset_type="SCENE_REFERENCE", scene_reference_image_id=image_id))
+        child = WorkflowStep(
+            workflow_run_id=run.id,
+            step_key="VIDEO_SHOT",
+            position=position,
+            input_payload={"shot": deepcopy(frozen_shot), "binding": deepcopy(binding), "prompt": _frozen_prompt(run, "VIDEO_GENERATE")},
+            model_profile_snapshot=deepcopy(binding["profile_snapshot"]),
+            idempotency_key=child_key,
+            shot_plan_id=shot_id,
+            video_clip_id=clip.id,
+        )
+        db.add(child)
+        db.flush()
+        child_ids.append(child.id)
+    parent_step.output_payload = {"child_step_ids": child_ids, "child_count": len(child_ids)}
+    snapshot = deepcopy(run.input_snapshot or {})
+    snapshot["video_child_step_ids"] = child_ids
+    run.input_snapshot = snapshot
+
+
+def _validate_inputs(db: Session, state, run_key: str, *, shot_plan_ids: list[str] | None = None) -> None:
     """集中校验每个生成任务的冻结前置条件，前端无法跳过这些判断。"""
 
     project_id = state.project_id
     if run_key == "reference_analysis":
         source = db.scalar(
-            select(MediaAsset.id).where(MediaAsset.project_id == project_id, MediaAsset.kind == AssetKind.SOURCE_VIDEO).limit(1)
+            select(MediaAsset.id)
+            .where(MediaAsset.project_id == project_id, MediaAsset.kind == AssetKind.SOURCE_VIDEO)
+            .order_by(MediaAsset.created_at.desc())
+            .limit(1)
         )
         if source is None:
             _conflict("请先上传有授权的参考视频")
@@ -190,10 +324,210 @@ def _validate_inputs(db: Session, state, run_key: str) -> None:
         shots = list(db.scalars(select(ShotPlan).where(ShotPlan.director_plan_id == state.director_plan_id)).all())
         if not shots or not all(item.locked_keyframe_id for item in shots):
             _conflict("请先锁定所有分镜关键帧")
+        if shot_plan_ids:
+            current_ids = {item.id for item in shots}
+            if any(item not in current_ids for item in shot_plan_ids):
+                _conflict("指定镜头不属于当前导演方案")
     elif run_key == "final_compose":
         clips = _current_clips(db, state)
-        if not clips or not all(item.review_status == VideoReviewStatus.APPROVED.value for item in clips):
+        shot_count = db.scalar(select(func.count(ShotPlan.id)).where(ShotPlan.director_plan_id == state.director_plan_id)) or 0
+        if not clips or len(clips) != shot_count or not all(item.review_status == VideoReviewStatus.APPROVED.value for item in clips):
             _conflict("请先审核通过当前导演方案的全部视频片段")
+
+
+def _run_idempotency_key(project_id: str, run_key: str, context: dict[str, Any]) -> str:
+    """生成稳定、无密钥的任务语义键；供应商调用会使用其派生子键。"""
+
+    raw = f"{project_id}:{run_key}:{context}".encode("utf-8")
+    return f"run:{sha256(raw).hexdigest()}"
+
+
+def _freeze_model_bindings(db: Session, bindings: list[Any], *, slot_key: str) -> list[dict[str, Any]]:
+    """把槽位顺序、槽位 ID 与完整模型配置写进 WorkflowRun，Worker 不再回查中心。"""
+
+    return [
+        {
+            "position": position,
+            "slot_id": binding.slot_id,
+            "slot_key": slot_key,
+            "model_profile_id": binding.model_profile_id,
+            "profile_snapshot": _profile_snapshot(binding.model_profile_id, db),
+        }
+        for position, binding in enumerate(bindings, start=1)
+    ]
+
+
+def _freeze_prompt(db: Session, task_type: str) -> dict[str, Any]:
+    """将整份 Prompt（包括变量定义）冻结，而不仅记录一个可变 ID。"""
+
+    prompt = _active_prompt(db, task_type)
+    return {
+        "id": prompt.id,
+        "task_type": prompt.task_type,
+        "name": prompt.name,
+        "version": prompt.version,
+        "content": prompt.content,
+        "variables_schema": deepcopy(prompt.variables_schema),
+        "status": prompt.status.value,
+        "created_at": prompt.created_at.isoformat(),
+        "updated_at": prompt.updated_at.isoformat(),
+    }
+
+
+def _freeze_run_context(db: Session, state, run_key: str, *, shot_plan_ids: list[str] | None) -> dict[str, Any]:
+    """冻结本次节点会消费的素材、审核选择和资产版本 ID。"""
+
+    project_id = state.project_id
+    source = db.scalars(
+        select(MediaAsset)
+        .where(MediaAsset.project_id == project_id, MediaAsset.kind == AssetKind.SOURCE_VIDEO)
+        .order_by(MediaAsset.created_at.desc())
+    ).first()
+    analysis = db.get(ReferenceAnalysis, state.locked_reference_analysis_id) if state.locked_reference_analysis_id else None
+    story = db.get(StoryProposal, state.selected_story_proposal_id) if state.selected_story_proposal_id else None
+    plan = db.get(DirectorPlan, state.director_plan_id) if state.director_plan_id else None
+    characters = list(db.scalars(select(CharacterDefinition).where(CharacterDefinition.story_proposal_id == state.selected_story_proposal_id)).all()) if state.selected_story_proposal_id else []
+    scenes = list(db.scalars(select(SceneDefinition).where(SceneDefinition.story_proposal_id == state.selected_story_proposal_id)).all()) if state.selected_story_proposal_id else []
+    shots = list(db.scalars(select(ShotPlan).where(ShotPlan.director_plan_id == state.director_plan_id).order_by(ShotPlan.shot_number)).all()) if state.director_plan_id else []
+    if run_key == "video_generation":
+        requested = set(shot_plan_ids or [])
+        # 没有明确指定时，只为“尚未有当前通过版本”的镜头建子任务，重做不会浪费
+        # 已通过镜头的供应商费用。
+        shots = [
+            shot for shot in shots
+            if (not requested and not _shot_has_selected_approved_clip(db, shot)) or (requested and shot.id in requested)
+        ]
+    return {
+        "source_asset_id": source.id if source else None,
+        "source_asset": _asset_snapshot(source),
+        "locked_reference_analysis_id": analysis.id if analysis else None,
+        "locked_reference_analysis": _analysis_snapshot(analysis),
+        "selected_story_proposal_id": story.id if story else None,
+        "selected_story": {"id": story.id, "content": deepcopy(story.content)} if story else None,
+        "director_plan_id": plan.id if plan else None,
+        "director_plan": {"id": plan.id, "visual_bible": deepcopy(plan.visual_bible)} if plan else None,
+        # 所有资产生成阶段都把会进入模型 Prompt 的字段一起冻结。Worker 后续可以
+        # 查询这些 ID 的输出版本号，但不得从资产表回读描述或替换成新锁定图片。
+        "character_definitions": [_character_definition_snapshot(item) for item in characters],
+        "scene_definitions": [_scene_definition_snapshot(item) for item in scenes],
+        "locked_character_assets": [
+            _locked_character_asset_snapshot(db, item) for item in characters if item.locked_reference_image_id
+        ],
+        "locked_scene_assets": [
+            _locked_scene_asset_snapshot(db, item) for item in scenes if item.locked_reference_image_id
+        ],
+        "shots": [_shot_snapshot(db, shot) for shot in shots],
+        "selected_video_clip_ids": [shot.selected_video_clip_id for shot in shots if shot.selected_video_clip_id],
+        "requested_shot_plan_ids": [shot.id for shot in shots] if run_key == "video_generation" else [],
+    }
+
+
+def _asset_snapshot(source: MediaAsset | None) -> dict[str, Any] | None:
+    if source is None:
+        return None
+    return {
+        "id": source.id,
+        "storage_key": source.storage_key,
+        "original_filename": source.original_filename,
+        "content_type": source.content_type,
+        "byte_size": source.byte_size,
+    }
+
+
+def _analysis_snapshot(analysis: ReferenceAnalysis | None) -> dict[str, Any] | None:
+    if analysis is None:
+        return None
+    return {"id": analysis.id, "locked_snapshot": deepcopy(analysis.locked_snapshot)}
+
+
+def _character_definition_snapshot(character: CharacterDefinition) -> dict[str, Any]:
+    """冻结角色图生成和导演分镜所需的全部角色描述。"""
+
+    return {
+        "definition_id": character.id,
+        "character_code": character.character_code,
+        "name": character.name,
+        "age_description": character.age_description,
+        "appearance": character.appearance,
+        "costume": character.costume,
+        "temperament": character.temperament,
+        "locked_reference_image_id": character.locked_reference_image_id,
+    }
+
+
+def _scene_definition_snapshot(scene: SceneDefinition) -> dict[str, Any]:
+    """冻结场景图生成和导演分镜所需的全部场景描述。"""
+
+    return {
+        "definition_id": scene.id,
+        "scene_code": scene.scene_code,
+        "name": scene.name,
+        "location": scene.location,
+        "environment": scene.environment,
+        "visual_style": scene.visual_style,
+        "mood": scene.mood,
+        "locked_reference_image_id": scene.locked_reference_image_id,
+    }
+
+
+def _locked_character_asset_snapshot(db: Session, character: CharacterDefinition) -> dict[str, Any]:
+    """冻结已选角色图的版本 ID 和地址，禁止后续锁图改写旧任务输入。"""
+
+    image = db.get(CharacterReferenceImage, character.locked_reference_image_id)
+    if image is None or not image.image_url:
+        raise RuntimeError("锁定角色资产缺少可用参考图")
+    return {
+        **_character_definition_snapshot(character),
+        "reference_image": {"id": image.id, "version": image.version, "image_url": image.image_url},
+    }
+
+
+def _locked_scene_asset_snapshot(db: Session, scene: SceneDefinition) -> dict[str, Any]:
+    """冻结已选场景图的版本 ID 和地址，禁止后续锁图改写旧任务输入。"""
+
+    image = db.get(SceneReferenceImage, scene.locked_reference_image_id)
+    if image is None or not image.image_url:
+        raise RuntimeError("锁定场景资产缺少可用参考图")
+    return {
+        **_scene_definition_snapshot(scene),
+        "reference_image": {"id": image.id, "version": image.version, "image_url": image.image_url},
+    }
+
+
+def _shot_snapshot(db: Session, shot: ShotPlan) -> dict[str, Any]:
+    keyframe = db.get(ShotKeyframe, shot.locked_keyframe_id) if shot.locked_keyframe_id else None
+    bindings = list(db.scalars(select(ShotAssetBinding).where(ShotAssetBinding.shot_id == shot.id)).all())
+    character_references = []
+    scene_references = []
+    for binding in bindings:
+        if binding.character_reference_image_id:
+            image = db.get(CharacterReferenceImage, binding.character_reference_image_id)
+            if image is None or not image.image_url:
+                raise RuntimeError("分镜绑定的角色参考图不存在或没有地址")
+            character_references.append({"id": image.id, "image_url": image.image_url})
+        if binding.scene_reference_image_id:
+            image = db.get(SceneReferenceImage, binding.scene_reference_image_id)
+            if image is None or not image.image_url:
+                raise RuntimeError("分镜绑定的场景参考图不存在或没有地址")
+            scene_references.append({"id": image.id, "image_url": image.image_url})
+    return {
+        "shot_plan_id": shot.id,
+        "shot_number": shot.shot_number,
+        "action_description": shot.action_description,
+        "camera_description": shot.camera_description,
+        "duration_seconds": float(shot.duration_seconds),
+        "video_action_prompt": shot.video_action_prompt,
+        "locked_keyframe": {"id": keyframe.id, "image_url": keyframe.image_url} if keyframe else None,
+        "character_reference_images": character_references,
+        "scene_reference_images": scene_references,
+        "character_reference_image_ids": [item["id"] for item in character_references],
+        "scene_reference_image_ids": [item["id"] for item in scene_references],
+    }
+
+
+def _shot_has_selected_approved_clip(db: Session, shot: ShotPlan) -> bool:
+    clip = db.get(VideoClip, shot.selected_video_clip_id) if shot.selected_video_clip_id else None
+    return bool(clip and clip.generation_status == RunStatus.SUCCEEDED.value and clip.review_status == VideoReviewStatus.APPROVED.value)
 
 
 def execute_v1_workflow(run_id: str) -> None:
@@ -205,6 +539,10 @@ def execute_v1_workflow(run_id: str) -> None:
         if run is None or not run.workflow_key.startswith(V1_WORKFLOW_PREFIX) or run.status != RunStatus.PENDING:
             return
         run_key = run.workflow_key.removeprefix(V1_WORKFLOW_PREFIX)
+        # 视频阶段由每镜头独立 Job 执行；父 Run 只聚合子任务状态，不能再走旧的
+        # 单 Job 串行轮询路径。
+        if run_key == "video_generation":
+            return
         now = utcnow()
         run.status = RunStatus.RUNNING
         run.started_at = now
@@ -276,24 +614,75 @@ def _active_prompt(db: Session, task_type: str) -> PromptTemplate:
     return prompt
 
 
-def _invoke(db: Session, *, run: WorkflowRun, slot_key: str, task_type: str, input_snapshot: dict[str, Any], profile_id: str) -> ModelInvocation:
-    """为一次模型执行保存配置与 Prompt 快照；成功/失败由调用方后续更新。"""
+def _frozen_bindings(run: WorkflowRun, slot_key: str) -> list[dict[str, Any]]:
+    """返回创建时固化的有序模型列表；禁止 Worker 回读模型中心。"""
 
-    slot = db.scalar(select(ModelSlot).where(ModelSlot.slot_key == slot_key))
-    if slot is None:
-        raise RuntimeError(f"模型槽位 {slot_key} 不存在")
-    profile_snapshot = _profile_snapshot(profile_id, db)
-    prompt = _active_prompt(db, task_type)
+    snapshot = run.input_snapshot or {}
+    bindings = ((snapshot.get("model_bindings") or {}).get(slot_key))
+    if not isinstance(bindings, list) or not bindings:
+        raise RuntimeError(f"运行 {run.id} 缺少冻结模型槽位 {slot_key}")
+    normalized = [item for item in bindings if isinstance(item, dict) and isinstance(item.get("profile_snapshot"), dict)]
+    if len(normalized) != len(bindings):
+        raise RuntimeError("冻结模型快照格式无效")
+    return normalized
+
+
+def _frozen_prompt(run: WorkflowRun, task_type: str) -> dict[str, Any]:
+    """返回创建时的完整 Prompt 版本；禁止 Worker 回读 ACTIVE 模板。"""
+
+    snapshot = run.input_snapshot or {}
+    prompt = ((snapshot.get("prompt_templates") or {}).get(task_type))
+    if not isinstance(prompt, dict) or not isinstance(prompt.get("content"), str) or not prompt["content"].strip():
+        raise RuntimeError(f"运行 {run.id} 缺少冻结 Prompt：{task_type}")
+    return prompt
+
+
+def _frozen_context(run: WorkflowRun) -> dict[str, Any]:
+    context = (run.input_snapshot or {}).get("context")
+    if not isinstance(context, dict):
+        raise RuntimeError(f"运行 {run.id} 缺少冻结业务输入")
+    return context
+
+
+def _invoke(
+    db: Session,
+    *,
+    run: WorkflowRun,
+    slot_key: str,
+    task_type: str,
+    input_snapshot: dict[str, Any],
+    binding: dict[str, Any],
+    workflow_step_id: str | None = None,
+    idempotency_key: str | None = None,
+) -> ModelInvocation:
+    """使用运行冻结的槽位/模型/Prompt 创建一次可计费调用审计。
+
+    相同 ``idempotency_key`` 已存在时直接返回原调用，确保 Worker 重启、网络重试或
+    并发任务不会重复向供应商提交请求。
+    """
+
+    if idempotency_key:
+        existing = db.scalars(select(ModelInvocation).where(ModelInvocation.idempotency_key == idempotency_key)).first()
+        if existing is not None:
+            return existing
+    profile_snapshot = binding.get("profile_snapshot")
+    slot_id = binding.get("slot_id")
+    profile_id = binding.get("model_profile_id")
+    if not isinstance(profile_snapshot, dict) or not isinstance(slot_id, str) or not isinstance(profile_id, str):
+        raise RuntimeError("冻结模型绑定格式无效")
+    prompt = _frozen_prompt(run, task_type)
     invocation = ModelInvocation(
         project_id=run.project_id,
         workflow_run_id=run.id,
-        model_slot_id=slot.id,
+        workflow_step_id=workflow_step_id,
+        model_slot_id=slot_id,
         model_profile_id=profile_id,
-        prompt_template_id=prompt.id,
+        prompt_template_id=prompt.get("id"),
         task_type=task_type,
-        model_profile_snapshot=profile_snapshot,
-        prompt_snapshot={"id": prompt.id, "name": prompt.name, "version": prompt.version, "content": prompt.content},
+        model_profile_snapshot=deepcopy(profile_snapshot),
+        prompt_snapshot=deepcopy(prompt),
         input_snapshot=deepcopy(input_snapshot),
+        idempotency_key=idempotency_key,
         status=RunStatus.RUNNING,
     )
     db.add(invocation)
@@ -350,13 +739,6 @@ def _fail_invocation(
     invocation.output_reference = {"error": message[:1000]}
 
 
-def _bindings(db: Session, slot_key: str):
-    bindings = enabled_profiles_for_slot(db, slot_key)
-    if not bindings:
-        raise RuntimeError(f"模型槽位 {slot_key} 没有启用配置")
-    return bindings
-
-
 def _is_mock(profile_snapshot: dict[str, Any]) -> bool:
     """保留显式本地模拟路径；真实路径统一由 V1 Adapter 层处理。"""
 
@@ -372,15 +754,27 @@ def _system_instruction(invocation: ModelInvocation, extra_rules: str) -> str:
     return f"{content.strip()}\n\n{extra_rules.strip()}"
 
 
-def _latest_source(db: Session, project_id: str) -> MediaAsset:
-    item = db.scalars(
-        select(MediaAsset)
-        .where(MediaAsset.project_id == project_id, MediaAsset.kind == AssetKind.SOURCE_VIDEO)
-        .order_by(MediaAsset.created_at.desc())
-    ).first()
-    if item is None:
-        raise RuntimeError("参考视频不存在")
-    return item
+def _frozen_source(db: Session, run: WorkflowRun) -> MediaAsset:
+    """由冻结素材快照重建 Adapter 输入，拒绝读取“最新上传素材”。"""
+
+    del db  # 此函数刻意不回查 media_assets；执行输入只来自 WorkflowRun 快照。
+    source = _frozen_context(run).get("source_asset")
+    if not isinstance(source, dict):
+        raise RuntimeError("创建任务时冻结的参考视频快照不存在")
+    required = ("id", "storage_key", "original_filename", "content_type", "byte_size")
+    if not all(isinstance(source.get(key), str) and source[key] for key in required[:-1]) or not isinstance(source.get("byte_size"), int):
+        raise RuntimeError("创建任务时冻结的参考视频快照格式无效")
+    # Adapter 只需要这五个不可变元数据字段；构造未持久化实体可以复用既有类型契约，
+    # 又避免供应商执行时受数据库里“最新上传”记录影响。
+    return MediaAsset(
+        id=source["id"],
+        project_id=run.project_id,
+        kind=AssetKind.SOURCE_VIDEO,
+        storage_key=source["storage_key"],
+        original_filename=source["original_filename"],
+        content_type=source["content_type"],
+        byte_size=source["byte_size"],
+    )
 
 
 def _analysis_payload_from_adapter(result: dict[str, Any]) -> dict[str, Any]:
@@ -433,9 +827,9 @@ def _analysis_payload_from_adapter(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _execute_reference_analysis(db: Session, run: WorkflowRun) -> None:
-    source = _latest_source(db, run.project_id)
-    binding = _bindings(db, "VIDEO_ANALYSIS")[0]
-    invocation = _invoke(db, run=run, slot_key="VIDEO_ANALYSIS", task_type="VIDEO_ANALYSIS", input_snapshot={"source_asset_id": source.id}, profile_id=binding.model_profile_id)
+    source = _frozen_source(db, run)
+    binding = _frozen_bindings(run, "VIDEO_ANALYSIS")[0]
+    invocation = _invoke(db, run=run, slot_key="VIDEO_ANALYSIS", task_type="VIDEO_ANALYSIS", input_snapshot={"source_asset_id": source.id}, binding=binding)
     snapshot = invocation.model_profile_snapshot
     started_at = perf_counter()
     if _is_mock(snapshot):
@@ -576,15 +970,34 @@ STORY_OUTPUT_CONTRACT = (
 
 
 def _execute_story_generation(db: Session, run: WorkflowRun) -> None:
-    state = get_project_production_state(db, run.project_id)
-    analysis = db.get(ReferenceAnalysis, state.locked_reference_analysis_id)
-    if analysis is None or analysis.locked_snapshot is None:
-        raise RuntimeError("锁定创作简报不存在")
-    batch = StoryGenerationBatch(project_id=run.project_id, reference_analysis_id=analysis.id, workflow_run_id=run.id, request_snapshot=deepcopy(analysis.locked_snapshot), status=RunStatus.RUNNING)
+    frozen_analysis = _frozen_context(run).get("locked_reference_analysis")
+    analysis_id = frozen_analysis.get("id") if isinstance(frozen_analysis, dict) else None
+    locked_snapshot = frozen_analysis.get("locked_snapshot") if isinstance(frozen_analysis, dict) else None
+    if not isinstance(analysis_id, str) or not isinstance(locked_snapshot, dict):
+        raise RuntimeError("运行缺少创建时冻结的锁定创作简报")
+    # 这里故意不读取 ReferenceAnalysis.locked_snapshot。即使后来有人修改展示字段、
+    # 切换项目指针或归档旧分析，本次故事任务仍严格使用创建 WorkflowRun 时的副本。
+    batch = StoryGenerationBatch(
+        project_id=run.project_id,
+        reference_analysis_id=analysis_id,
+        workflow_run_id=run.id,
+        request_snapshot=deepcopy(locked_snapshot),
+        status=RunStatus.RUNNING,
+    )
     db.add(batch)
     db.flush()
-    for position, binding in enumerate(_bindings(db, "STORY_GENERATE"), start=1):
-        invocation = _invoke(db, run=run, slot_key="STORY_GENERATE", task_type="STORY_GENERATE", input_snapshot={"analysis_id": analysis.id, "creative_brief": analysis.locked_snapshot["creative_brief"]}, profile_id=binding.model_profile_id)
+    for position, binding in enumerate(_frozen_bindings(run, "STORY_GENERATE"), start=1):
+        creative_brief = locked_snapshot.get("creative_brief")
+        if not isinstance(creative_brief, dict):
+            raise RuntimeError("冻结创作简报缺少 creative_brief")
+        invocation = _invoke(
+            db,
+            run=run,
+            slot_key="STORY_GENERATE",
+            task_type="STORY_GENERATE",
+            input_snapshot={"analysis_id": analysis_id, "creative_brief": deepcopy(creative_brief)},
+            binding=binding,
+        )
         snapshot = invocation.model_profile_snapshot
         started_at = perf_counter()
         if _is_mock(snapshot):
@@ -598,7 +1011,7 @@ def _execute_story_generation(db: Session, run: WorkflowRun) -> None:
                     "输出一个完全原创的短剧方案。只能使用已锁定简报中的结构和情绪机制，"
                     "不得复制参考视频的台词、人物、画面或具体剧情。",
                 ),
-                user_payload={"locked_reference_analysis": analysis.locked_snapshot},
+                user_payload={"locked_reference_analysis": deepcopy(locked_snapshot)},
                 output_contract=STORY_OUTPUT_CONTRACT,
             )
             content = _normalize_story_content(result, snapshot["display_name"])
@@ -616,12 +1029,24 @@ def _execute_story_generation(db: Session, run: WorkflowRun) -> None:
     mark_story_batch_ready(db, batch.id)
 
 
-def _selected_story(db: Session, project_id: str) -> StoryProposal:
-    state = get_project_production_state(db, project_id)
-    story = db.get(StoryProposal, state.selected_story_proposal_id)
-    if story is None:
-        raise RuntimeError("当前选中故事不存在")
-    return story
+def _frozen_story_id(run: WorkflowRun) -> str:
+    """返回创建时冻结的故事 ID；不回查项目当前选中故事。"""
+
+    story = _frozen_context(run).get("selected_story")
+    story_id = story.get("id") if isinstance(story, dict) else None
+    if not isinstance(story_id, str) or not story_id:
+        raise RuntimeError("运行缺少创建时冻结的选中故事 ID")
+    return story_id
+
+
+def _frozen_story_content(run: WorkflowRun) -> dict[str, Any]:
+    """读取创建时冻结的故事正文，避免执行时使用可变的 StoryProposal.content。"""
+
+    story = _frozen_context(run).get("selected_story")
+    content = story.get("content") if isinstance(story, dict) else None
+    if not isinstance(content, dict):
+        raise RuntimeError("运行缺少创建时冻结的选中故事正文")
+    return deepcopy(content)
 
 
 def _normalize_character_designs(result: dict[str, Any]) -> list[dict[str, str]]:
@@ -691,17 +1116,18 @@ SCENE_DESIGN_OUTPUT_CONTRACT = (
 
 
 def _execute_character_design(db: Session, run: WorkflowRun) -> None:
-    story = _selected_story(db, run.project_id)
-    if db.scalar(select(CharacterDefinition.id).where(CharacterDefinition.story_proposal_id == story.id).limit(1)):
+    story_id = _frozen_story_id(run)
+    story_content = _frozen_story_content(run)
+    if db.scalar(select(CharacterDefinition.id).where(CharacterDefinition.story_proposal_id == story_id).limit(1)):
         # 基础资产一旦已有记录不能被新的运行覆盖；前端在“设计已生成、图片未生成”
         # 的中断场景下可以安全重试，而真正重做应创建新的故事生产版本。
         return
-    binding = _bindings(db, "CHARACTER_DESIGN")[0]
-    invocation = _invoke(db, run=run, slot_key="CHARACTER_DESIGN", task_type="CHARACTER_DESIGN", input_snapshot={"story_id": story.id}, profile_id=binding.model_profile_id)
+    binding = _frozen_bindings(run, "CHARACTER_DESIGN")[0]
+    invocation = _invoke(db, run=run, slot_key="CHARACTER_DESIGN", task_type="CHARACTER_DESIGN", input_snapshot={"story_id": story_id}, binding=binding)
     snapshot = invocation.model_profile_snapshot
     started_at = perf_counter()
     if _is_mock(snapshot):
-        roles = story.content.get("roles", [])
+        roles = story_content.get("roles", [])
     else:
         result = generate_structured_text(
             snapshot,
@@ -711,7 +1137,7 @@ def _execute_character_design(db: Session, run: WorkflowRun) -> None:
                 "依据已选原创故事设计可长期复用的角色资产。角色必须是原创，"
                 "并将外貌、服装和性格写成稳定、可供参考图生成的描述。",
             ),
-            user_payload={"selected_story": story.content},
+            user_payload={"selected_story": story_content},
             output_contract=CHARACTER_DESIGN_OUTPUT_CONTRACT,
         )
         roles = _normalize_character_designs(result)
@@ -720,26 +1146,27 @@ def _execute_character_design(db: Session, run: WorkflowRun) -> None:
     for index, role in enumerate(roles, start=1):
         if not isinstance(role, dict):
             continue
-        db.add(CharacterDefinition(project_id=run.project_id, story_proposal_id=story.id, character_code=str(role.get("code") or f"ROLE_{index}"), name=str(role.get("name") or f"角色 {index}"), age_description=str(role.get("age") or "成年人"), appearance=str(role.get("appearance") or "原创角色外貌"), costume=str(role.get("costume") or "原创服装"), temperament=str(role.get("temperament") or "有明确行动目标"), design_status=DesignStatus.READY))
+        db.add(CharacterDefinition(project_id=run.project_id, story_proposal_id=story_id, character_code=str(role.get("code") or f"ROLE_{index}"), name=str(role.get("name") or f"角色 {index}"), age_description=str(role.get("age") or "成年人"), appearance=str(role.get("appearance") or "原创角色外貌"), costume=str(role.get("costume") or "原创服装"), temperament=str(role.get("temperament") or "有明确行动目标"), design_status=DesignStatus.READY))
     _finish_invocation(
         db,
         invocation,
-        {"story_id": story.id, "kind": "CHARACTER_DESIGN", "count": len(roles)},
+        {"story_id": story_id, "kind": "CHARACTER_DESIGN", "count": len(roles)},
         started_at=started_at,
     )
     db.commit()
 
 
 def _execute_scene_design(db: Session, run: WorkflowRun) -> None:
-    story = _selected_story(db, run.project_id)
-    if db.scalar(select(SceneDefinition.id).where(SceneDefinition.story_proposal_id == story.id).limit(1)):
+    story_id = _frozen_story_id(run)
+    story_content = _frozen_story_content(run)
+    if db.scalar(select(SceneDefinition.id).where(SceneDefinition.story_proposal_id == story_id).limit(1)):
         return
-    binding = _bindings(db, "SCENE_DESIGN")[0]
-    invocation = _invoke(db, run=run, slot_key="SCENE_DESIGN", task_type="SCENE_DESIGN", input_snapshot={"story_id": story.id}, profile_id=binding.model_profile_id)
+    binding = _frozen_bindings(run, "SCENE_DESIGN")[0]
+    invocation = _invoke(db, run=run, slot_key="SCENE_DESIGN", task_type="SCENE_DESIGN", input_snapshot={"story_id": story_id}, binding=binding)
     snapshot = invocation.model_profile_snapshot
     started_at = perf_counter()
     if _is_mock(snapshot):
-        scenes = story.content.get("scenes", [])
+        scenes = story_content.get("scenes", [])
     else:
         result = generate_structured_text(
             snapshot,
@@ -749,7 +1176,7 @@ def _execute_scene_design(db: Session, run: WorkflowRun) -> None:
                 "依据已选原创故事设计可长期复用的场景资产。描述要便于持续保持地点、"
                 "环境、视觉风格和氛围一致，且不得复制参考视频画面。",
             ),
-            user_payload={"selected_story": story.content},
+            user_payload={"selected_story": story_content},
             output_contract=SCENE_DESIGN_OUTPUT_CONTRACT,
         )
         scenes = _normalize_scene_designs(result)
@@ -758,11 +1185,11 @@ def _execute_scene_design(db: Session, run: WorkflowRun) -> None:
     for index, scene in enumerate(scenes, start=1):
         if not isinstance(scene, dict):
             continue
-        db.add(SceneDefinition(project_id=run.project_id, story_proposal_id=story.id, scene_code=str(scene.get("code") or f"SCENE_{index}"), name=str(scene.get("name") or f"场景 {index}"), location=str(scene.get("location") or "原创地点"), environment=str(scene.get("environment") or "原创环境"), visual_style=str(scene.get("visual_style") or "电影感"), mood=str(scene.get("mood") or "紧张"), design_status=DesignStatus.READY))
+        db.add(SceneDefinition(project_id=run.project_id, story_proposal_id=story_id, scene_code=str(scene.get("code") or f"SCENE_{index}"), name=str(scene.get("name") or f"场景 {index}"), location=str(scene.get("location") or "原创地点"), environment=str(scene.get("environment") or "原创环境"), visual_style=str(scene.get("visual_style") or "电影感"), mood=str(scene.get("mood") or "紧张"), design_status=DesignStatus.READY))
     _finish_invocation(
         db,
         invocation,
-        {"story_id": story.id, "kind": "SCENE_DESIGN", "count": len(scenes)},
+        {"story_id": story_id, "kind": "SCENE_DESIGN", "count": len(scenes)},
         started_at=started_at,
     )
     db.commit()
@@ -778,32 +1205,44 @@ def _image_prompt(instruction: str, subject: str) -> str:
     return f"{instruction.strip()}\n\n生成对象：{subject.strip()}"
 
 
+def _frozen_asset_rows(run: WorkflowRun, key: str) -> list[dict[str, Any]]:
+    """读取创建时冻结的资产定义，拒绝由运行时数据库内容填充模型输入。"""
+
+    rows = _frozen_context(run).get(key)
+    if not isinstance(rows, list) or not rows or not all(isinstance(item, dict) for item in rows):
+        raise RuntimeError(f"运行缺少冻结资产快照：{key}")
+    return [deepcopy(item) for item in rows]
+
+
 def _execute_character_images(db: Session, run: WorkflowRun) -> None:
-    story = _selected_story(db, run.project_id)
-    characters = list(db.scalars(select(CharacterDefinition).where(CharacterDefinition.story_proposal_id == story.id)).all())
-    binding = _bindings(db, "CHARACTER_IMAGE_GENERATE")[0]
+    characters = _frozen_asset_rows(run, "character_definitions")
+    binding = _frozen_bindings(run, "CHARACTER_IMAGE_GENERATE")[0]
     for character in characters:
-        invocation = _invoke(db, run=run, slot_key="CHARACTER_IMAGE_GENERATE", task_type="IMAGE_GENERATE", input_snapshot={"character_id": character.id}, profile_id=binding.model_profile_id)
+        character_id = character.get("definition_id")
+        if not isinstance(character_id, str):
+            raise RuntimeError("冻结角色资产缺少 definition_id")
+        invocation = _invoke(db, run=run, slot_key="CHARACTER_IMAGE_GENERATE", task_type="IMAGE_GENERATE", input_snapshot={"character_id": character_id}, binding=binding)
         snapshot = invocation.model_profile_snapshot
-        version = (db.scalar(select(func.max(CharacterReferenceImage.version)).where(CharacterReferenceImage.character_id == character.id)) or 0) + 1
+        version = (db.scalar(select(func.max(CharacterReferenceImage.version)).where(CharacterReferenceImage.character_id == character_id)) or 0) + 1
         prompt = _image_prompt(
             _system_instruction(invocation, "输出单人角色设定参考图，不出现文字、水印或其他未定义角色。"),
-            f"角色编码：{character.character_code}；姓名：{character.name}；年龄：{character.age_description}；"
-            f"外貌：{character.appearance}；服装：{character.costume}；气质：{character.temperament}。",
+            f"角色编码：{character.get('character_code', '')}；姓名：{character.get('name', '')}；"
+            f"年龄：{character.get('age_description', '')}；外貌：{character.get('appearance', '')}；"
+            f"服装：{character.get('costume', '')}；气质：{character.get('temperament', '')}。",
         )
         started_at = perf_counter()
         if _is_mock(snapshot):
-            image_url = _mock_image_url("character", character.id, version)
+            image_url = _mock_image_url("character", character_id, version)
         else:
             provider_url = generate_image(snapshot, prompt=prompt)
             image_url = persist_v1_image(
                 project_id=run.project_id,
                 asset_kind="character-reference",
-                asset_id=character.id,
+                asset_id=character_id,
                 version=version,
                 source_url=provider_url,
             )
-        image = CharacterReferenceImage(character_id=character.id, project_id=run.project_id, generation_run_id=run.id, model_invocation_id=invocation.id, version=version, prompt_snapshot=prompt, image_url=image_url, generation_status=RunStatus.SUCCEEDED)
+        image = CharacterReferenceImage(character_id=character_id, project_id=run.project_id, generation_run_id=run.id, model_invocation_id=invocation.id, version=version, prompt_snapshot=prompt, image_url=image_url, generation_status=RunStatus.SUCCEEDED)
         db.add(image)
         _finish_invocation(
             db,
@@ -816,31 +1255,34 @@ def _execute_character_images(db: Session, run: WorkflowRun) -> None:
 
 
 def _execute_scene_images(db: Session, run: WorkflowRun) -> None:
-    story = _selected_story(db, run.project_id)
-    scenes = list(db.scalars(select(SceneDefinition).where(SceneDefinition.story_proposal_id == story.id)).all())
-    binding = _bindings(db, "SCENE_IMAGE_GENERATE")[0]
+    scenes = _frozen_asset_rows(run, "scene_definitions")
+    binding = _frozen_bindings(run, "SCENE_IMAGE_GENERATE")[0]
     for scene in scenes:
-        invocation = _invoke(db, run=run, slot_key="SCENE_IMAGE_GENERATE", task_type="IMAGE_GENERATE", input_snapshot={"scene_id": scene.id}, profile_id=binding.model_profile_id)
+        scene_id = scene.get("definition_id")
+        if not isinstance(scene_id, str):
+            raise RuntimeError("冻结场景资产缺少 definition_id")
+        invocation = _invoke(db, run=run, slot_key="SCENE_IMAGE_GENERATE", task_type="IMAGE_GENERATE", input_snapshot={"scene_id": scene_id}, binding=binding)
         snapshot = invocation.model_profile_snapshot
-        version = (db.scalar(select(func.max(SceneReferenceImage.version)).where(SceneReferenceImage.scene_id == scene.id)) or 0) + 1
+        version = (db.scalar(select(func.max(SceneReferenceImage.version)).where(SceneReferenceImage.scene_id == scene_id)) or 0) + 1
         prompt = _image_prompt(
             _system_instruction(invocation, "输出无人场景设定参考图，不出现文字、水印或未定义人物。"),
-            f"场景编码：{scene.scene_code}；名称：{scene.name}；地点：{scene.location}；"
-            f"环境：{scene.environment}；视觉风格：{scene.visual_style}；氛围：{scene.mood}。",
+            f"场景编码：{scene.get('scene_code', '')}；名称：{scene.get('name', '')}；地点：{scene.get('location', '')}；"
+            f"环境：{scene.get('environment', '')}；视觉风格：{scene.get('visual_style', '')}；"
+            f"氛围：{scene.get('mood', '')}。",
         )
         started_at = perf_counter()
         if _is_mock(snapshot):
-            image_url = _mock_image_url("scene", scene.id, version)
+            image_url = _mock_image_url("scene", scene_id, version)
         else:
             provider_url = generate_image(snapshot, prompt=prompt)
             image_url = persist_v1_image(
                 project_id=run.project_id,
                 asset_kind="scene-reference",
-                asset_id=scene.id,
+                asset_id=scene_id,
                 version=version,
                 source_url=provider_url,
             )
-        image = SceneReferenceImage(scene_id=scene.id, project_id=run.project_id, generation_run_id=run.id, model_invocation_id=invocation.id, version=version, prompt_snapshot=prompt, image_url=image_url, generation_status=RunStatus.SUCCEEDED)
+        image = SceneReferenceImage(scene_id=scene_id, project_id=run.project_id, generation_run_id=run.id, model_invocation_id=invocation.id, version=version, prompt_snapshot=prompt, image_url=image_url, generation_status=RunStatus.SUCCEEDED)
         db.add(image)
         _finish_invocation(
             db,
@@ -863,10 +1305,10 @@ DIRECTOR_PLAN_OUTPUT_CONTRACT = (
 def _normalize_director_plan(
     result: dict[str, Any],
     *,
-    characters: list[CharacterDefinition],
-    scenes: list[SceneDefinition],
+    characters: list[dict[str, Any]],
+    scenes: list[dict[str, Any]],
 ) -> tuple[dict[str, str], list[dict[str, Any]]]:
-    """验证导演模型只引用已锁定资产，并输出规范的镜头规划。"""
+    """按冻结资产快照校验导演输出，不从运行时资产表读取 Prompt 输入。"""
 
     bible = result.get("visual_bible")
     shots = result.get("shots")
@@ -876,8 +1318,8 @@ def _normalize_director_plan(
         "continuity": _required_text(bible.get("continuity"), "visual_bible.continuity"),
         "style": _required_text(bible.get("style"), "visual_bible.style"),
     }
-    characters_by_code = {item.character_code: item for item in characters}
-    scenes_by_code = {item.scene_code: item for item in scenes}
+    characters_by_code = {item.get("character_code"): item for item in characters if isinstance(item.get("character_code"), str)}
+    scenes_by_code = {item.get("scene_code"): item for item in scenes if isinstance(item.get("scene_code"), str)}
     normalized: list[dict[str, Any]] = []
     seen_numbers: set[int] = set()
     for index, item in enumerate(shots[:80], start=1):
@@ -889,15 +1331,15 @@ def _normalize_director_plan(
         seen_numbers.add(number)
         scene_code = _code(item.get("scene_code"), "")
         scene = scenes_by_code.get(scene_code)
-        if scene is None or not scene.locked_reference_image_id:
+        if scene is None or not isinstance(scene.get("reference_image"), dict):
             raise RuntimeError(f"导演模型引用了未锁定或不存在的场景：{scene_code or '未填写'}")
         character_codes = item.get("character_codes")
         if not isinstance(character_codes, list):
             raise RuntimeError(f"第 {number} 镜的 character_codes 必须是数组")
-        selected_characters: list[CharacterDefinition] = []
+        selected_characters: list[dict[str, Any]] = []
         for character_code in character_codes:
             character = characters_by_code.get(_code(character_code, ""))
-            if character is None or not character.locked_reference_image_id:
+            if character is None or not isinstance(character.get("reference_image"), dict):
                 raise RuntimeError(f"第 {number} 镜引用了未锁定或不存在的角色")
             if character not in selected_characters:
                 selected_characters.append(character)
@@ -921,13 +1363,13 @@ def _normalize_director_plan(
 
 
 def _execute_director_plan(db: Session, run: WorkflowRun) -> None:
-    story = _selected_story(db, run.project_id)
-    state = get_project_production_state(db, run.project_id)
-    binding = _bindings(db, "DIRECTOR_PLAN")[0]
-    invocation = _invoke(db, run=run, slot_key="DIRECTOR_PLAN", task_type="DIRECTOR_PLAN", input_snapshot={"story_id": story.id}, profile_id=binding.model_profile_id)
+    story_id = _frozen_story_id(run)
+    story_content = _frozen_story_content(run)
+    binding = _frozen_bindings(run, "DIRECTOR_PLAN")[0]
+    invocation = _invoke(db, run=run, slot_key="DIRECTOR_PLAN", task_type="DIRECTOR_PLAN", input_snapshot={"story_id": story_id}, binding=binding)
     snapshot = invocation.model_profile_snapshot
-    characters = list(db.scalars(select(CharacterDefinition).where(CharacterDefinition.story_proposal_id == story.id)).all())
-    scenes = list(db.scalars(select(SceneDefinition).where(SceneDefinition.story_proposal_id == story.id)).all())
+    characters = _frozen_asset_rows(run, "locked_character_assets")
+    scenes = _frozen_asset_rows(run, "locked_scene_assets")
     started_at = perf_counter()
     if _is_mock(snapshot):
         visual_bible = {"continuity": "所有镜头只能引用锁定角色图和场景图", "style": "原创现实主义短剧"}
@@ -936,7 +1378,7 @@ def _execute_director_plan(db: Session, run: WorkflowRun) -> None:
                 "number": number,
                 "scene": scenes[(number - 1) % len(scenes)],
                 "characters": characters,
-                "action_description": f"角色在{scenes[(number - 1) % len(scenes)].name}中因新线索采取行动",
+                "action_description": f"角色在{scenes[(number - 1) % len(scenes)].get('name', '场景')}中因新线索采取行动",
                 "camera_description": "中近景，缓慢推进，强调关系变化",
                 "duration_seconds": 3.0,
                 "video_action_prompt": "角色动作自然克制，保持锁定角色与场景一致",
@@ -953,22 +1395,22 @@ def _execute_director_plan(db: Session, run: WorkflowRun) -> None:
                 "每镜必须给出动作、机位、时长和图生视频动作描述。",
             ),
             user_payload={
-                "selected_story": story.content,
+                "selected_story": story_content,
                 "locked_characters": [
-                    {"code": item.character_code, "name": item.name, "appearance": item.appearance, "costume": item.costume,
-                     "reference_image_id": item.locked_reference_image_id}
+                    {"code": item.get("character_code"), "name": item.get("name"), "appearance": item.get("appearance"),
+                     "costume": item.get("costume"), "reference_image_id": item["reference_image"].get("id")}
                     for item in characters
                 ],
                 "locked_scenes": [
-                    {"code": item.scene_code, "name": item.name, "environment": item.environment,
-                     "visual_style": item.visual_style, "reference_image_id": item.locked_reference_image_id}
+                    {"code": item.get("scene_code"), "name": item.get("name"), "environment": item.get("environment"),
+                     "visual_style": item.get("visual_style"), "reference_image_id": item["reference_image"].get("id")}
                     for item in scenes
                 ],
             },
             output_contract=DIRECTOR_PLAN_OUTPUT_CONTRACT,
         )
         visual_bible, planned_shots = _normalize_director_plan(result, characters=characters, scenes=scenes)
-    plan = DirectorPlan(project_id=run.project_id, story_proposal_id=story.id, workflow_run_id=run.id, visual_bible=visual_bible, status=DirectorPlanStatus.READY)
+    plan = DirectorPlan(project_id=run.project_id, story_proposal_id=story_id, workflow_run_id=run.id, visual_bible=visual_bible, status=DirectorPlanStatus.READY)
     db.add(plan)
     db.flush()
     for specification in planned_shots:
@@ -977,7 +1419,13 @@ def _execute_director_plan(db: Session, run: WorkflowRun) -> None:
         db.add(shot)
         db.flush()
         for character in specification["characters"]:
-            db.add(ShotAssetBinding(shot_id=shot.id, character_id=character.id, character_reference_image_id=character.locked_reference_image_id, scene_id=scene.id, scene_reference_image_id=scene.locked_reference_image_id))
+            character_image = character.get("reference_image")
+            scene_image = scene.get("reference_image")
+            character_id = character.get("definition_id")
+            scene_id = scene.get("definition_id")
+            if not isinstance(character_id, str) or not isinstance(scene_id, str) or not isinstance(character_image, dict) or not isinstance(scene_image, dict):
+                raise RuntimeError("冻结导演资产快照不完整")
+            db.add(ShotAssetBinding(shot_id=shot.id, character_id=character_id, character_reference_image_id=character_image.get("id"), scene_id=scene_id, scene_reference_image_id=scene_image.get("id")))
     _finish_invocation(
         db,
         invocation,
@@ -989,53 +1437,62 @@ def _execute_director_plan(db: Session, run: WorkflowRun) -> None:
 
 
 def _execute_shot_keyframes(db: Session, run: WorkflowRun) -> None:
-    state = get_project_production_state(db, run.project_id)
-    shots = list(db.scalars(select(ShotPlan).where(ShotPlan.director_plan_id == state.director_plan_id)).all())
-    binding = _bindings(db, "SHOT_KEYFRAME_GENERATE")[0]
+    shots = _frozen_asset_rows(run, "shots")
+    binding = _frozen_bindings(run, "SHOT_KEYFRAME_GENERATE")[0]
     for shot in shots:
-        bindings = list(db.scalars(select(ShotAssetBinding).where(ShotAssetBinding.shot_id == shot.id)).all())
-        invocation = _invoke(db, run=run, slot_key="SHOT_KEYFRAME_GENERATE", task_type="IMAGE_GENERATE", input_snapshot={"shot_id": shot.id, "asset_binding_ids": [item.id for item in bindings]}, profile_id=binding.model_profile_id)
-        snapshot = invocation.model_profile_snapshot
-        version = (db.scalar(select(func.max(ShotKeyframe.version)).where(ShotKeyframe.shot_id == shot.id)) or 0) + 1
-        character_images = [
-            db.get(CharacterReferenceImage, item.character_reference_image_id)
-            for item in bindings
-            if item.character_reference_image_id
-        ]
-        scene_images = [
-            db.get(SceneReferenceImage, item.scene_reference_image_id)
-            for item in bindings
-            if item.scene_reference_image_id
-        ]
+        shot_id = shot.get("shot_plan_id")
+        shot_number = shot.get("shot_number")
+        if not isinstance(shot_id, str) or not isinstance(shot_number, int):
+            raise RuntimeError("冻结分镜缺少镜头 ID 或编号")
+        character_references = shot.get("character_reference_images")
+        scene_references = shot.get("scene_reference_images")
+        if not isinstance(character_references, list) or not isinstance(scene_references, list):
+            raise RuntimeError("冻结分镜缺少资产引用快照")
+        reference_rows = [*character_references, *scene_references]
         reference_urls = list(
             dict.fromkeys(
-                [item.image_url for item in [*character_images, *scene_images] if item is not None and item.image_url]
+                item.get("image_url") for item in reference_rows
+                if isinstance(item, dict) and isinstance(item.get("image_url"), str) and item["image_url"]
             )
         )
         if not reference_urls:
-            raise RuntimeError("分镜关键帧缺少已锁定的角色图或场景图")
+            raise RuntimeError("分镜关键帧缺少冻结的角色图或场景图")
+        invocation = _invoke(
+            db,
+            run=run,
+            slot_key="SHOT_KEYFRAME_GENERATE",
+            task_type="IMAGE_GENERATE",
+            input_snapshot={
+                "shot_id": shot_id,
+                "character_reference_image_ids": deepcopy(shot.get("character_reference_image_ids") or []),
+                "scene_reference_image_ids": deepcopy(shot.get("scene_reference_image_ids") or []),
+            },
+            binding=binding,
+        )
+        snapshot = invocation.model_profile_snapshot
+        version = (db.scalar(select(func.max(ShotKeyframe.version)).where(ShotKeyframe.shot_id == shot_id)) or 0) + 1
         prompt = _image_prompt(
             _system_instruction(
                 invocation,
                 "必须以输入的锁定角色图和场景图为视觉参考，保持人物外观、服装、场景风格一致；"
                 "输出这个镜头的一张关键画面，不出现文字或水印。",
             ),
-            f"第 {shot.shot_number} 镜；动作：{shot.action_description}；机位：{shot.camera_description}；"
-            f"视频动作要求：{shot.video_action_prompt}",
+            f"第 {shot_number} 镜；动作：{shot.get('action_description', '')}；"
+            f"机位：{shot.get('camera_description', '')}；视频动作要求：{shot.get('video_action_prompt', '')}",
         )
         started_at = perf_counter()
         if _is_mock(snapshot):
-            image_url = _mock_image_url("keyframe", shot.id, version)
+            image_url = _mock_image_url("keyframe", shot_id, version)
         else:
             provider_url = generate_image(snapshot, prompt=prompt, reference_image_urls=reference_urls)
             image_url = persist_v1_image(
                 project_id=run.project_id,
                 asset_kind="shot-keyframe",
-                asset_id=shot.id,
+                asset_id=shot_id,
                 version=version,
                 source_url=provider_url,
             )
-        frame = ShotKeyframe(shot_id=shot.id, project_id=run.project_id, generation_run_id=run.id, model_invocation_id=invocation.id, version=version, prompt_snapshot=prompt, image_url=image_url, input_asset_snapshot={"character_reference_image_ids": [item.character_reference_image_id for item in bindings], "scene_reference_image_ids": [item.scene_reference_image_id for item in bindings]}, generation_status=RunStatus.SUCCEEDED)
+        frame = ShotKeyframe(shot_id=shot_id, project_id=run.project_id, generation_run_id=run.id, model_invocation_id=invocation.id, version=version, prompt_snapshot=prompt, image_url=image_url, input_asset_snapshot={"character_reference_image_ids": deepcopy(shot.get("character_reference_image_ids") or []), "scene_reference_image_ids": deepcopy(shot.get("scene_reference_image_ids") or [])}, generation_status=RunStatus.SUCCEEDED)
         db.add(frame)
         _finish_invocation(
             db,
@@ -1047,118 +1504,211 @@ def _execute_shot_keyframes(db: Session, run: WorkflowRun) -> None:
     db.commit()
 
 
-def _execute_video_generation(db: Session, run: WorkflowRun) -> None:
-    state = get_project_production_state(db, run.project_id)
-    shots = list(db.scalars(select(ShotPlan).where(ShotPlan.director_plan_id == state.director_plan_id).order_by(ShotPlan.shot_number)).all())
-    binding = _bindings(db, "VIDEO_GENERATE")[0]
-    snapshot = _profile_snapshot(binding.model_profile_id, db)
-    provider = None if _is_mock(snapshot) else video_provider(snapshot)
-    failed_messages: list[str] = []
-    for shot in shots:
-        keyframe = db.get(ShotKeyframe, shot.locked_keyframe_id)
-        if keyframe is None:
-            raise RuntimeError("锁定关键帧不存在")
-        asset_rows = list(db.scalars(select(ShotAssetBinding).where(ShotAssetBinding.shot_id == shot.id)).all())
-        invocation = _invoke(db, run=run, slot_key="VIDEO_GENERATE", task_type="VIDEO_GENERATE", input_snapshot={"shot_id": shot.id, "keyframe_id": keyframe.id}, profile_id=binding.model_profile_id)
-        invocation_snapshot = invocation.model_profile_snapshot
-        version = (db.scalar(select(func.max(VideoClip.version)).where(VideoClip.shot_plan_id == shot.id)) or 0) + 1
-        clip = VideoClip(project_id=run.project_id, storyboard_package_id=None, shot_plan_id=shot.id, model_invocation_id=invocation.id, generation_run_id=run.id, group_number=shot.shot_number, start_shot_number=shot.shot_number, end_shot_number=shot.shot_number, shots_per_group=1, version=version, image_ids=[keyframe.id], prompt=shot.video_action_prompt, status=VideoClipStatus.PENDING, generation_status=RunStatus.PENDING.value, review_status=VideoReviewStatus.PENDING_REVIEW.value, input_asset_snapshot={"shot_keyframe_id": keyframe.id, "character_reference_image_ids": [item.character_reference_image_id for item in asset_rows], "scene_reference_image_ids": [item.scene_reference_image_id for item in asset_rows]})
-        db.add(clip)
-        db.flush()
-        db.add(VideoClipAssetBinding(video_clip_id=clip.id, asset_type="SHOT_KEYFRAME", shot_keyframe_id=keyframe.id))
-        for item in asset_rows:
-            db.add(VideoClipAssetBinding(video_clip_id=clip.id, asset_type="CHARACTER_REFERENCE", character_reference_image_id=item.character_reference_image_id))
-            db.add(VideoClipAssetBinding(video_clip_id=clip.id, asset_type="SCENE_REFERENCE", scene_reference_image_id=item.scene_reference_image_id))
+def execute_v1_video_child(run_id: str, step_id: str) -> None:
+    """执行一个独立视频镜头子任务；供应商任务号已存在时只恢复查询。"""
+
+    db = SessionLocal()
+    try:
+        run = db.get(WorkflowRun, run_id)
+        step = db.get(WorkflowStep, step_id)
+        if run is None or step is None or step.workflow_run_id != run.id or step.step_key != "VIDEO_SHOT":
+            return
+        if step.status in (RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED):
+            return
+        clip = db.get(VideoClip, step.video_clip_id)
+        if clip is None:
+            raise RuntimeError("视频子任务缺少 VideoClip")
+        # 正在执行但尚未获得供应商任务号，说明另一 Worker 已占有提交权；绝不能重提。
+        if step.status == RunStatus.RUNNING and not (step.provider_task_id or clip.provider_task_id):
+            return
+        now = utcnow()
+        if run.status == RunStatus.PENDING:
+            run.status = RunStatus.RUNNING
+            run.started_at = now
+        parent = db.scalars(select(WorkflowStep).where(WorkflowStep.workflow_run_id == run.id, WorkflowStep.position == 1)).first()
+        if parent is not None and parent.status == RunStatus.PENDING:
+            parent.status = RunStatus.RUNNING
+            parent.started_at = now
+            parent.attempt += 1
+        step.status = RunStatus.RUNNING
+        step.started_at = step.started_at or now
+        step.attempt += 1
+        db.commit()
+
+        payload = step.input_payload or {}
+        frozen_shot = payload.get("shot")
+        binding = payload.get("binding")
+        if not isinstance(frozen_shot, dict) or not isinstance(binding, dict):
+            raise RuntimeError("视频子任务冻结输入损坏")
+        keyframe = frozen_shot.get("locked_keyframe")
+        if not isinstance(keyframe, dict) or not isinstance(keyframe.get("id"), str):
+            raise RuntimeError("视频子任务缺少冻结关键帧")
+        invocation = _invoke(
+            db,
+            run=run,
+            slot_key="VIDEO_GENERATE",
+            task_type="VIDEO_GENERATE",
+            input_snapshot={"shot_id": frozen_shot.get("shot_plan_id"), "keyframe_id": keyframe["id"]},
+            binding=binding,
+            workflow_step_id=step.id,
+            idempotency_key=step.idempotency_key,
+        )
+        clip.model_invocation_id = invocation.id
+        snapshot = invocation.model_profile_snapshot
         started_at = perf_counter()
-        if _is_mock(invocation_snapshot):
-            clip.video_url = f"mock://v1-video/{shot.id}/v{version}"
+        if _is_mock(snapshot):
+            clip.video_url = f"mock://v1-video/{clip.shot_plan_id}/v{clip.version}"
             clip.status = VideoClipStatus.SUCCEEDED
             clip.generation_status = RunStatus.SUCCEEDED.value
-            _finish_invocation(
-                db,
-                invocation,
-                {"video_clip_id": clip.id, "version": version},
-                started_at=started_at,
-                media_units={"video_clips": 1, "mode": "local_mock"},
-            )
-            db.commit()
-            continue
-
-        if provider is None:
-            raise RuntimeError("真实视频 Adapter 未初始化")
-        if not keyframe.image_url:
-            raise RuntimeError("锁定关键帧缺少图片地址")
-        try:
-            # 首帧固定为锁定关键帧；角色/场景版本以 VideoClipAssetBinding 精确追溯。
-            # 某些视频协议支持最后一帧时，可在模型配置中决定如何使用额外输入。
+            _finish_invocation(db, invocation, {"video_clip_id": clip.id, "version": clip.version}, started_at=started_at, media_units={"video_clips": 1, "mode": "local_mock"})
+            _finish_video_child(db, run, step, clip)
+            return
+        if not isinstance(keyframe.get("image_url"), str) or not keyframe["image_url"]:
+            raise RuntimeError("冻结关键帧缺少可用图片地址")
+        provider = video_provider(snapshot)
+        provider_task_id = step.provider_task_id or clip.provider_task_id or invocation.provider_task_id
+        if provider_task_id:
+            # Worker 重启后的恢复路径：已有供应商号只查询，绝不会再次 submit。
+            first_result = provider.poll(provider_task_id)
+        else:
             submitted = provider.submit(
                 create_video_request(
                     project_id=run.project_id,
-                    shot_number=shot.shot_number,
-                    prompt=shot.video_action_prompt,
-                    image_urls=[keyframe.image_url],
+                    shot_number=int(frozen_shot["shot_number"]),
+                    prompt=str(frozen_shot.get("video_action_prompt") or ""),
+                    image_urls=[keyframe["image_url"]],
                 )
             )
-            clip.provider_task_id = submitted.provider_task_id
-            invocation.provider_task_id = submitted.provider_task_id
-            # 提交成功先落库，避免 Worker 在后续轮询期间中断后丢失供应商任务号。
+            provider_task_id = submitted.provider_task_id
+            if not provider_task_id:
+                raise RuntimeError("视频供应商提交成功但未返回任务号")
+            step.provider_task_id = provider_task_id
+            clip.provider_task_id = provider_task_id
+            invocation.provider_task_id = provider_task_id
+            # 任务号必须在轮询前提交，进程中断后才能恢复查询而不产生第二次扣费。
             db.commit()
-            result = wait_for_video_result(provider, invocation_snapshot, submitted)
-            clip.provider_task_id = result.provider_task_id or clip.provider_task_id
-            if result.status == "SUCCEEDED":
-                if not result.video_url:
-                    raise RuntimeError("视频 Adapter 返回成功状态但没有视频地址")
-                clip.video_url = result.video_url
-                clip.status = VideoClipStatus.SUCCEEDED
-                clip.generation_status = RunStatus.SUCCEEDED.value
-                clip.error_message = None
-                _finish_invocation(
-                    db,
-                    invocation,
-                    {"video_clip_id": clip.id, "version": version, "provider_task_id": clip.provider_task_id},
-                    started_at=started_at,
-                    provider_task_id=clip.provider_task_id,
-                    media_units={"video_clips": 1},
-                )
-            elif result.status == "FAILED":
-                message = result.error_message or "视频供应商任务失败"
-                clip.status = VideoClipStatus.FAILED
-                clip.generation_status = RunStatus.FAILED.value
-                clip.error_message = message[:2000]
-                _fail_invocation(
-                    invocation,
-                    message,
-                    started_at=started_at,
-                    provider_task_id=clip.provider_task_id,
-                )
-                failed_messages.append(f"第 {shot.shot_number} 镜：{message}")
-            else:
-                raise RuntimeError(f"视频 Adapter 返回未知状态：{result.status}")
-        except Exception as exc:
+            first_result = submitted
+        result = wait_for_video_result(provider, snapshot, first_result)
+        clip.provider_task_id = result.provider_task_id or provider_task_id
+        step.provider_task_id = clip.provider_task_id
+        if result.status != "SUCCEEDED" or not result.video_url:
+            message = result.error_message or "视频供应商任务失败"
             clip.status = VideoClipStatus.FAILED
             clip.generation_status = RunStatus.FAILED.value
-            clip.error_message = str(exc)[:2000]
-            _fail_invocation(invocation, str(exc), started_at=started_at, provider_task_id=clip.provider_task_id)
-            failed_messages.append(f"第 {shot.shot_number} 镜：{exc}")
-        db.commit()
-    if failed_messages:
-        raise RuntimeError("；".join(failed_messages))
-    state.active_stage = ProductionStage.VIDEO_REVIEW
+            clip.error_message = message[:2000]
+            _fail_invocation(invocation, message, started_at=started_at, provider_task_id=clip.provider_task_id)
+            raise RuntimeError(message)
+        clip.video_url = result.video_url
+        clip.status = VideoClipStatus.SUCCEEDED
+        clip.generation_status = RunStatus.SUCCEEDED.value
+        clip.error_message = None
+        _finish_invocation(db, invocation, {"video_clip_id": clip.id, "version": clip.version, "provider_task_id": clip.provider_task_id}, started_at=started_at, provider_task_id=clip.provider_task_id, media_units={"video_clips": 1})
+        _finish_video_child(db, run, step, clip)
+    except Exception as exc:
+        db.rollback()
+        run = db.get(WorkflowRun, run_id)
+        step = db.get(WorkflowStep, step_id)
+        if run is not None and step is not None:
+            clip = db.get(VideoClip, step.video_clip_id)
+            if clip is not None:
+                clip.status = VideoClipStatus.FAILED
+                clip.generation_status = RunStatus.FAILED.value
+                clip.error_message = str(exc)[:2000]
+            invocation = db.scalars(select(ModelInvocation).where(ModelInvocation.idempotency_key == step.idempotency_key)).first()
+            if invocation is not None and invocation.status == RunStatus.RUNNING:
+                _fail_invocation(invocation, str(exc), provider_task_id=step.provider_task_id)
+            step.status = RunStatus.FAILED
+            step.error_message = str(exc)[:2000]
+            step.finished_at = utcnow()
+            _aggregate_video_parent(db, run)
+            db.commit()
+    finally:
+        db.close()
+
+
+def _finish_video_child(db: Session, run: WorkflowRun, step: WorkflowStep, clip: VideoClip) -> None:
+    step.status = RunStatus.SUCCEEDED
+    step.progress = 100
+    step.output_payload = {"video_clip_id": clip.id, "provider_task_id": clip.provider_task_id}
+    step.finished_at = utcnow()
+    _aggregate_video_parent(db, run)
     db.commit()
 
 
+def _aggregate_video_parent(db: Session, run: WorkflowRun) -> None:
+    """所有独立镜头到达终态才终结父 Run，避免父任务抢跑进入审核。"""
+
+    children = list(db.scalars(select(WorkflowStep).where(WorkflowStep.workflow_run_id == run.id, WorkflowStep.step_key == "VIDEO_SHOT")).all())
+    parent = db.scalars(select(WorkflowStep).where(WorkflowStep.workflow_run_id == run.id, WorkflowStep.position == 1)).first()
+    if not children:
+        run.status = RunStatus.FAILED
+        run.finished_at = utcnow()
+        if parent is not None:
+            parent.status = RunStatus.FAILED
+            parent.error_message = "视频运行没有镜头子任务"
+            parent.finished_at = run.finished_at
+        return
+    if any(child.status == RunStatus.FAILED for child in children):
+        run.status = RunStatus.FAILED
+        run.finished_at = utcnow()
+        if parent is not None:
+            parent.status = RunStatus.FAILED
+            parent.progress = int(sum(child.status == RunStatus.SUCCEEDED for child in children) / len(children) * 100)
+            parent.error_message = "至少一个视频镜头生成失败；请人工选择失败镜头重新生成"
+            parent.finished_at = run.finished_at
+        return
+    if all(child.status == RunStatus.SUCCEEDED for child in children):
+        run.status = RunStatus.SUCCEEDED
+        run.finished_at = utcnow()
+        if parent is not None:
+            parent.status = RunStatus.SUCCEEDED
+            parent.progress = 100
+            parent.finished_at = run.finished_at
+        state = get_project_production_state(db, run.project_id)
+        state.active_stage = ProductionStage.VIDEO_REVIEW
+        return
+    run.status = RunStatus.RUNNING
+    if parent is not None:
+        parent.status = RunStatus.RUNNING
+        parent.progress = int(sum(child.status == RunStatus.SUCCEEDED for child in children) / len(children) * 100)
+
+
 def _current_clips(db: Session, state) -> list[VideoClip]:
-    return list(db.scalars(select(VideoClip).join(ShotPlan, VideoClip.shot_plan_id == ShotPlan.id).where(VideoClip.project_id == state.project_id, ShotPlan.director_plan_id == state.director_plan_id)).all())
+    """只返回每镜明确采用的版本；历史 REJECTED 片段永远不进入审核/合成。"""
+
+    if not state.director_plan_id:
+        return []
+    return list(
+        db.scalars(
+            select(VideoClip)
+            .join(ShotPlan, VideoClip.id == ShotPlan.selected_video_clip_id)
+            .where(VideoClip.project_id == state.project_id, ShotPlan.director_plan_id == state.director_plan_id)
+            .order_by(ShotPlan.shot_number)
+        ).all()
+    )
+
+
+def _execute_video_generation(db: Session, run: WorkflowRun) -> None:
+    """防止旧 Worker 入口误走串行视频逻辑。"""
+
+    raise RuntimeError("视频生成必须通过 VIDEO_SHOT 子任务执行")
 
 
 def _execute_final_compose(db: Session, run: WorkflowRun) -> None:
-    state = get_project_production_state(db, run.project_id)
-    clips = _current_clips(db, state)
-    binding = _bindings(db, "FINAL_COMPOSE")[0]
-    invocation = _invoke(db, run=run, slot_key="FINAL_COMPOSE", task_type="FINAL_COMPOSE", input_snapshot={"clip_ids": [item.id for item in clips]}, profile_id=binding.model_profile_id)
+    context = _frozen_context(run)
+    director_plan_id = context.get("director_plan_id")
+    clip_ids = context.get("selected_video_clip_ids")
+    if not isinstance(director_plan_id, str) or not isinstance(clip_ids, list):
+        raise RuntimeError("成片任务缺少冻结导演方案或视频片段")
+    clips = [db.get(VideoClip, clip_id) for clip_id in clip_ids]
+    if any(clip is None or clip.review_status != VideoReviewStatus.APPROVED.value for clip in clips):
+        raise RuntimeError("冻结视频片段已不存在或未经审核通过")
+    selected_clips = [clip for clip in clips if clip is not None]
+    binding = _frozen_bindings(run, "FINAL_COMPOSE")[0]
+    invocation = _invoke(db, run=run, slot_key="FINAL_COMPOSE", task_type="FINAL_COMPOSE", input_snapshot={"clip_ids": [item.id for item in selected_clips]}, binding=binding)
     snapshot = invocation.model_profile_snapshot
-    version = (db.scalar(select(func.max(FinalVideo.version)).where(FinalVideo.project_id == run.project_id, FinalVideo.director_plan_id == state.director_plan_id)) or 0) + 1
-    final = FinalVideo(project_id=run.project_id, storyboard_package_id=None, director_plan_id=state.director_plan_id, workflow_definition_id=state.workflow_definition_id, workflow_version=V1_WORKFLOW_VERSION, generation_run_id=run.id, version=version, clip_ids=[item.id for item in clips], approved_clip_ids=[item.id for item in clips], input_snapshot={"approved_clip_ids": [item.id for item in clips]}, status=FinalVideoStatus.PENDING)
+    version = (db.scalar(select(func.max(FinalVideo.version)).where(FinalVideo.project_id == run.project_id, FinalVideo.director_plan_id == director_plan_id)) or 0) + 1
+    final = FinalVideo(project_id=run.project_id, storyboard_package_id=None, director_plan_id=director_plan_id, workflow_definition_id=run.workflow_definition_id, workflow_version=run.workflow_version, generation_run_id=run.id, version=version, clip_ids=[item.id for item in selected_clips], approved_clip_ids=[item.id for item in selected_clips], input_snapshot={"approved_clip_ids": [item.id for item in selected_clips]}, status=FinalVideoStatus.PENDING)
     db.add(final)
     db.flush()
     started_at = perf_counter()
@@ -1178,7 +1728,7 @@ def _execute_final_compose(db: Session, run: WorkflowRun) -> None:
         delivery = _compose_real_video(
             project_id=run.project_id,
             final_video_id=final.id,
-            clips=clips,
+            clips=selected_clips,
             snapshot=snapshot,
         )
         final.storage_key = delivery.storage_key
@@ -1190,8 +1740,9 @@ def _execute_final_compose(db: Session, run: WorkflowRun) -> None:
             invocation,
             {"final_video_id": final.id, "version": version, "storage_key": delivery.storage_key},
             started_at=started_at,
-            media_units={"final_videos": 1, "input_video_clips": len(clips)},
+            media_units={"final_videos": 1, "input_video_clips": len(selected_clips)},
         )
+    state = get_project_production_state(db, run.project_id)
     state.active_stage = ProductionStage.COMPLETED
     db.commit()
 
@@ -1205,6 +1756,5 @@ _EXECUTORS: dict[str, Callable[[Session, WorkflowRun], None]] = {
     "scene_images": _execute_scene_images,
     "director_plan": _execute_director_plan,
     "shot_keyframes": _execute_shot_keyframes,
-    "video_generation": _execute_video_generation,
     "final_compose": _execute_final_compose,
 }

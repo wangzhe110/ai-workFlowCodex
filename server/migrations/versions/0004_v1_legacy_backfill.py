@@ -31,6 +31,35 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# ``op.bulk_insert`` 使用 ``sa.table`` 的列类型来绑定参数。生产 PostgreSQL 中
+# 这些列是原生 ENUM；若在此处写成 ``sa.String``，PostgreSQL 会拒绝把 varchar
+# 自动赋值给 enum。显式复用数据库中已由 0003 创建的类型，SQLite 则自然降级为
+# 字符串绑定，保持两种数据库的迁移行为一致。
+_WORKFLOW_DEFINITION_STATUS = sa.Enum(
+    "DRAFT", "PUBLISHED", "ARCHIVED", name="workflowdefinitionstatus", create_type=False
+)
+_PRODUCTION_STAGE = sa.Enum(
+    "LEGACY_READONLY",
+    "REFERENCE_ANALYSIS",
+    "ANALYSIS_REVIEW",
+    "STORY_GENERATION",
+    "STORY_REVIEW",
+    "CHARACTER_ASSETS",
+    "SCENE_ASSETS",
+    "DIRECTOR_PLANNING",
+    "SHOT_KEYFRAMES",
+    "VIDEO_GENERATION",
+    "VIDEO_REVIEW",
+    "FINAL_EXPORT",
+    "COMPLETED",
+    name="productionstage",
+    create_type=False,
+)
+_MODEL_SELECTION_MODE = sa.Enum(
+    "SINGLE", "MULTI_PARALLEL", "AB_TEST", name="modelselectionmode", create_type=False
+)
+
+
 def upgrade() -> None:
     """建立新旧工作流并存时所需的最小可审计数据。"""
 
@@ -42,7 +71,7 @@ def upgrade() -> None:
         sa.column("workflow_code", sa.String),
         sa.column("version", sa.String),
         sa.column("definition_json", sa.JSON),
-        sa.column("status", sa.String),
+        sa.column("status", _WORKFLOW_DEFINITION_STATUS),
         sa.column("published_at", sa.DateTime(timezone=True)),
         sa.column("created_at", sa.DateTime(timezone=True)),
         sa.column("updated_at", sa.DateTime(timezone=True)),
@@ -115,7 +144,7 @@ def upgrade() -> None:
     project_states = sa.table(
         "project_production_states",
         sa.column("project_id", sa.String),
-        sa.column("active_stage", sa.String),
+        sa.column("active_stage", _PRODUCTION_STAGE),
         sa.column("workflow_definition_id", sa.String),
         sa.column("created_at", sa.DateTime(timezone=True)),
         sa.column("updated_at", sa.DateTime(timezone=True)),
@@ -160,7 +189,7 @@ def upgrade() -> None:
         sa.column("id", sa.String),
         sa.column("slot_key", sa.String),
         sa.column("capability", sa.String),
-        sa.column("selection_mode", sa.String),
+        sa.column("selection_mode", _MODEL_SELECTION_MODE),
         sa.column("description", sa.Text),
         sa.column("is_enabled", sa.Boolean),
         sa.column("created_at", sa.DateTime(timezone=True)),

@@ -3,6 +3,7 @@
 from fastapi.testclient import TestClient
 
 from app.main import app
+from conftest import real_video_bytes
 
 
 def test_reference_video_can_be_analyzed_into_abstract_mechanisms() -> None:
@@ -18,7 +19,7 @@ def test_reference_video_can_be_analyzed_into_abstract_mechanisms() -> None:
 
         upload_response = client.post(
             f"/api/v1/projects/{project_id}/source-video",
-            files={"file": ("reference.mp4", b"not-a-real-video", "video/mp4")},
+            files={"file": ("reference.mp4", real_video_bytes(), "video/mp4")},
         )
         assert upload_response.status_code == 201
 

@@ -321,6 +321,16 @@ class WorkflowRun(Base):
     """一次完整工作流运行，聚合其下各步骤的总体状态。"""
 
     __tablename__ = "workflow_runs"
+    __table_args__ = (
+        Index(
+            "uq_v1_active_run_project_key",
+            "project_id",
+            "workflow_key",
+            unique=True,
+            postgresql_where=text("workflow_key LIKE 'v1_%' AND status IN ('PENDING', 'RUNNING')"),
+            sqlite_where=text("workflow_key LIKE 'v1_%' AND status IN ('PENDING', 'RUNNING')"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
@@ -329,6 +339,9 @@ class WorkflowRun(Base):
     # 新建数据库时先创建 workflow_runs 却尚未创建 workflow_definitions。
     workflow_definition_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     workflow_version: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    # 由创建请求确定的幂等键。真正的唯一性由 0007 的“活动任务部分唯一索引”保证，
+    # 历史运行可保留相同语义键，供制作人追溯每次人工重做。
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(160), nullable=True, index=True)
     input_snapshot: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
     status: Mapped[RunStatus] = mapped_column(SqlEnum(RunStatus), default=RunStatus.PENDING, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
@@ -345,6 +358,15 @@ class WorkflowStep(Base):
     """可观察、可重试的一个工作流节点。"""
 
     __tablename__ = "workflow_steps"
+    __table_args__ = (
+        Index(
+            "uq_workflow_steps_idempotency_key",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL"),
+            sqlite_where=text("idempotency_key IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     workflow_run_id: Mapped[str] = mapped_column(ForeignKey("workflow_runs.id"), nullable=False, index=True)
@@ -357,6 +379,12 @@ class WorkflowStep(Base):
     output_payload: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     model_profile_snapshot: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    # 视频阶段会为每个 ShotPlan 建立独立子步骤。provider_task_id 一旦写入，只能继续
+    # 查询，不得因 Worker 重启而重复提交可能收费的供应商任务。
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)
+    shot_plan_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
+    video_clip_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
+    provider_task_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -459,6 +487,13 @@ class VideoClip(Base):
             "version",
             name="uq_video_clip_group_version",
         ),
+        Index(
+            "uq_video_clips_idempotency_key",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL"),
+            sqlite_where=text("idempotency_key IS NOT NULL"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -479,6 +514,9 @@ class VideoClip(Base):
     prompt: Mapped[str] = mapped_column(Text, nullable=False)
     video_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     provider_task_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # 同一收费调用的追溯键，与 WorkflowStep / ModelInvocation 对齐。空值保留给迁移
+    # 前历史片段，绝不覆盖既有版本。
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)
     status: Mapped[VideoClipStatus] = mapped_column(
         SqlEnum(VideoClipStatus), default=VideoClipStatus.PENDING, nullable=False
     )
@@ -827,6 +865,9 @@ class ShotPlan(Base):
     locked_keyframe_id: Mapped[Optional[str]] = mapped_column(
         ForeignKey("shot_keyframes.id", use_alter=True, name="fk_shot_locked_keyframe"), nullable=True
     )
+    # 当前采用的视频版本是显式指针，不以“最新一版”推断。历史 REJECTED / 已替换
+    # 版本永久保留，但不会被审核闸门或成片合成读取。
+    selected_video_clip_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
@@ -942,6 +983,13 @@ class ModelInvocation(Base):
     __table_args__ = (
         Index("ix_model_invocation_profile_task", "model_profile_id", "task_type", "created_at"),
         Index("ix_model_invocation_project", "project_id", "created_at"),
+        Index(
+            "uq_model_invocations_idempotency_key",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL"),
+            sqlite_where=text("idempotency_key IS NOT NULL"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -957,6 +1005,7 @@ class ModelInvocation(Base):
     input_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     output_reference: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
     provider_task_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)
     input_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     output_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     media_units: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)

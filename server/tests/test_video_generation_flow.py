@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from app.main import app
+from conftest import real_video_bytes
 from app.services.video_service import _validate_video_input_urls
 
 
@@ -14,7 +15,7 @@ def _prepare_confirmed_board(client: TestClient, shot_count: int) -> str:
     project_id = client.post("/api/v1/projects", json={"title": "视频片段测试"}).json()["id"]
     client.post(
         f"/api/v1/projects/{project_id}/source-video",
-        files={"file": ("reference.mp4", b"test-video", "video/mp4")},
+            files={"file": ("reference.mp4", real_video_bytes(), "video/mp4")},
     )
     client.post(f"/api/v1/projects/{project_id}/analysis-runs")
     client.post(f"/api/v1/projects/{project_id}/topic-generation-runs")

@@ -1,53 +1,75 @@
-# AI 短剧生产工作流平台
+# LemonFlow V1
 
-这是面向生产环境演进的 V1 工程。目前 V1 已打通：**创建项目 → 上传授权参考视频 → 抽象分析 → 审核锁定创作简报 → 多模型原创故事 → 人工选择 → 角色资产 → 场景资产 → AI 导演分镜 → 关键帧锁定 → 视频片段审核 → 合成成片**。所有关键阶段均有人工确认、任务状态、不可覆盖版本与模型/Prompt 记录。
+LemonFlow V1 是一个带人工审核闸门的多模型 AI 视频生产工作流。它只保留一条正式生产链路：
 
-## 工程原则
+```text
+上传授权参考视频
+→ 视频分析
+→ 锁定创作简报
+→ 多模型故事生成
+→ 选择故事
+→ 角色资产与角色图锁定
+→ 场景资产与场景图锁定
+→ AI 导演分镜
+→ 分镜关键帧锁定
+→ 视频片段生成与审核
+→ 合成成片
+```
 
-- **模块化单体**：先保持一个可部署、可调试的后端；业务边界明确，后续可按 Worker、模型或媒体处理能力拆分。
-- **任务不依赖请求进程**：接口仅创建任务；耗时模型调用由 Worker 执行并留下可追踪的步骤记录。
-- **模型可替换**：业务工作流只调用统一的模型适配器，不直接依赖任一中转平台。
-- **不复制参考作品**：分析结果只保存抽象创作特征，如开头机制、冲突、节奏与镜头结构；不得复用未经授权的具体台词、人物形象、音乐或画面。
-- **密钥不进代码**：所有 API Key 仅从服务端运行环境读取，前端与数据库只保存供应商/模型标识和脱敏信息。
+参考视频仅用于提炼结构、节奏、开头机制和视觉规律；不得复制未经授权的台词、人物、画面、音乐或故事表达。
+
+## 当前能力
+
+- **人工审核与不可覆盖版本**：分析、故事、角色图、场景图、关键帧和视频片段均有正式状态流转。重新生成只会创建新版本。
+- **正确的视频版本选择**：每个 `ShotPlan` 只有一个当前采用视频版本。成片仅冻结每个镜头当前采用且已审核通过的片段，历史驳回片段永久保留但绝不参与合成。
+- **任务快照与幂等保护**：创建任务时冻结源视频、Workflow、模型配置、Prompt、已锁定分析/故事/资产；模型中心或 Prompt 中心之后的切换不会影响已创建任务。重复点击或网络重试会返回同一未完成任务，不重复提交收费任务。
+- **独立视频子任务**：每个镜头是独立的后台视频任务，保存脱敏展示的供应商任务号；Worker 中断后只恢复查询，不会重新提交供应商任务。
+- **可替换模型**：业务代码依赖能力槽位和 Adapter，不写死模型名称。默认目标模型为 Gemini 视频分析、Claude/Gemini 并行故事、Banana 2 图片、Seedance 视频；实际选择由模型中心的已启用配置决定。
+- **全程可追溯**：每次调用会记录冻结的模型、Prompt、输入快照、耗时、可用用量/成本数据和供应商任务号。质量报表只给人工比较，不会自动切换模型。
 
 ## 目录
 
-- `web/`：Vue 3 前端，负责用户操作与任务进度展示。
-- `server/`：FastAPI 业务 API、领域模型、工作流与本地开发 Worker。
-- `infra/`：本地开发所需 PostgreSQL、Redis、MinIO 等基础设施定义。
-- `docs/`：接口、部署及模型接入说明。
+- `web/`：Vue 3 + TypeScript 生产台、模型中心、Prompt 中心、质量报表和项目追溯页。
+- `server/`：FastAPI、领域模型、状态机、模型 Adapter、媒体处理与 Worker。
+- `infra/`：Docker Compose、PostgreSQL/Redis/MinIO 配置与备份、发布检查脚本。
+- `docs/`：面向制作人员和运维人员的当前操作文档。
 
-每个业务代码目录均有中文 `README.md`，用于说明模块职责、文件/页面作用、数据模型依赖和扩展方式。
+## 快速启动（本地模拟，不调用真实模型）
 
-## 本地启动（开发阶段）
+1. 复制环境示例：`cp .env.example .env`。
+2. 启动后端：
 
-1. 复制 `.env.example` 为 `.env`，先保留默认的 SQLite 与本地文件存储配置。
-2. 在 `server/` 创建虚拟环境并安装 `requirements.txt`。
-3. 启动 API：`uvicorn app.main:app --reload --port 8000`。
-4. 在 `web/` 安装依赖后执行 `npm run dev`。
+   ```bash
+   cd server
+   python3 -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   uvicorn app.main:app --reload --port 8000
+   ```
 
-开发模式使用进程内 Worker 以降低首次启动门槛；生产环境可设置 `TASK_EXECUTION_MODE=rq`，由 Redis/RQ 独立 Worker 消费任务。生产发布还须设置 `DATABASE_SCHEMA_MODE=migrate`，先运行 `cd server && alembic upgrade head`，再启动 API/Worker。若要在一台电脑先验收完整前端、独立 API、Worker、PostgreSQL、Redis 与 MinIO，可将 `infra/compose.env.example`、`infra/backend.env.example` 各复制为不提交的同名无 `.example` 文件，再执行 `docker compose --env-file infra/compose.env up --build`，然后打开 `http://127.0.0.1:5173`。没有部署经验时，优先按 `docs/部署与模型配置快速指南.md` 操作；它将启动、模型类型、密钥配置、预检和启用步骤串成了一条可执行路径。详细规则见 `infra/README.md`、`docs/Redis_RQ_Worker部署说明.md` 和 `server/migrations/README.md`。
+3. 新开终端启动前端：
 
-上线前要同时准备数据库和媒体对象的备份。仓库提供本机 Compose 的 PostgreSQL 备份/恢复脚本；媒体对象必须由 S3/MinIO 的版本化与复制策略保护。详见 `docs/运维备份恢复说明.md`。
+   ```bash
+   cd web
+   npm install
+   npm run dev
+   ```
 
-每次发布前可运行 `bash infra/scripts/verify_release.sh`，它会在临时数据库上验证迁移，
-再运行后端测试与前端生产构建，作为发布的最低质量门禁。
+4. 打开 `http://127.0.0.1:5173`，创建项目后进入生产台。未配置真实模型时，请在模型中心使用本地模拟配置，按 [V1 本地闭环验收操作](docs/V1本地闭环验收操作.md) 验证流程。
 
-## 当前 V1 工作流
+生产或近生产本机验收请使用 Docker Compose：复制 `infra/compose.env.example` 和 `infra/backend.env.example` 为不提交的同名文件，然后执行：
 
-1. 上传有权使用的参考视频；Gemini 等视觉模型只提炼脚本结构、开头机制、爆款元素、场景作用与创作简报，禁止复刻具体台词、人物或画面。
-2. 人工审核并锁定创作简报；多个编剧模型再并行创作原创故事，人工选择一个候选。
-3. 先设计并锁定角色参考图，再设计并锁定场景参考图；AI 导演只引用这些锁定资产生成分镜。
-4. 根据分镜生成关键帧并由人工锁定；Seedance 使用锁定角色图、场景图、关键帧和动作描述生成独立视频片段。
-5. 人工审核每个视频片段后，FFmpeg 合成一版完整成片；每次重新生成均创建新版本，不覆盖历史。
-6. 在“模型中心”按能力槽位维护候选模型版本；在“质量报表”比较人工评分、成功率、采用率、预计成本和耗时后，仍由人手动切换模型。
+```bash
+docker compose --env-file infra/compose.env up --build
+```
 
-## 真实模型接入边界
+生产部署必须先执行数据库迁移：`cd server && DATABASE_SCHEMA_MODE=migrate alembic upgrade head`；再启动 API 与 RQ Worker。详细步骤见 [部署与模型配置快速指南](docs/部署与模型配置快速指南.md)。
 
-模型适配器集中在 `server/app/services/analysis_provider.py`，业务服务只读取 `ModelProfile` 快照。接入一个中转站时：新增适配器、使用 `secret_env_name` 从部署环境读取 Key、把其返回值归一化为平台契约，再允许对应配置启用。不要把 Key 写进前端、数据库或任务输入输出。配置中心还支持无扣费预检和人工小样本评测记录，可比较成本、耗时、成功率与质量评分后再切换版本。
+## 使用入口
 
-当前已实现 `openai_compatible` 文本适配器（原创选题、故事包、分镜细纲）、`openai_compatible_image` 同步图片适配器（分镜图片）、`openai_compatible_transcription` 语音转写适配器（有限开头音轨、仅内存传递）和 `openai_compatible_vision` 参考视频分析适配器（FFmpeg 抽帧后发送给视觉模型）。云雾文本/图片/转写/视觉配置可使用 `https://yunwu.ai/v1` 与 `YUNWU_API_KEY` 环境变量；实际模型名必须以账户后台的可用模型列表为准。
+- 制作人员从 [用户使用手册](docs/用户使用手册.md) 开始。
+- 第一次配置模型，从 [模型配置小白操作卡](docs/模型配置小白操作卡.md) 开始；真实 Key 只写服务器环境变量，绝不写进网页、数据库或 Git。
+- 启用 Seedance 前阅读 [豆包 Seedance 视频操作说明](docs/豆包Seedance视频操作说明.md)。
+- 模型、Prompt 与供应商任务号的历史定位见 [生产追溯操作](docs/LemonFlow_V1_生产追溯操作.md)。
 
-“视频片段”默认已接入火山方舟原生 `volcengine_ark_video` 适配器，固定使用参考流程中的 `doubao-seedance-2-0-mini-260615`。创建任务、轮询、首帧字段与视频 URL 均由代码封装；只需在部署环境设置 `ARK_API_KEY`，并在页面选择画幅与时长。通用 `configurable_async_video` 仍保留给未来其他中转站使用。真实运行只能使用供应商可访问的 HTTPS 图片地址。参见 `docs/豆包Seedance视频操作说明.md`。
-
-“完整成片导出”支持默认模拟流程和 `ffmpeg_concat` 真实合成模式。后者在 Worker 下载已冻结顺序的 HTTPS 视频片段，用 FFmpeg 生成 MP4；`FINAL_VIDEO_DELIVERY_MODE=local` 用于单机下载，生产可切换 `s3` 将 MP4 流式上传至 S3/MinIO。详见 `docs/完整成片导出说明.md`。
+当前代码已完成本地 Mock、数据库迁移、任务幂等、媒体真实性和视频驳回重做的自动化验证。真实模型 Key、小样本成本和供应商实际输出尚未由本仓库自动验证，必须先走一条授权样本的人工验收，不能直接批量生产。

@@ -1,12 +1,14 @@
 # 路由模块
 
-路由将 URL 映射为页面，不保存页面数据。
+路由只映射 URL 到页面，不保存业务数据。
 
-- `/`：项目列表和新建项目。
-- `/projects/:projectId`：LemonFlow V1 唯一生产工作台，包含审核和锁定节点。
-- `/projects/:projectId/legacy`：旧工作台兼容入口。
-- `/projects/:projectId/topics`、`story`、`storyboard`、`images`、`videos`：历史兼容或辅助实验页面，不是 V1 的强制前置步骤。
-- `/model-profiles`：LemonFlow V1 模型中心，按能力槽位管理候选模型与人工启用状态。
-- `/model-profiles/legacy`：旧流程模型配置兼容页面。
+- `/`：项目列表与新建项目。
+- `/projects/:projectId`：LemonFlow V1 唯一生产台。
+- `/projects/:projectId/trace`：该项目的 Workflow、模型、Prompt 和供应商任务号追溯。
+- `/model-profiles`：V1 模型中心。
+- `/model-quality`：质量/成本比较报表。
+- `/prompt-templates`：Prompt 版本管理。
+- `/creative-library`：可选的抽象创作资产库。
+- `/projects/:projectId/legacy`、`topics`、`story`、`storyboard`、`images`、`videos` 与 `/model-profiles/legacy`：历史兼容或辅助实验入口，不能成为新项目的 V1 前置步骤。
 
-以后加入登录与权限时，在这里补充路由守卫；不要在单个页面中分散判断登录状态。
+后续添加登录时在此处增加路由守卫；不要把权限判断分散到页面。

@@ -6,9 +6,11 @@
 
 - `src/views/ProjectsView.vue`：项目列表与新建项目。
 - `src/views/ProductionWorkbenchView.vue`：V1 默认生产台，展示唯一主链路、审核备注、分析/故事/资产/视频版本和正式锁定按钮。
+- `src/views/V1ProductionTraceView.vue`：查看项目冻结的 Workflow、模型、Prompt、调用和脱敏供应商任务号。
+- `src/views/V1QualityReportView.vue`、`V1PromptTemplatesView.vue`：人工比较模型质量/成本与管理 Prompt 版本；均不会自动调用或切换模型。
 - `src/views/ProjectWorkbenchView.vue`：旧工作台兼容入口。
 - `src/views/ProjectTopicsView.vue`、`ProjectStoryView.vue`、`ProjectStoryboardView.vue`、`ProjectImagesView.vue`、`ProjectVideosView.vue`：历史兼容或辅助实验页面，不是 V1 的强制前置步骤。
-- `src/views/ModelProfilesView.vue`：管理各步骤非敏感模型配置版本；包含文本、视觉视频分析、同步图片与异步视频任务的字段/响应映射配置，前端绝不接收真实 API Key。
+- `src/views/ModelProfilesView.vue`：旧流程模型配置兼容页面；V1 模型中心为 `V1ModelCenterView.vue`，前端绝不接收真实 API Key。
 
 ## 目录边界
 

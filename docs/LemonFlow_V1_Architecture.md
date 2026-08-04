@@ -1,8 +1,8 @@
-# LemonFlow V1 架构设计（冻结候选）
+# LemonFlow V1 架构设计（已实施基线）
 
-> 文档状态：`已确认，作为 V1 架构基线`  
+> 文档状态：`已确认并已实施，作为 V1 架构基线`  
 > 适用范围：LemonFlow V1 主生产链路  
-> 本文只定义架构、数据、接口和迁移方案；确认前不进行数据库迁移或业务代码重构。
+> 实施状态：数据库迁移已至 `0007_v1_production_integrity`；状态机、版本冻结、幂等、镜头视频子任务与本地 Mock 自动化验证已完成。真实模型 Key 和真实供应商小样本验收尚需由负责人授权执行。
 
 ## 1. 产品定位与架构原则
 
@@ -212,12 +212,12 @@ erDiagram
 | `director_plans` | `story_proposal_id`、`visual_bible`、`status` | 基于已锁定角色/场景资产生成的导演分镜方案 |
 | `character_definitions` | `story_proposal_id`、`name`、`age`、`appearance`、`costume`、`temperament`、`locked_reference_image_id` | 角色文字设定在导演分镜前生成；指针选择本轮角色图 |
 | `scene_definitions` | `story_proposal_id`、`name`、`location`、`environment`、`style`、`mood`、`locked_reference_image_id` | 场景文字设定在导演分镜前生成；指针选择本轮场景图 |
-| `shot_plans` | `director_plan_id`、`shot_number`、`action`、`camera`、`duration`、`video_action_prompt`、`locked_keyframe_id` | 每个导演分镜 |
+| `shot_plans` | `director_plan_id`、`shot_number`、`action`、`camera`、`duration`、`video_action_prompt`、`locked_keyframe_id`、`selected_video_clip_id` | 每个导演分镜；只由该指针选择一个当前采用视频版本 |
 | `character_reference_images` | `character_id`、`version`、`prompt`、`image_url`、`review_status` | 角色参考图不可变版本 |
 | `scene_reference_images` | `scene_id`、`version`、`prompt`、`image_url`、`review_status` | 场景参考图不可变版本 |
 | `shot_keyframes` | `shot_id`、`version`、`prompt`、`image_url`、`review_status` | 分镜关键画面不可变版本 |
 | `shot_asset_bindings` | `shot_id`、`character_id`、`character_reference_image_id`、`scene_reference_image_id` | 明确分镜引用了哪些锁定基础资产 |
-| `video_clips` | `shot_id`、`version`、`video_url`、`provider_task_id`、`generation_status`、`review_status` | 一个导演分镜默认对应一个视频片段 |
+| `video_clips` | `shot_id`、`version`、`video_url`、`provider_task_id`、`idempotency_key`、`generation_status`、`review_status` | 一个导演分镜可有多个历史版本；仅 `ShotPlan.selected_video_clip_id` 所指向且已通过审核的版本可参与成片 |
 | `video_clip_asset_bindings` | `video_clip_id`、`asset_type`、`character_reference_image_id` / `scene_reference_image_id` / `shot_keyframe_id` | 通过三类明确外键冻结视频调用实际输入的图片资产 |
 | `final_videos` | `project_id`、`version`、`approved_clip_ids`、`output_url` | 只由已审核通过片段合成 |
 
@@ -301,87 +301,54 @@ VideoGenerationAdapter.poll(task) -> VideoAssetOutput + InvocationUsage
 
 Adapter 负责 API 调用、参数转换、供应商错误映射与返回结果标准化。业务服务只依赖这些契约。
 
-已存在的 Seedance 火山方舟原生能力应迁移为 `SeedanceAdapter`，保留其提交、轮询、首帧和视频地址解析能力；业务层改为从已锁定资产绑定中读取输入。
+已实现的 `volcengine_ark_video` Adapter 封装了 Seedance 火山方舟的提交、轮询、首帧和视频地址解析能力；业务层只从已锁定资产绑定和 `WorkflowRun` 冻结快照读取输入。
 
-## 9. API 接口设计
+## 9. API 接口设计（当前实现）
 
-### 9.1 参考分析与审核
+实际接口统一以 `/api/v1/production` 为前缀，完整参数和响应以启动后的 `/docs` 为准。
+
+### 9.1 生产台、生成任务与审核
 
 ```text
-POST /projects/{project_id}/reference-analysis-runs
+GET  /projects/{project_id}/state
+POST /projects/{project_id}/generation-runs/{run_key}
 GET  /projects/{project_id}/reference-analyses
-GET  /reference-analyses/{analysis_id}
 POST /reference-analyses/{analysis_id}/lock
 POST /reference-analyses/{analysis_id}/reject
-```
-
-`lock` 必须校验五类输出完整，并写入不可变锁定快照。
-
-### 9.2 并行故事与选择
-
-```text
-POST /projects/{project_id}/story-generation-batches
-GET  /projects/{project_id}/story-generation-batches
-GET  /story-generation-batches/{batch_id}/proposals
+GET  /projects/{project_id}/story-proposals
 POST /story-proposals/{proposal_id}/select
-POST /story-proposals/{proposal_id}/reject
-```
-
-创建批次可传模型配置列表；未传时使用 `StoryGenerateModel` 当前启用的多模型绑定。
-
-### 9.3 角色、场景、分镜与图片资产
-
-```text
-POST /projects/{project_id}/character-design-runs
-GET  /projects/{project_id}/characters
-POST /characters/{character_id}/reference-image-runs
-GET  /characters/{character_id}/reference-images
+GET  /projects/{project_id}/character-reference-images
 POST /character-reference-images/{image_id}/lock
-
-POST /projects/{project_id}/scene-design-runs
-GET  /projects/{project_id}/scenes
-POST /scenes/{scene_id}/reference-image-runs
-GET  /scenes/{scene_id}/reference-images
+GET  /projects/{project_id}/scene-reference-images
 POST /scene-reference-images/{image_id}/lock
-
-POST /projects/{project_id}/director-plan-runs
-GET  /projects/{project_id}/director-plans
-GET  /director-plans/{plan_id}/shots
-POST /shots/{shot_id}/keyframe-runs
-GET  /shots/{shot_id}/keyframes
+GET  /projects/{project_id}/shot-keyframes
 POST /shot-keyframes/{image_id}/lock
-```
-
-### 9.4 视频、审核与成片
-
-```text
-POST /projects/{project_id}/video-generation-runs
 GET  /projects/{project_id}/video-clips
 POST /video-clips/{clip_id}/approve
 POST /video-clips/{clip_id}/reject
-POST /video-clips/{clip_id}/regenerate
-
-POST /projects/{project_id}/final-video-runs
-GET  /projects/{project_id}/final-videos
+GET  /projects/{project_id}/model-invocations
 ```
 
-### 9.5 模型、Prompt 与质量
+`run_key` 只能是服务端声明的 V1 节点。创建时服务端冻结 Workflow、素材、模型、Prompt 和上游锁定资产，并在已有 `PENDING`/`RUNNING` 运行时返回既有任务。视频生成可传指定 `shot_plan_ids`，用于单镜头重做。
+
+### 9.2 模型、Prompt 与质量
 
 ```text
+GET  /workflow-definition
 GET  /model-slots
-GET  /model-slots/{slot_key}/profiles
-POST /model-slots/{slot_key}/profiles
 POST /model-slots/{slot_key}/strategy
-
+POST /model-slots/{slot_key}/bindings
+GET  /v1-model-profiles
+POST /v1-model-profiles
 GET  /prompt-templates
 POST /prompt-templates
 POST /prompt-templates/{template_id}/activate
 POST /prompt-templates/{template_id}/archive
-
-GET  /model-invocations
 GET  /model-quality-evaluations
-POST /model-invocations/{invocation_id}/quality-review
+POST /model-quality-evaluations/refresh
 ```
+
+模型和 Prompt 接口不接收真实 Key，也不允许浏览器通过请求指定某家供应商。质量刷新只汇总既有 `ModelInvocation` 与审核记录，绝不重跑模型或自动切换槽位。
 
 ## 10. 前端页面改造方案
 
@@ -416,48 +383,48 @@ POST /model-invocations/{invocation_id}/quality-review
 
 首次迁移不物理删除旧表，不破坏旧项目。旧模块在前端标记为“可选/旧版”，待 V1 稳定并完成数据归档后再决定是否清理。
 
-## 12. 开发任务拆分（确认后执行）
+## 12. 实施情况与后续验收
 
-### 阶段 A：架构底座
+### 已完成：架构底座
 
-1. 新增 Workflow 定义与版本冻结。
-2. 新增模型槽位、多模型绑定、模型调用审计。
-3. 新增 Prompt 模板、版本、变量校验与调用快照。
-4. 完成数据库迁移与回归测试基线。
+1. 已新增 Workflow 定义与版本冻结。
+2. 已新增模型槽位、多模型绑定、模型调用审计。
+3. 已新增 Prompt 模板、版本、变量校验与调用快照。
+4. 已完成至 `0007` 的数据库迁移和回归测试基线。
 
-### 阶段 B：分析与故事闭环
+### 已完成：分析与故事闭环
 
-1. 实现 Gemini 视频分析 Adapter 与标准化分析结果。
-2. 实现分析审核、驳回、锁定。
-3. 实现多模型故事批次、候选比较和故事选择。
+1. 已实现供应商无关的视觉分析 Adapter 与标准化分析结果。
+2. 已实现分析审核、驳回、锁定。
+3. 已实现多模型故事批次、候选比较和故事选择。
 
-### 阶段 C：资产驱动视觉链路
+### 已完成：资产驱动视觉链路
 
-1. 实现角色设计、角色参考图和锁定。
-2. 实现场景设计、场景参考图和锁定。
-3. 实现导演分镜、分镜资产绑定和关键帧锁定。
-4. 实现 Banana Adapter。
+1. 已实现角色设计、角色参考图和锁定。
+2. 已实现场景设计、场景参考图和锁定。
+3. 已实现导演分镜、分镜资产绑定和关键帧锁定。
+4. 已实现 OpenAI 兼容图片 Adapter，可为 Banana 2 或兼容渠道创建配置。
 
-### 阶段 D：视频与成片闭环
+### 已完成：视频与成片闭环
 
-1. 将 Seedance 输入切换为锁定资产绑定。
-2. 实现视频片段审核、驳回和新版本重做。
-3. 限制成片仅使用审核通过片段。
+1. Seedance 输入已切换为锁定资产绑定和冻结快照。
+2. 已实现视频片段审核、驳回和单镜头新版本重做。
+3. 成片只使用每个镜头当前采用且审核通过的片段。
 
-### 阶段 E：前端、质量和交付
+### 已完成：前端、质量和交付；待执行真实小样本验收
 
-1. 重构项目生产台及所有审核页面。
-2. 实现模型/Prompt 质量和成本看板。
-3. 更新零基础用户手册、部署文档、模块 README。
-4. 完成真实渠道小样本验收、端到端回归与发布检查。
+1. 已完成项目生产台及所有审核页面。
+2. 已实现模型/Prompt 质量和成本看板。
+3. 已更新零基础用户手册、部署文档、模块 README。
+4. 本地 Mock、迁移、媒体、幂等、视频驳回重做和前端构建已验证；真实渠道小样本验收待负责人配置 Key 后执行。
 
-## 13. 确认后仍需提供的外部资料
+## 13. 真实小样本验收前需确认的外部资料
 
-开始真实 Adapter 接入前，需要确认每个渠道的实际 API 文档、可用模型标识、密钥环境变量名称、计费返回字段和输入限制：
+真实模型调用前，需要由负责人确认每个渠道的实际 API 文档、可用模型标识、密钥环境变量名称、计费返回字段和输入限制：
 
 - Gemini 视频分析渠道；
 - Claude Sonnet/Opus 渠道；
 - Banana 2 图片生成渠道；
 - Seedance 已有火山方舟渠道可继续复用。
 
-这些资料只影响 Adapter 实现，不改变本文的业务流程、数据关系或审核规则。
+这些资料只影响模型中心配置、Adapter 参数和小样本验收，不改变本文的业务流程、数据关系或审核规则。V1 不会在没有明确授权的情况下调用真实供应商或产生费用。

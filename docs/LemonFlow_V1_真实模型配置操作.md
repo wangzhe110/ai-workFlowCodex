@@ -18,8 +18,8 @@ cp infra/backend.env.example infra/backend.env
 打开 `infra/backend.env`，只由负责人填写真实 Key。例如：
 
 ```dotenv
-# 云雾或其他 OpenAI 兼容中转站的 Key；变量名可不同，但网页里必须填写同一个名字。
-YUNWU_API_KEY=这里填写真实的中转站密钥
+# 任一 OpenAI 兼容渠道的 Key；变量名可自行命名，但模型中心的 secret_env_name 必须完全一致。
+TEXT_OR_VISION_PROVIDER_KEY=这里填写真实的中转站密钥
 
 # 火山方舟的视频 Key。
 ARK_API_KEY=这里填写真实的火山方舟密钥
@@ -41,7 +41,7 @@ ARK_API_KEY=这里填写真实的火山方舟密钥
 - 中转站类型：系统自动选择“视觉分析模型”
 - 模型名称：从中转站复制 Gemini 3.1 Pro Preview 的实际模型名
 - API 地址：中转站文档给出的 `https://.../v1`
-- 服务器变量名：例如 `YUNWU_API_KEY`
+- 服务器变量名：例如 `TEXT_OR_VISION_PROVIDER_KEY`
 
 保存为候选即可。这个模型必须支持“图片 + 文字”的 Chat Completions 接口；系统会在 Worker 中从上传视频抽取少量画面，要求它输出：脚本结构、爆款开头、爆款元素、场景分析和创作简报。
 
@@ -77,10 +77,11 @@ V1 可以先让这三项使用同一个性价比好的文本模型。每个功�
 
 - 功能选择：`生成视频片段`
 - 系统默认模型名：`doubao-seedance-2-0-mini-260615`
-- 服务器变量名固定为：`ARK_API_KEY`
+- Adapter：`volcengine_ark_video`
+- 服务器变量名：`ARK_API_KEY`
 - 选择 9:16 与 3 秒或 5 秒进行第一轮测试
 
-系统会使用已锁定关键帧作为首帧创建火山方舟任务，保存任务号，轮询至完成，再进入人工视频审核。
+系统会为每个镜头创建独立子任务，使用已锁定关键帧及其角色/场景引用提交火山方舟，保存任务号后轮询至完成，再进入人工视频审核。Worker 重启后只会继续查询已有任务号，不会重新提交。
 
 真实视频必须能从公网读取首帧图片。因此正式生产必须让图片模型结果成为稳定的 HTTPS 地址。建议配置 S3/MinIO + HTTPS CDN：
 

@@ -6,7 +6,7 @@
 
 - PostgreSQL：生产业务数据，保存项目、素材元信息、工作流运行记录、步骤状态和模型配置版本。
 - Redis：生产任务队列、进度事件和限流状态。第一天的本地演示不依赖 Redis。
-- MinIO：S3 兼容对象存储，生产时保存原视频、抽帧、图片和短视频片段。
+- MinIO：S3 兼容对象存储，生产时保存源视频、生成图片、视频片段和最终成片；抽帧仅在 Worker 临时目录中处理，不作为 V1 生产资产长期保存。
 
 ## 运行说明
 
@@ -14,7 +14,7 @@
 数据库迁移，之后才启动 API 和 RQ Worker；两者共用同一个服务镜像、同一个媒体卷。
 先复制 `compose.env.example` 和 `backend.env.example` 为未提交的 `compose.env`、
 `backend.env`。后者会同时注入 API 和 Worker，填写模型配置中心对应
-`secret_env_name` 的真实 Key（例如 `YUNWU_API_KEY`）以及未来的 S3 凭据。再在项目根目录执行：
+`secret_env_name` 的真实 Key（例如 `ARK_API_KEY` 或自定义的兼容渠道变量）以及 S3 凭据。再在项目根目录执行：
 
 ```bash
 docker compose --env-file infra/compose.env up --build

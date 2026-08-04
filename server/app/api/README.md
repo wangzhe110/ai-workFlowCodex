@@ -1,15 +1,12 @@
 # HTTP 接口模块
 
-路由层只负责请求解析、权限边界（V1 暂未启用登录）、调用服务和序列化响应；不直接操作工作流状态或第三方模型。
+路由层只解析请求、校验前置条件、调用服务、返回 API 契约和投递任务；不直接写状态机、不执行长任务、不保存密钥。
 
-## 路由说明
+## V1 路由职责
 
-- `routes/projects.py`：项目创建、列表、详情和原视频上传。
-- `routes/workflows.py`：创建分析运行、轮询运行状态、失败后重试。
-- `routes/creative_library.py`：维护抽象爆点元素与开头模式，不保存具体受版权保护素材。
-- `routes/topics.py`：创建原创选题任务、查看候选并由用户确认一个选题。
-- `routes/model_profiles.py`：维护步骤模型配置版本、无扣费预检、安全启用，以及按版本保存的人工小样本评测统计。
-- `routes/production.py`：V1 生产台读取与人工审核节点；只能通过状态机锁定/选择/审核，不能绕过主流程。
-- `routes/v1_modeling.py`：V1 Workflow 版本、能力槽位、配置绑定和 Prompt 模板版本管理。
+- `routes/projects.py`：项目和参考视频上传。
+- `routes/production.py`：生产台状态、生成运行入口、分析锁定、故事选择、图片锁定、视频审核和运行状态查询。
+- `routes/v1_modeling.py`：Workflow 定义、模型槽位、模型绑定、Prompt 模板版本和人工启用。
+- `routes/model_profiles.py`：非敏感模型配置、无扣费预检和兼容管理接口。
 
-旧选题、故事包、分镜和图片路由均是历史兼容或可选工具，不能成为 V1 主链路前置条件。所有接口以 `/api/v1` 开头。V1 虽无登录，但 URL 已提前版本化，避免以后扩展破坏已上线前端。
+`workflows.py`、`topics.py`、`stories.py`、`storyboards.py`、`images.py`、`videos.py` 和 `creative_library.py` 为历史兼容或辅助功能；它们不得成为 V1 主链路前置条件。所有 API 以 `/api/v1` 开头。

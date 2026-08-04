@@ -14,6 +14,10 @@
 
 模型配置契约只包含供应商/模型标识、非敏感参数和 `secret_env_name` 引用。真实 API Key 由部署环境注入，不属于任何接口请求或响应。
 
+V1 生产台契约包含唯一主流程的 `ProductionStateResponse`、人工审核 `ReviewActionRequest`、
+分析/故事/资产/视频的版本化响应，以及模型能力槽位与 `PromptTemplate` 的版本化配置响应。
+它们与旧选题、故事包和单镜图片契约并存，但不会把旧流程变成新项目的前置条件。
+
 `ModelProfilePreflightResponse` 用于启用前的无扣费基础预检，逐项报告适配器、参数、
 密钥注入和必要的本机依赖是否就绪。它绝不返回密钥值、数据库连接信息或第三方原始错误。
 

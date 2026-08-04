@@ -23,6 +23,12 @@ DATABASE_SCHEMA_MODE=migrate alembic upgrade head
 4. 先在备份/预发布数据库执行 `alembic upgrade head` 并回归测试。
 5. 发布时先迁移、再部署 API/Worker；不要让线上服务进程执行 `Base.metadata.create_all()`。
 
-`versions/0001_initial_schema.py` 是 V1 基线，固定创建其发布时的表名快照；
-`0002_model_evaluations.py` 是首个增量示例，新增模型小样本验收统计表。后续变更必须
-新增版本文件，不能让基线迁移随着当前实体自动增加未来表。
+`versions/0001_initial_schema.py` 是旧工作流基线，`0002_model_evaluations.py` 新增模型小样本
+验收统计。`0003_v1_production_foundation.py` 创建 LemonFlow V1 的审核、资产引用、模型槽位、
+Prompt 与调用审计结构；`0004_v1_legacy_backfill.py` 回填历史 Workflow 和模型兼容数据；
+`0005_v1_asset_ownership_and_versions.py` 将角色/场景主归属修正为已选故事，并允许多个已锁定
+资产版本并存、由当前指针选择本轮采用版本。
+
+由于早期 `0001` 以固定表名从 ORM 元数据创建初始表，`0003` 对旧表使用“列已存在则跳过”的
+兼容迁移策略，保证全新数据库与已运行过 `0002` 的数据库都能升级。后续变更仍必须新增版本文件，
+不得改写已经发布的 V1 迁移逻辑。

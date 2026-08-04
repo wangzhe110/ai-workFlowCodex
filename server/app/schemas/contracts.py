@@ -291,5 +291,283 @@ class ModelEvaluationComparisonResponse(ModelEvaluationResponse):
     display_name: Optional[str]
 
 
+# ---------------------------------------------------------------------------
+# LemonFlow V1 生产台：状态、审核、模型槽位与 Prompt 版本接口。
+# 这些契约不复用旧“原创选题/故事包/单镜图片”页面结构，避免旧流程阻塞主链路。
+# ---------------------------------------------------------------------------
+
+
+class ReviewActionRequest(BaseModel):
+    """人工审核统一输入；评分可选，避免历史审核与“只做决定”被强制阻断。"""
+
+    reviewer_label: Optional[str] = Field(default=None, max_length=120)
+    note: Optional[str] = Field(default=None, max_length=2000)
+    quality_score: Optional[int] = Field(default=None, ge=1, le=10, description="制作人对本次结果的 1 至 10 分评分")
+
+
+class ProductionStateResponse(BaseModel):
+    """生产台顶部进度条所需的当前阶段与冻结对象指针。"""
+
+    project_id: str
+    active_stage: str
+    workflow_definition_id: str
+    locked_reference_analysis_id: Optional[str]
+    selected_story_proposal_id: Optional[str]
+    director_plan_id: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+
+
+class ReferenceAnalysisResponse(BaseModel):
+    """爆款视频分析的五类可人工审核结果；不输出原视频逐字复刻内容。"""
+
+    id: str
+    project_id: str
+    workflow_run_id: str
+    version: int
+    video_script_structure: dict[str, Any]
+    opening_analysis: dict[str, Any]
+    viral_elements: list[dict[str, Any]]
+    scene_analysis: list[dict[str, Any]]
+    creative_brief: dict[str, Any]
+    generation_status: str
+    review_status: str
+    locked_snapshot: Optional[dict[str, Any]]
+    locked_at: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime
+
+
+class StoryProposalV1Response(BaseModel):
+    """并行编剧模型产出的原创候选；选择状态由人工决定。"""
+
+    id: str
+    project_id: str
+    batch_id: str
+    model_invocation_id: Optional[str]
+    candidate_number: int
+    content: dict[str, Any]
+    status: str
+    created_at: datetime
+
+
+class CharacterReferenceImageV1Response(BaseModel):
+    """角色资产审核卡片；含角色代码和当前设计状态，便于锁图。"""
+
+    id: str
+    project_id: str
+    character_id: str
+    character_code: str
+    character_name: str
+    version: int
+    image_url: Optional[str]
+    generation_status: str
+    review_status: str
+    created_at: datetime
+
+
+class SceneReferenceImageV1Response(BaseModel):
+    """场景资产审核卡片；含场景代码和当前设计状态，便于锁图。"""
+
+    id: str
+    project_id: str
+    scene_id: str
+    scene_code: str
+    scene_name: str
+    version: int
+    image_url: Optional[str]
+    generation_status: str
+    review_status: str
+    created_at: datetime
+
+
+class ShotKeyframeV1Response(BaseModel):
+    """分镜关键帧审核卡片；明确它服务于哪个导演镜头。"""
+
+    id: str
+    project_id: str
+    shot_id: str
+    shot_number: int
+    version: int
+    image_url: Optional[str]
+    generation_status: str
+    review_status: str
+    input_asset_snapshot: dict[str, Any]
+    created_at: datetime
+
+
+class VideoClipV1Response(BaseModel):
+    """V1 视频审核卡片；输入资产快照可用于追溯角色、场景与关键帧版本。"""
+
+    id: str
+    project_id: str
+    shot_plan_id: str
+    shot_number: int
+    version: int
+    video_url: Optional[str]
+    provider_task_id: Optional[str]
+    generation_status: Optional[str]
+    review_status: Optional[str]
+    review_note: Optional[str]
+    input_asset_snapshot: Optional[dict[str, Any]]
+    created_at: datetime
+
+
+class ModelInvocationTraceResponse(BaseModel):
+    """项目生产追溯行；刻意不返回原始 Prompt、输入和输出，避免泄露素材内容。"""
+
+    id: str
+    workflow_run_id: Optional[str]
+    workflow_key: Optional[str]
+    workflow_version: Optional[str]
+    task_type: str
+    slot_key: str
+    model_display_name: str
+    model_key: str
+    model_version: str
+    model_profile_version: Optional[int]
+    prompt_template_id: Optional[str]
+    prompt_name: Optional[str]
+    prompt_version: Optional[int]
+    status: str
+    provider_task_id: Optional[str]
+    input_tokens: Optional[int]
+    output_tokens: Optional[int]
+    media_units: dict[str, Any]
+    cost_amount: Optional[float]
+    currency: str
+    latency_ms: Optional[int]
+    error_code: Optional[str]
+    created_at: datetime
+    finished_at: Optional[datetime]
+
+
+class ModelSlotResponse(BaseModel):
+    """能力槽位展示模型，业务名称与具体供应商/模型名称分离。"""
+
+    id: str
+    slot_key: str
+    capability: str
+    selection_mode: str
+    description: str
+    is_enabled: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class ModelSlotStrategyRequest(BaseModel):
+    """模型中心由人工调整单模型/并行策略；V1 禁止自动 A/B 分流。"""
+
+    selection_mode: str = Field(min_length=1, max_length=40)
+
+
+class ModelSlotBindingRequest(BaseModel):
+    """将无密钥模型配置绑定给一个能力槽位。"""
+
+    model_profile_id: str = Field(min_length=1, max_length=36)
+    enabled: bool = True
+    # 只有用户在模型中心明确确认时，单模型槽位才会停用旧绑定并切换到新配置。
+    # 它不是模型质量系统的自动切换开关。
+    replace_existing: bool = False
+    priority: int = Field(default=100, ge=0, le=10_000)
+    weight: Optional[float] = Field(default=None, gt=0, le=1)
+
+
+class ModelSlotBindingResponse(BaseModel):
+    """模型槽位绑定记录；API 不返回环境变量实际值或任何密钥。"""
+
+    id: str
+    slot_id: str
+    model_profile_id: str
+    is_enabled: bool
+    priority: int
+    weight: Optional[float]
+    created_at: datetime
+
+
+class V1ModelProfileCreateRequest(BaseModel):
+    """为 V1 能力槽位新建一版候选模型配置，真实密钥只允许部署在服务器环境。"""
+
+    slot_key: str = Field(min_length=1, max_length=80)
+    adapter_key: str = Field(min_length=1, max_length=80)
+    model_key: str = Field(min_length=1, max_length=160)
+    display_name: str = Field(min_length=1, max_length=160)
+    model_version: Optional[str] = Field(default=None, max_length=160)
+    provider_config: dict[str, Any] = Field(default_factory=dict)
+    enable_in_slot: bool = False
+    replace_existing: bool = False
+    priority: int = Field(default=100, ge=0, le=10_000)
+
+
+class V1ModelProfileResponse(BaseModel):
+    """V1 模型中心展示使用；不返回环境变量值或密钥内容。"""
+
+    id: str
+    slot_key: str
+    adapter_key: str
+    model_key: str
+    display_name: str
+    model_version: Optional[str]
+    version: int
+    provider_config: dict[str, Any]
+    is_bound: bool
+    is_enabled_in_slot: bool
+    priority: Optional[int]
+    created_at: datetime
+
+
+class ModelQualityEvaluationResponse(BaseModel):
+    """模型中心的质量报表行；结果仅供人工比较，不能触发自动切换。"""
+
+    id: str
+    model_profile_id: str
+    display_name: str
+    model_key: str
+    model_version: str
+    prompt_template_id: Optional[str]
+    prompt_name: Optional[str]
+    prompt_version: Optional[int]
+    task_type: str
+    scenario: str
+    sample_count: int
+    success_count: int
+    success_rate: float
+    average_cost_amount: Optional[float]
+    currency: str
+    average_latency_ms: Optional[int]
+    average_human_score: Optional[float]
+    adoption_rate: Optional[float]
+    created_at: datetime
+
+
+class ModelQualityRefreshRequest(BaseModel):
+    """按需生成一份新的质量报表快照；不重跑模型、不更改生产配置。"""
+
+    task_type: Optional[str] = Field(default=None, min_length=1, max_length=80)
+
+
+class PromptTemplateCreateRequest(BaseModel):
+    """创建一个新 Prompt 草稿版本；生产版本不可通过 PATCH 原地改写。"""
+
+    task_type: str = Field(min_length=1, max_length=80)
+    name: str = Field(min_length=1, max_length=160)
+    content: str = Field(min_length=1, max_length=50_000)
+    variables_schema: dict[str, Any] = Field(default_factory=dict)
+
+
+class PromptTemplateResponse(BaseModel):
+    """Prompt 模板版本的审计视图。"""
+
+    id: str
+    task_type: str
+    name: str
+    version: int
+    content: str
+    variables_schema: dict[str, Any]
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+
 # Pydantic 需要在全部类型声明后解析前向引用。
 ProjectDetailResponse.model_rebuild()

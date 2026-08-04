@@ -20,6 +20,7 @@ from app.services.story_service import execute_story_generation
 from app.services.storyboard_service import execute as execute_storyboard
 from app.services.topic_service import execute_topic_generation
 from app.services.video_service import execute_video_generation
+from app.services.v1_execution_service import execute_v1_workflow
 from app.services.workflow_service import execute_video_analysis
 
 
@@ -33,6 +34,16 @@ _WORKFLOW_EXECUTORS: dict[str, WorkflowExecutor] = {
     "image_generation": execute_images,
     "video_generation": execute_video_generation,
     "final_video_export": execute_final_video_export,
+    "v1_reference_analysis": execute_v1_workflow,
+    "v1_story_generation": execute_v1_workflow,
+    "v1_character_design": execute_v1_workflow,
+    "v1_character_images": execute_v1_workflow,
+    "v1_scene_design": execute_v1_workflow,
+    "v1_scene_images": execute_v1_workflow,
+    "v1_director_plan": execute_v1_workflow,
+    "v1_shot_keyframes": execute_v1_workflow,
+    "v1_video_generation": execute_v1_workflow,
+    "v1_final_compose": execute_v1_workflow,
 }
 
 

@@ -104,19 +104,37 @@ class OpenAICompatibleVisionAnalysisProvider:
         if not request.sampled_frames:
             raise RuntimeError("真实视频分析缺少采样帧")
         api_key = self._api_key()
+        # 旧流程仍使用精简的“创作机制分析”契约；V1 配置 ``result_contract`` 后，
+        # 同一视觉协议会返回完整的可审核创作简报。这样业务层不需要知道模型名称，
+        # 历史接口的返回结构也不会被破坏。
+        v1_contract = self.provider_config.get("result_contract") == "V1_REFERENCE_ANALYSIS"
+        output_contract = (
+            '{"video_script_structure":{"theme":"string","structure":["string"]},'
+            '"opening_analysis":{"time_window":"string","hook_type":"string","mechanism":"string"},'
+            '"viral_elements":[{"type":"string","description":"string"}],'
+            '"scene_analysis":[{"role":"string","visual_style":"string"}],'
+            '"creative_brief":{"originality_rule":"string","recommended_rhythm":"string","target_format":"string"}}'
+            if v1_contract
+            else '{"summary":"string","opening_mechanism":["string"],'
+            '"viral_elements":["string"],"pacing_notes":"string",'
+            '"compliance_note":"string"}'
+        )
+        task_description = (
+            "输出视频脚本结构、爆款开头、爆款元素、场景分析和创作简报。"
+            "所有内容必须是抽象机制，供原创故事使用。"
+            if v1_contract
+            else "分析用户有权使用的参考短视频，提炼可迁移的创作机制。"
+        )
         user_content: list[dict[str, Any]] = [
             {
                 "type": "text",
                 "text": (
                     "请严格只返回合法 JSON，不要使用 Markdown 代码块。\n"
-                    "任务：分析用户有权使用的参考短视频，提炼可迁移的创作机制。\n"
+                    f"任务：{task_description}\n"
                     "合规要求：只分析开头信息释放、冲突类型、节奏、情绪曲线、镜头功能；"
                     "不得复述或建议复用原视频的人物身份、外貌、台词、屏幕文字、音乐、"
                     "具体画面、情节或镜头素材。不得识别真实人物。\n"
-                    "输出契约："
-                    '{"summary":"string","opening_mechanism":["string"],'
-                    '"viral_elements":["string"],"pacing_notes":"string",'
-                    '"compliance_note":"string"}\n'
+                    f"输出契约：{output_contract}\n"
                     f"素材元数据：{json.dumps({'asset_id': request.asset_id, 'filename': request.filename, 'content_type': request.content_type}, ensure_ascii=False)}\n"
                     "以下是按时间采样的画面帧："
                 ),
@@ -178,10 +196,10 @@ class OpenAICompatibleVisionAnalysisProvider:
             raise RuntimeError("视觉模型响应缺少 choices[0].message.content") from exc
         if not isinstance(content, str):
             raise RuntimeError("视觉模型返回的内容不是文本 JSON")
-        return _normalize_reference_analysis(
-            _parse_model_json(content),
-            request,
-        )
+        parsed = _parse_model_json(content)
+        if v1_contract:
+            return _normalize_v1_reference_analysis(parsed)
+        return _normalize_reference_analysis(parsed, request)
 
     def _api_key(self) -> str:
         """从部署环境读取密钥；不把密钥写入模型配置或日志。"""
@@ -293,6 +311,72 @@ def _normalize_reference_analysis(result: Any, request: VideoAnalysisInput) -> d
         "audio_mechanism_considered": bool(request.transcript_for_mechanism_analysis),
     }
     return normalized
+
+
+def _normalize_v1_reference_analysis(result: Any) -> dict[str, Any]:
+    """校验 V1 创作简报的五类结果，拒绝不完整或未经结构化的视觉模型输出。"""
+
+    if not isinstance(result, dict):
+        raise RuntimeError("V1 视觉模型必须返回 JSON 对象")
+    structure = result.get("video_script_structure")
+    opening = result.get("opening_analysis")
+    viral_elements = result.get("viral_elements")
+    scene_analysis = result.get("scene_analysis")
+    creative_brief = result.get("creative_brief")
+    if not isinstance(structure, dict) or not isinstance(opening, dict) or not isinstance(creative_brief, dict):
+        raise RuntimeError("V1 视频分析缺少结构、开头或创作简报对象")
+    for field_name, value in (
+        ("video_script_structure.theme", structure.get("theme")),
+        ("opening_analysis.time_window", opening.get("time_window")),
+        ("opening_analysis.hook_type", opening.get("hook_type")),
+        ("opening_analysis.mechanism", opening.get("mechanism")),
+        ("creative_brief.originality_rule", creative_brief.get("originality_rule")),
+        ("creative_brief.recommended_rhythm", creative_brief.get("recommended_rhythm")),
+        ("creative_brief.target_format", creative_brief.get("target_format")),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"V1 视频分析缺少有效字段：{field_name}")
+    sequence = structure.get("structure")
+    if not isinstance(sequence, list) or not any(isinstance(item, str) and item.strip() for item in sequence):
+        raise RuntimeError("V1 视频分析的 video_script_structure.structure 必须是非空字符串数组")
+    if not isinstance(viral_elements, list) or not viral_elements:
+        raise RuntimeError("V1 视频分析的 viral_elements 必须是非空数组")
+    if not isinstance(scene_analysis, list) or not scene_analysis:
+        raise RuntimeError("V1 视频分析的 scene_analysis 必须是非空数组")
+
+    def clean_object(value: Any, fields: tuple[str, ...], label: str) -> dict[str, str]:
+        if not isinstance(value, dict):
+            raise RuntimeError(f"V1 视频分析的 {label} 项必须是对象")
+        normalized: dict[str, str] = {}
+        for field_name in fields:
+            field_value = value.get(field_name)
+            if not isinstance(field_value, str) or not field_value.strip():
+                raise RuntimeError(f"V1 视频分析的 {label}.{field_name} 必须是非空文本")
+            normalized[field_name] = field_value.strip()[:1200]
+        return normalized
+
+    return {
+        "video_script_structure": {
+            "theme": structure["theme"].strip()[:1200],
+            "structure": [item.strip()[:800] for item in sequence if isinstance(item, str) and item.strip()][:12],
+        },
+        "opening_analysis": {
+            "time_window": opening["time_window"].strip()[:200],
+            "hook_type": opening["hook_type"].strip()[:400],
+            "mechanism": opening["mechanism"].strip()[:1200],
+        },
+        "viral_elements": [
+            clean_object(item, ("type", "description"), "viral_elements") for item in viral_elements[:12]
+        ],
+        "scene_analysis": [
+            clean_object(item, ("role", "visual_style"), "scene_analysis") for item in scene_analysis[:12]
+        ],
+        "creative_brief": {
+            "originality_rule": creative_brief["originality_rule"].strip()[:1600],
+            "recommended_rhythm": creative_brief["recommended_rhythm"].strip()[:800],
+            "target_format": creative_brief["target_format"].strip()[:200],
+        },
+    }
 
 
 @dataclass(frozen=True)
@@ -470,8 +554,14 @@ class OpenAICompatibleImageProvider:
         self.model_key = str(model_profile_snapshot["model_key"])
         self.provider_config = model_profile_snapshot.get("provider_config") or {}
 
-    def generate(self, prompt: str) -> str:
-        """生成一张图片，并归一化为可被前端直接使用的 URL 或 data URL。"""
+    def generate(self, prompt: str, *, reference_image_urls: Optional[list[str]] = None) -> str:
+        """生成一张图片，并归一化为可被前端直接使用的 URL 或 data URL。
+
+        标准 OpenAI 图片接口没有统一的“参考图”字段，因此 V1 不会猜测某个供应商
+        的私有参数。需要角色/场景参考生图时，模型配置可声明
+        ``reference_image_field``（例如 ``images``），Adapter 才会把已锁定的图 URL
+        写入该字段。未声明时只提交文本提示词，避免无声丢弃或错误扣费。
+        """
 
         api_base_url = self.provider_config.get("api_base_url")
         secret_env_name = self.provider_config.get("secret_env_name")
@@ -492,12 +582,30 @@ class OpenAICompatibleImageProvider:
         image_size = self.provider_config.get("image_size")
         if image_size:
             payload["size"] = image_size
+        urls = reference_image_urls or []
+        if not isinstance(urls, list) or not all(isinstance(item, str) and item for item in urls):
+            raise RuntimeError("reference_image_urls 必须是非空字符串数组")
+        reference_image_field = self.provider_config.get("reference_image_field")
+        if urls:
+            if reference_image_field is None:
+                # 不是所有图片模型都支持参考图；这里显式拒绝以保证“锁图”确实参与
+                # 后续生成，而不是在用户不知情的情况下退化成纯文生图。
+                raise RuntimeError("当前图片模型未配置 reference_image_field，不能使用锁定参考图生成")
+            if (
+                not isinstance(reference_image_field, str)
+                or not reference_image_field
+                or not reference_image_field.replace("_", "").isalnum()
+            ):
+                raise RuntimeError("reference_image_field 必须由字母、数字或下划线组成")
+            payload[reference_image_field] = urls
         options = self.provider_config.get("image_request_options", {})
         if not isinstance(options, dict):
             raise RuntimeError("image_request_options 必须为 JSON 对象")
         reserved = {"model", "prompt", "n", "response_format", "size"}
+        if isinstance(reference_image_field, str) and reference_image_field:
+            reserved.add(reference_image_field)
         if reserved.intersection(options):
-            raise RuntimeError("image_request_options 不能覆盖 model、prompt、n、response_format 或 size")
+            raise RuntimeError("image_request_options 不能覆盖 Adapter 管理的模型、提示词、输出或参考图字段")
         payload.update(options)
 
         response_payload = _post_json(
@@ -835,6 +943,115 @@ class MockVideoGenerationProvider:
             status="SUCCEEDED",
             video_url=f"mock://video/{provider_task_id}",
         )
+
+
+class VolcengineArkVideoProvider:
+    """火山方舟 Seedance 原生图生视频适配器。
+
+    这不是让用户填写通用中转站路径的配置模板，而是按火山方舟 SDK 的固定协议封装：
+    ``POST /contents/generations/tasks`` 创建任务，随后 ``GET`` 同一路径加任务号查询。
+    因此制作人员只需选择已经开通的模型、画幅和时长；方舟地址、请求结构、首帧字段
+    与状态映射均由代码托管，避免把付费视频接口参数暴露给非技术用户。
+    """
+
+    provider_key = "volcengine_ark_video"
+    _BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+
+    def __init__(self, model_profile_snapshot: dict[str, Any]) -> None:
+        self.model_key = str(model_profile_snapshot["model_key"])
+        self.provider_config = model_profile_snapshot.get("provider_config") or {}
+
+    def submit(self, request: VideoGenerationInput) -> VideoTaskResult:
+        """以视频提示词和首帧图片创建方舟异步视频任务。"""
+
+        first_frame_url = self._public_image_url(request.image_urls[0])
+        content: list[dict[str, Any]] = [
+            {"type": "text", "text": request.prompt},
+            {
+                "type": "image_url",
+                "image_url": {"url": first_frame_url},
+                "role": "first_frame",
+            },
+        ]
+        if self.provider_config.get("use_last_frame") and len(request.image_urls) > 1:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": self._public_image_url(request.image_urls[-1])},
+                    "role": "last_frame",
+                }
+            )
+
+        payload: dict[str, Any] = {"model": self.model_key, "content": content}
+        # 只映射 SDK 明确支持、且不会泄露密钥的固定生产参数。
+        for option in ("ratio", "duration", "resolution", "generate_audio", "watermark", "return_last_frame", "seed"):
+            value = self.provider_config.get(option)
+            if value is not None:
+                payload[option] = value
+
+        response_payload = _post_json(
+            f"{self._BASE_URL}/contents/generations/tasks",
+            self._api_key(),
+            payload,
+            _request_timeout_seconds(self.provider_config),
+        )
+        task_id = response_payload.get("id")
+        if not isinstance(task_id, str) or not task_id:
+            raise RuntimeError("火山方舟创建视频任务后没有返回任务 ID")
+        # 官方创建接口只保证返回任务 ID；实际结果统一由轮询接口确认。
+        return VideoTaskResult(provider_task_id=task_id, status="PENDING")
+
+    def poll(self, provider_task_id: str) -> VideoTaskResult:
+        """读取方舟任务状态，并转换为平台统一状态。"""
+
+        if not provider_task_id:
+            raise RuntimeError("视频任务缺少火山方舟任务 ID")
+        response_payload = _get_json(
+            f"{self._BASE_URL}/contents/generations/tasks/{quote(provider_task_id, safe='')}",
+            self._api_key(),
+            _request_timeout_seconds(self.provider_config),
+        )
+        raw_status = response_payload.get("status")
+        if not isinstance(raw_status, str) or not raw_status:
+            raise RuntimeError("火山方舟任务查询响应缺少 status")
+        normalized_status = raw_status.strip().lower()
+        returned_task_id = response_payload.get("id")
+        stable_task_id = returned_task_id if isinstance(returned_task_id, str) and returned_task_id else provider_task_id
+        if normalized_status == "succeeded":
+            content = response_payload.get("content")
+            video_url = content.get("video_url") if isinstance(content, dict) else None
+            if not isinstance(video_url, str) or not video_url.startswith(("https://", "http://")):
+                raise RuntimeError("火山方舟任务已成功但未返回可访问的视频地址")
+            return VideoTaskResult(provider_task_id=stable_task_id, status="SUCCEEDED", video_url=video_url)
+        if normalized_status in {"failed", "cancelled", "canceled"}:
+            error = response_payload.get("error")
+            message = error.get("message") if isinstance(error, dict) else None
+            return VideoTaskResult(
+                provider_task_id=stable_task_id,
+                status="FAILED",
+                error_message=message if isinstance(message, str) and message else f"火山方舟任务状态：{raw_status}",
+            )
+        # queued、running 等非终态都由 Worker 按固定间隔继续轮询。
+        return VideoTaskResult(provider_task_id=stable_task_id, status="PENDING")
+
+    def _api_key(self) -> str:
+        """只从服务器环境读取 ARK Key，不保存或回显真实密钥。"""
+
+        secret_env_name = self.provider_config.get("secret_env_name", "ARK_API_KEY")
+        if not isinstance(secret_env_name, str) or not secret_env_name:
+            raise RuntimeError("火山方舟视频配置缺少密钥环境变量名称")
+        api_key = os.getenv(secret_env_name)
+        if not api_key:
+            raise RuntimeError(f"服务器环境变量 {secret_env_name} 未设置")
+        return api_key
+
+    @staticmethod
+    def _public_image_url(image_url: str) -> str:
+        """方舟服务端需能读取首帧，阻止将本机 data URL 发送到付费接口。"""
+
+        if not isinstance(image_url, str) or not image_url.startswith("https://"):
+            raise RuntimeError("豆包图生视频需要公网 HTTPS 首帧图片；请先使用真实图片模型或对象存储")
+        return image_url
 
 
 class ConfigurableAsyncVideoProvider:

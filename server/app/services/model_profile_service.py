@@ -74,6 +74,7 @@ OPENAI_COMPATIBLE_TEXT_STEPS = {
 }
 OPENAI_COMPATIBLE_IMAGE_STEPS = {"generate_storyboard_images"}
 CONFIGURABLE_ASYNC_VIDEO_STEPS = {"generate_storyboard_video_groups"}
+VOLCENGINE_ARK_VIDEO_STEPS = {"generate_storyboard_video_groups"}
 OPENAI_COMPATIBLE_VISION_STEPS = {"analyze_reference_mechanisms"}
 OPENAI_COMPATIBLE_TRANSCRIPTION_STEPS = {"transcribe_reference_audio"}
 FFMPEG_CONCAT_STEPS = {"assemble_final_video"}
@@ -123,6 +124,8 @@ def is_adapter_available(step_key: str, provider_key: str, model_key: str) -> bo
     ) or (
         provider_key == "configurable_async_video" and step_key in CONFIGURABLE_ASYNC_VIDEO_STEPS
     ) or (
+        provider_key == "volcengine_ark_video" and step_key in VOLCENGINE_ARK_VIDEO_STEPS
+    ) or (
         provider_key == "ffmpeg_concat" and step_key in FFMPEG_CONCAT_STEPS
     )
 
@@ -140,11 +143,15 @@ def _validate_activation_config(
         "openai_compatible_vision",
         "openai_compatible_transcription",
         "configurable_async_video",
+        "volcengine_ark_video",
         "ffmpeg_concat",
     }:
         return
     if provider_key == "configurable_async_video":
         _validate_async_video_config(step_key, provider_config)
+        return
+    if provider_key == "volcengine_ark_video":
+        _validate_volcengine_ark_video_config(step_key, provider_config)
         return
     if provider_key == "ffmpeg_concat":
         _validate_ffmpeg_concat_config(step_key, provider_config)
@@ -319,6 +326,32 @@ def _validate_async_video_config(step_key: str, provider_config: dict[str, Any])
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=f"{config_key} 必须是非空字符串数组")
 
 
+def _validate_volcengine_ark_video_config(step_key: str, provider_config: dict[str, Any]) -> None:
+    """校验火山方舟原生视频配置，仅保留制作人员真正需要选择的参数。"""
+
+    if step_key not in VOLCENGINE_ARK_VIDEO_STEPS:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="该步骤暂未接入火山方舟视频适配器")
+    secret_env_name = provider_config.get("secret_env_name", "ARK_API_KEY")
+    if not isinstance(secret_env_name, str) or not _ENV_NAME_PATTERN.fullmatch(secret_env_name):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="火山方舟视频配置需要 ARK_API_KEY 环境变量名称")
+    ratio = provider_config.get("ratio", "9:16")
+    if not isinstance(ratio, str) or ratio not in {"16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "adaptive"}:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="视频画幅必须是平台支持的比例，例如 9:16")
+    duration = provider_config.get("duration", 5)
+    if not isinstance(duration, int) or not 2 <= duration <= 12:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="视频时长必须是 2 至 12 秒的整数")
+    resolution = provider_config.get("resolution")
+    if resolution is not None and (not isinstance(resolution, str) or not resolution.strip()):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="视频分辨率必须是非空文本或留空使用模型默认值")
+    for option in ("generate_audio", "watermark", "return_last_frame", "use_last_frame"):
+        value = provider_config.get(option)
+        if value is not None and not isinstance(value, bool):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=f"{option} 必须是是或否")
+    seed = provider_config.get("seed")
+    if seed is not None and (not isinstance(seed, int) or seed < 0):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="seed 必须是非负整数或留空")
+
+
 def ensure_default_profiles(db: Session) -> None:
     """在空数据库首次启动时写入各步骤可直接联调的模拟配置。"""
 
@@ -484,6 +517,17 @@ def preflight_model_profile(db: Session, profile_id: str) -> list[dict[str, str]
                 "key": "network",
                 "status": "warning",
                 "message": "通用异步视频协议没有统一的无扣费探针；请先用测试项目生成 1 组镜头验证提交与轮询映射。",
+            }
+        )
+        return checks
+
+    if profile.provider_key == "volcengine_ark_video":
+        checks.append(_preflight_secret(profile.provider_config))
+        checks.append(
+            {
+                "key": "protocol",
+                "status": "passed",
+                "message": "已使用火山方舟原生视频协议；创建、查询、首帧字段和状态映射由系统固定管理",
             }
         )
         return checks

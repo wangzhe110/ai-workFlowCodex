@@ -100,6 +100,40 @@ def test_openai_compatible_image_provider_returns_remote_image_url(monkeypatch) 
     assert captured["body"]["watermark"] is False
 
 
+def test_openai_compatible_image_provider_requires_explicit_reference_field(monkeypatch) -> None:
+    """参考生图不会悄悄退化为文生图，字段名由模型配置而非业务代码决定。"""
+
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _FakeHttpResponse({"data": [{"url": "https://cdn.example/generated.png"}]})
+
+    monkeypatch.setenv("YUNWU_API_KEY", "test-only-key")
+    monkeypatch.setattr("app.services.analysis_provider.urlopen", fake_urlopen)
+    provider = OpenAICompatibleImageProvider(
+        {
+            "model_key": "image-model",
+            "provider_config": {
+                "api_base_url": "https://yunwu.ai/v1",
+                "secret_env_name": "YUNWU_API_KEY",
+                "reference_image_field": "images",
+            },
+        }
+    )
+
+    result = provider.generate(
+        "以锁定角色和场景为参考生成关键帧",
+        reference_image_urls=["https://cdn.example/character.png", "https://cdn.example/scene.png"],
+    )
+
+    assert result == "https://cdn.example/generated.png"
+    assert captured["body"]["images"] == [
+        "https://cdn.example/character.png",
+        "https://cdn.example/scene.png",
+    ]
+
+
 def test_configurable_async_video_provider_submits_then_polls(monkeypatch) -> None:
     """异步视频适配器可由配置映射请求字段、任务状态和最终 MP4 地址。"""
 
@@ -230,6 +264,58 @@ def test_openai_compatible_vision_provider_sends_sampled_frames_and_keeps_abstra
     assert result["source"]["audio_mechanism_considered"] is True
     assert "原始语音" not in json.dumps(result, ensure_ascii=False)
     assert "untrusted_raw_field" not in result
+
+
+def test_openai_compatible_vision_provider_supports_v1_reviewable_contract(monkeypatch) -> None:
+    """配置 V1 结果契约后，视觉模型输出五类审核数据而不影响旧流程契约。"""
+
+    def fake_urlopen(request, timeout):
+        return _FakeHttpResponse(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "video_script_structure": {"theme": "异常信息驱动", "structure": ["异常", "目标", "反转"]},
+                                    "opening_analysis": {"time_window": "前 3 秒", "hook_type": "异常来电", "mechanism": "先抛问题再给目标"},
+                                    "viral_elements": [{"type": "conflict", "description": "目标与阻碍同现"}],
+                                    "scene_analysis": [{"role": "建立压力", "visual_style": "近景高信息密度"}],
+                                    "creative_brief": {"originality_rule": "只复用机制", "recommended_rhythm": "每段推进", "target_format": "9:16"},
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setenv("YUNWU_API_KEY", "test-only-key")
+    monkeypatch.setattr("app.services.analysis_provider.urlopen", fake_urlopen)
+    provider = OpenAICompatibleVisionAnalysisProvider(
+        {
+            "model_key": "vision-model",
+            "provider_config": {
+                "api_base_url": "https://yunwu.ai/v1",
+                "secret_env_name": "YUNWU_API_KEY",
+                "result_contract": "V1_REFERENCE_ANALYSIS",
+            },
+        }
+    )
+
+    result = provider.analyze(
+        VideoAnalysisInput(
+            asset_id="asset-1",
+            filename="reference.mp4",
+            content_type="video/mp4",
+            sampled_frames=[SampledVideoFrame(1.0, "data:image/jpeg;base64,Zmlyc3Q=")],
+        )
+    )
+
+    assert result["video_script_structure"]["theme"] == "异常信息驱动"
+    assert result["opening_analysis"]["hook_type"] == "异常来电"
+    assert result["viral_elements"] == [{"type": "conflict", "description": "目标与阻碍同现"}]
 
 
 def test_openai_compatible_transcription_provider_uses_multipart_and_returns_memory_text(monkeypatch) -> None:

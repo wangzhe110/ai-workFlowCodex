@@ -31,16 +31,8 @@ const finalVideoDownloadTimeoutSeconds = ref(120)
 const finalVideoMaxClipBytes = ref(500 * 1024 * 1024)
 const finalVideoMaxOutputBytes = ref(2 * 1024 * 1024 * 1024)
 const finalVideoRenderTimeoutSeconds = ref(1800)
-const videoSubmitPath = ref('/luma/generations')
-const videoQueryPath = ref('/luma/generations/{task_id}')
-const videoPromptField = ref('user_prompt')
-const videoImageInputMode = ref<'top_level_url' | 'luma_keyframe'>('top_level_url')
-const videoModelField = ref('')
-const videoEndImageField = ref('')
-const videoRequestOptionsText = ref('{}')
-const videoResponseMappingText = ref('{\n  "task_id_path": "id",\n  "state_path": "state",\n  "video_url_paths": ["video.url", "artifact.video.url"]\n}')
-const pollIntervalSeconds = ref(4)
-const maxPollSeconds = ref(900)
+const videoRatio = ref('9:16')
+const videoDuration = ref(5)
 const activate = ref(false)
 const comparisonStepKey = ref('generate_story_package')
 
@@ -69,7 +61,7 @@ const stepHelp = computed(() => {
     return '这一步不选 AI 模型。系统会把已经生成成功的视频片段按顺序合成为一个 MP4 文件。'
   }
   if (isVideoStep.value) {
-    return '这是最容易因不同中转站接口而出错、也可能产生费用的一步。请先让有 API 文档的人填写高级设置，再只生成 1 组镜头测试。'
+    return '参考流程使用的是豆包 Seedance 2.0 Mini。系统已按火山方舟官方协议接好创建任务、查询结果和首帧图片，不需要填写 API 路径或 JSON。'
   }
   if (isImageStep.value) {
     return '填写你在中转站后台看到的图片模型名称。首次测试只生成 1–2 张图片，确认尺寸和风格后再启用。'
@@ -90,6 +82,7 @@ const providerLabels: Record<string, string> = {
   openai_compatible_vision: '视觉分析模型（OpenAI 兼容）',
   openai_compatible_transcription: '语音转写模型（OpenAI 兼容）',
   configurable_async_video: '异步图生视频模型',
+  volcengine_ark_video: '豆包 Seedance 2.0 Mini（火山方舟）',
   ffmpeg_concat: '本地 FFmpeg 合成',
 }
 
@@ -123,9 +116,12 @@ function applyStepTemplate(nextStep: string) {
     return
   }
   if (nextStep === 'generate_storyboard_video_groups') {
-    providerKey.value = 'configurable_async_video'
-    displayName.value = '云雾图生视频模型'
-    apiBaseUrl.value = 'https://yunwu.ai'
+    providerKey.value = 'volcengine_ark_video'
+    modelKey.value = 'doubao-seedance-2-0-mini-260615'
+    displayName.value = '豆包 Seedance 2.0 Mini 视频模型'
+    // 火山方舟地址和任务协议由原生适配器固定管理，制作人员无需接触。
+    apiBaseUrl.value = ''
+    secretEnvName.value = ''
     return
   }
   if (nextStep === 'assemble_final_video') {
@@ -154,14 +150,8 @@ function providerConfig(): Record<string, unknown> {
       throw new Error(`${label}格式不正确。若你不确定，请保持系统提供的默认内容并联系有 API 文档的人。`)
     }
   }
-  let videoRequestOptions: Record<string, unknown> = {}
-  let videoResponseMapping: Record<string, unknown> = {}
   let visionRequestOptions: Record<string, unknown> = {}
   let transcriptionRequestOptions: Record<string, unknown> = {}
-  if (isVideoStep.value) {
-    videoRequestOptions = parseObject(videoRequestOptionsText.value, '视频固定参数')
-    videoResponseMapping = parseObject(videoResponseMappingText.value, '视频返回结果对应关系')
-  }
   if (isVisionStep.value) visionRequestOptions = parseObject(visionRequestOptionsText.value, '视觉模型高级参数')
   if (isTranscriptionStep.value) transcriptionRequestOptions = parseObject(transcriptionRequestOptionsText.value, '语音转写高级参数')
   return {
@@ -189,16 +179,9 @@ function providerConfig(): Record<string, unknown> {
       render_timeout_seconds: finalVideoRenderTimeoutSeconds.value,
     } : {}),
     ...(isVideoStep.value ? {
-      submit_path: videoSubmitPath.value.trim(),
-      query_path_template: videoQueryPath.value.trim(),
-      prompt_field: videoPromptField.value.trim(),
-      image_input_mode: videoImageInputMode.value,
-      ...(videoModelField.value.trim() ? { model_field: videoModelField.value.trim() } : {}),
-      ...(videoEndImageField.value.trim() ? { end_image_field: videoEndImageField.value.trim() } : {}),
-      video_request_options: videoRequestOptions,
-      ...videoResponseMapping,
-      poll_interval_seconds: pollIntervalSeconds.value,
-      max_poll_seconds: maxPollSeconds.value,
+      secret_env_name: 'ARK_API_KEY',
+      ratio: videoRatio.value,
+      duration: videoDuration.value,
     } : {}),
   }
 }
@@ -247,7 +230,7 @@ async function submit() {
       <li>从云雾/中转站后台复制模型名称，粘贴到“模型名称”。</li>
       <li>保存为候选 → 点击基础预检 → 用小样本测试 → 确认后启用。</li>
     </ol>
-    <p class="notice info">你不需要理解“供应商标识、JSON、请求路径”等词。除非视频中转站的文档要求，否则保持高级设置默认值即可。</p>
+    <p class="notice info">你不需要理解“供应商标识、JSON、请求路径”等词。文本、图片和豆包视频的常用配置均已内置。</p>
   </section>
 
   <div class="grid">
@@ -262,6 +245,24 @@ async function submit() {
 
       <template v-if="isFinalVideoStep">
         <p class="notice info">已自动选择本机 MP4 合成器。不消耗模型额度，也不需要填写 API Key。</p>
+      </template>
+      <template v-else-if="isVideoStep">
+        <p class="notice info">当前固定模型：<strong>doubao-seedance-2-0-mini-260615</strong>（豆包 Seedance 2.0 Mini）。你不用填写模型名称或 API Key。</p>
+        <label class="field">视频画幅
+          <select v-model="videoRatio">
+            <option value="9:16">竖屏短剧（9:16，推荐）</option>
+            <option value="16:9">横屏（16:9）</option>
+            <option value="1:1">方形（1:1）</option>
+          </select>
+        </label>
+        <label class="field">每段视频时长
+          <select v-model.number="videoDuration">
+            <option :value="3">3 秒（测试）</option>
+            <option :value="5">5 秒（推荐）</option>
+            <option :value="8">8 秒</option>
+          </select>
+        </label>
+        <p class="notice info">负责人只需在服务器配置一次 <code>ARK_API_KEY</code>。保存后先做预检；预检通过后，第一次只生成 1 组镜头。</p>
       </template>
       <template v-else>
         <label class="field">模型名称
@@ -291,7 +292,7 @@ async function submit() {
         <summary>高级设置（第一次通常不用打开）</summary>
         <div class="stack advanced-content">
           <p class="notice info">只有更换中转站、模型文档明确要求不同参数，或有技术人员协助时，才修改这里。API Key 的真实内容永远不能填在这里。</p>
-          <template v-if="!isFinalVideoStep">
+          <template v-if="!isFinalVideoStep && !isVideoStep">
             <label class="field">中转站类型<input v-model="providerKey" maxlength="80" /></label>
             <label class="field">API 地址<input v-model="apiBaseUrl" type="url" placeholder="https://…" /></label>
             <label class="field">服务器密钥变量名<input v-model="secretEnvName" placeholder="例如 YUNWU_API_KEY" /></label>
@@ -314,17 +315,7 @@ async function submit() {
           </template>
 
           <template v-if="isVideoStep">
-            <p class="notice error">视频模型的下面参数必须以中转站当前 API 文档为准；不知道含义时，不要保存或启用。请把 API 文档交给技术人员配置，并先只测试 1 组镜头。</p>
-            <label class="field">提交任务的路径<input v-model="videoSubmitPath" placeholder="例如 /luma/generations" /></label>
-            <label class="field">查询任务结果的路径<input v-model="videoQueryPath" placeholder="例如 /luma/generations/{task_id}" /></label>
-            <label class="field">提示词字段名<input v-model="videoPromptField" placeholder="例如 user_prompt 或 prompt" /></label>
-            <label class="field">首帧图片格式<select v-model="videoImageInputMode"><option value="top_level_url">普通图片地址</option><option value="luma_keyframe">关键帧格式</option></select></label>
-            <label class="field">模型字段名（可不填）<input v-model="videoModelField" placeholder="例如 model" /></label>
-            <label class="field">结束帧字段名（可不填）<input v-model="videoEndImageField" placeholder="例如 image_end_url" /></label>
-            <label class="field">固定参数（JSON）<textarea v-model="videoRequestOptionsText" rows="3" placeholder='例如 {"duration":"5s","aspect_ratio":"9:16"}' /></label>
-            <label class="field">返回结果对应关系（JSON）<textarea v-model="videoResponseMappingText" rows="6" /></label>
-            <label class="field">每隔几秒查询一次<input v-model.number="pollIntervalSeconds" type="number" min="1" max="60" /></label>
-            <label class="field">最长等多久（秒）<input v-model.number="maxPollSeconds" type="number" min="10" max="1800" /></label>
+            <p class="notice info">豆包视频已使用火山方舟原生适配器：系统自动提交视频任务、传入第一张分镜图、等待生成完成并保存视频地址。这里没有需要你填写的技术参数。</p>
           </template>
 
           <template v-if="isFinalVideoStep">

@@ -6,6 +6,12 @@
 
 `视频分析` 的状态顺序为：`PENDING → RUNNING → SUCCEEDED / FAILED`。每一次运行都会生成独立的 `WorkflowRun` 与 `WorkflowStep`，因此重试、成本记录和将来的模型版本对比都有可追溯记录。
 
+## LemonFlow V1 主链路
+
+新项目通过 `ProjectProductionState` 进入唯一的生产顺序：参考分析 → 分析审核 → 多模型故事 →
+故事选择 → 角色资产 → 场景资产 → 导演分镜 → 关键帧 → 视频生成 → 视频审核 → 成片导出。
+人工审核必须由 `v1_production_service.py` 执行；真实模型调用将由后续 Adapter/Worker 完成后再送入审核，不能由浏览器直接标记为成功。
+
 ## 重要约束
 
 - 模型供应商的 Key 不写入数据库实体或接口响应。

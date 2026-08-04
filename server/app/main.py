@@ -7,7 +7,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.api.routes import creative_library, images, model_profiles, projects, stories, storyboards, topics, videos, workflows
+from app.api.routes import (
+    creative_library,
+    images,
+    model_profiles,
+    production,
+    projects,
+    stories,
+    storyboards,
+    topics,
+    v1_modeling,
+    videos,
+    workflows,
+)
 from app.core.config import settings
 from app.core.database import engine, init_database
 from app.schemas import HealthResponse, ReadinessResponse
@@ -46,6 +58,8 @@ app.include_router(storyboards.router)
 app.include_router(images.router)
 app.include_router(videos.router)
 app.include_router(model_profiles.router)
+app.include_router(production.router)
+app.include_router(v1_modeling.router)
 
 
 @app.get("/health", response_model=HealthResponse, tags=["系统"])

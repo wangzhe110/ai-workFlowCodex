@@ -5,9 +5,9 @@
 ## 页面
 
 - `src/views/ProjectsView.vue`：项目列表与新建项目。
-- `src/views/ProjectWorkbenchView.vue`：上传参考视频、启动视频分析、查看进度和分析结果。
-- `src/views/ProjectTopicsView.vue`、`ProjectStoryView.vue`、`ProjectStoryboardView.vue`：依次审核原创选题、故事包和分镜。
-- `src/views/ProjectImagesView.vue`、`ProjectVideosView.vue`：生成带版本的分镜图片与按连续镜头分组的视频片段。
+- `src/views/ProductionWorkbenchView.vue`：V1 默认生产台，展示唯一主链路、审核备注、分析/故事/资产/视频版本和正式锁定按钮。
+- `src/views/ProjectWorkbenchView.vue`：旧工作台兼容入口。
+- `src/views/ProjectTopicsView.vue`、`ProjectStoryView.vue`、`ProjectStoryboardView.vue`、`ProjectImagesView.vue`、`ProjectVideosView.vue`：历史兼容或辅助实验页面，不是 V1 的强制前置步骤。
 - `src/views/ModelProfilesView.vue`：管理各步骤非敏感模型配置版本；包含文本、视觉视频分析、同步图片与异步视频任务的字段/响应映射配置，前端绝不接收真实 API Key。
 
 ## 目录边界

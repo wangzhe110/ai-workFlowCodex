@@ -41,7 +41,7 @@ function formatTime(value: string): string {
   <section class="page-heading">
     <div>
       <h1>项目工作台</h1>
-      <p>从有权使用的参考视频中提炼抽象创作机制，进入原创生产流程。</p>
+      <p>从有权使用的参考视频中提炼抽象创作机制，进入多模型协作、人工审核的原创生产流程。</p>
     </div>
   </section>
 
@@ -49,7 +49,7 @@ function formatTime(value: string): string {
     <form class="panel stack" @submit.prevent="submitProject">
       <div>
         <h2>新建项目</h2>
-        <p class="muted">Day 1 先建立项目并上传参考视频。</p>
+        <p class="muted">新项目将直接进入 LemonFlow V1 正式生产链路。</p>
       </div>
       <label class="field">
         项目名称

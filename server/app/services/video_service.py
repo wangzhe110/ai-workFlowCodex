@@ -27,6 +27,7 @@ from app.models import (
 from app.services.analysis_provider import (
     ConfigurableAsyncVideoProvider,
     MockVideoGenerationProvider,
+    VolcengineArkVideoProvider,
     VideoGenerationInput,
     VideoGenerationProvider,
     VideoTaskResult,
@@ -134,10 +135,10 @@ def _validate_video_input_urls(snapshot: dict, groups: list[dict]) -> None:
     确保这些图片均为 HTTPS 地址，而不是等后台 Worker 已创建任务后才失败。
     """
 
-    if snapshot.get("provider_key") != "configurable_async_video":
+    if snapshot.get("provider_key") not in {"configurable_async_video", "volcengine_ark_video"}:
         return
     config = snapshot.get("provider_config") or {}
-    needs_end_frame = bool(config.get("end_image_field"))
+    needs_end_frame = bool(config.get("end_image_field")) or bool(config.get("use_last_frame"))
     invalid_sources: list[str] = []
     for group in groups:
         required_shots = [group["shots"][0]]
@@ -205,6 +206,8 @@ def _video_provider(snapshot: dict) -> VideoGenerationProvider:
         return MockVideoGenerationProvider()
     if provider_key == "configurable_async_video":
         return ConfigurableAsyncVideoProvider(snapshot)
+    if provider_key == "volcengine_ark_video":
+        return VolcengineArkVideoProvider(snapshot)
     raise RuntimeError(f"视频步骤没有可执行的供应商适配器：{provider_key or '未配置'}")
 
 

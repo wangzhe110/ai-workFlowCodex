@@ -166,3 +166,227 @@ export interface ModelEvaluationComparison extends ModelEvaluation {
   profile_version: number
   display_name: string | null
 }
+
+/** LemonFlow V1 唯一生产主链路当前阶段及已冻结输入指针。 */
+export interface ProductionState {
+  project_id: string
+  active_stage: ProductionStage
+  workflow_definition_id: string
+  locked_reference_analysis_id: string | null
+  selected_story_proposal_id: string | null
+  director_plan_id: string | null
+  created_at: string
+  updated_at: string
+}
+
+export type ProductionStage =
+  | 'REFERENCE_ANALYSIS'
+  | 'ANALYSIS_REVIEW'
+  | 'STORY_GENERATION'
+  | 'STORY_REVIEW'
+  | 'CHARACTER_ASSETS'
+  | 'SCENE_ASSETS'
+  | 'DIRECTOR_PLANNING'
+  | 'SHOT_KEYFRAMES'
+  | 'VIDEO_GENERATION'
+  | 'VIDEO_REVIEW'
+  | 'FINAL_EXPORT'
+  | 'COMPLETED'
+  | 'LEGACY_READONLY'
+
+/** V1 的人工审核附带可追溯备注；登录上线后会自动替换 reviewer_label。 */
+export interface ReviewActionPayload {
+  reviewer_label?: string
+  note?: string
+  /** 可选的制作人主观评分；采用决定与评分独立保存，均用于模型横向比较。 */
+  quality_score?: number
+}
+
+/** V1 模型调用与人工审核形成的最新质量报表快照，只供人工比较，不会自动切换模型。 */
+export interface ModelQualityEvaluation {
+  id: string
+  model_profile_id: string
+  display_name: string
+  model_key: string
+  model_version: string
+  prompt_template_id: string | null
+  prompt_name: string | null
+  prompt_version: number | null
+  task_type: string
+  scenario: string
+  sample_count: number
+  success_count: number
+  success_rate: number
+  average_cost_amount: number | null
+  currency: string
+  average_latency_ms: number | null
+  average_human_score: number | null
+  adoption_rate: number | null
+  created_at: string
+}
+
+/** 项目内一次模型调用的安全追溯视图；不包含原视频、Prompt 正文和模型原始输出。 */
+export interface ModelInvocationTrace {
+  id: string
+  workflow_run_id: string | null
+  workflow_key: string | null
+  workflow_version: string | null
+  task_type: string
+  slot_key: string
+  model_display_name: string
+  model_key: string
+  model_version: string
+  model_profile_version: number | null
+  prompt_template_id: string | null
+  prompt_name: string | null
+  prompt_version: number | null
+  status: 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED'
+  provider_task_id: string | null
+  input_tokens: number | null
+  output_tokens: number | null
+  media_units: Record<string, unknown>
+  cost_amount: number | null
+  currency: string
+  latency_ms: number | null
+  error_code: string | null
+  created_at: string
+  finished_at: string | null
+}
+
+/** Gemini 等视频分析模型产生的抽象创作简报。 */
+export interface ReferenceAnalysis {
+  id: string
+  project_id: string
+  workflow_run_id: string
+  version: number
+  video_script_structure: Record<string, unknown>
+  opening_analysis: Record<string, unknown>
+  viral_elements: Array<Record<string, unknown>>
+  scene_analysis: Array<Record<string, unknown>>
+  creative_brief: Record<string, unknown>
+  generation_status: 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED'
+  review_status: 'PENDING_REVIEW' | 'LOCKED' | 'REJECTED'
+  locked_snapshot: Record<string, unknown> | null
+  locked_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+/** 并行导演/编剧模型生成的原创故事方案。 */
+export interface StoryProposalV1 {
+  id: string
+  project_id: string
+  batch_id: string
+  model_invocation_id: string | null
+  candidate_number: number
+  content: Record<string, unknown>
+  status: 'CANDIDATE' | 'SELECTED' | 'REJECTED'
+  created_at: string
+}
+
+export interface CharacterReferenceImageV1 {
+  id: string
+  project_id: string
+  character_id: string
+  character_code: string
+  character_name: string
+  version: number
+  image_url: string | null
+  generation_status: 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED'
+  review_status: 'PENDING_REVIEW' | 'LOCKED' | 'REJECTED'
+  created_at: string
+}
+
+export interface SceneReferenceImageV1 {
+  id: string
+  project_id: string
+  scene_id: string
+  scene_code: string
+  scene_name: string
+  version: number
+  image_url: string | null
+  generation_status: 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED'
+  review_status: 'PENDING_REVIEW' | 'LOCKED' | 'REJECTED'
+  created_at: string
+}
+
+export interface ShotKeyframeV1 {
+  id: string
+  project_id: string
+  shot_id: string
+  shot_number: number
+  version: number
+  image_url: string | null
+  generation_status: 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED'
+  review_status: 'PENDING_REVIEW' | 'LOCKED' | 'REJECTED'
+  input_asset_snapshot: Record<string, unknown>
+  created_at: string
+}
+
+export interface VideoClipV1 {
+  id: string
+  project_id: string
+  shot_plan_id: string
+  shot_number: number
+  version: number
+  video_url: string | null
+  provider_task_id: string | null
+  generation_status: string | null
+  review_status: 'PENDING_REVIEW' | 'APPROVED' | 'REJECTED' | null
+  review_note: string | null
+  input_asset_snapshot: Record<string, unknown> | null
+  created_at: string
+}
+
+/** 模型槽位只描述要完成的能力，业务页面不依赖具体供应商名称。 */
+export interface ModelSlot {
+  id: string
+  slot_key: string
+  capability: string
+  selection_mode: 'SINGLE' | 'MULTI_PARALLEL' | 'AB_TEST'
+  description: string
+  is_enabled: boolean
+  created_at: string
+  updated_at: string
+}
+
+/** V1 模型中心中的一个候选版本；Key 只以服务器环境变量名引用，不会出现在这里。 */
+export interface V1ModelProfile {
+  id: string
+  slot_key: string
+  adapter_key: string
+  model_key: string
+  display_name: string
+  model_version: string | null
+  version: number
+  provider_config: Record<string, unknown>
+  is_bound: boolean
+  is_enabled_in_slot: boolean
+  priority: number | null
+  created_at: string
+}
+
+export interface V1ModelProfileCreatePayload {
+  slot_key: string
+  adapter_key: string
+  model_key: string
+  display_name: string
+  model_version?: string
+  provider_config: Record<string, unknown>
+  enable_in_slot: boolean
+  replace_existing: boolean
+  priority?: number
+}
+
+/** 可版本化的生产 Prompt；真实调用会另外冻结一份快照。 */
+export interface PromptTemplate {
+  id: string
+  task_type: string
+  name: string
+  version: number
+  content: string
+  variables_schema: Record<string, unknown>
+  status: 'DRAFT' | 'ACTIVE' | 'ARCHIVED'
+  created_at: string
+  updated_at: string
+}

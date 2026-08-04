@@ -10,6 +10,7 @@ from app.core.database import get_db
 from app.models import AssetKind, Project, WorkflowRun
 from app.schemas import AssetResponse, ProjectCreateRequest, ProjectDetailResponse, ProjectSummaryResponse, WorkflowRunResponse
 from app.services.storage import asset_storage
+from app.services.v1_configuration_service import get_or_create_project_state
 from app.services.workflow_service import add_source_video, create_project, get_project_or_404
 
 
@@ -83,6 +84,8 @@ def create_project_endpoint(payload: ProjectCreateRequest, db: Session = Depends
     """创建项目。创建后须上传素材才能启动分析。"""
 
     project = create_project(db, payload.title, payload.description)
+    # 新项目直接进入 V1 唯一主流程；历史项目由迁移标记为只读兼容，绝不被这里覆盖。
+    get_or_create_project_state(db, project.id)
     # 新建实体还未加载关系，直接构造避免无意义的懒加载。
     return ProjectSummaryResponse(
         id=project.id,

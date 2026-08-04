@@ -12,6 +12,8 @@
     <nav class="top-nav" aria-label="主导航">
       <RouterLink to="/creative-library">创作资产库</RouterLink>
       <RouterLink to="/model-profiles">模型配置</RouterLink>
+      <RouterLink to="/model-quality">质量报表</RouterLink>
+      <RouterLink to="/prompt-templates">Prompt 模板</RouterLink>
       <span class="phase">V1</span>
     </nav>
   </header>

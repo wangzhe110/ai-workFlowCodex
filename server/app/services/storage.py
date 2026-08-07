@@ -56,12 +56,18 @@ class LocalAssetStorage:
         同名能力或提供本地临时文件，而不能让工作流依赖存储细节。
         """
 
+        candidate = self._safe_source_video_path(storage_key)
+        if not candidate.is_file():
+            raise RuntimeError("参考视频文件不存在或无法读取")
+        return candidate
+
+    def _safe_source_video_path(self, storage_key: str) -> Path:
+        """仅解析并校验源视频路径，供读取与删除共用。"""
+
         root = settings.local_storage_path.resolve()
         candidate = (root / storage_key).resolve()
         if candidate != root and root not in candidate.parents:
             raise RuntimeError("素材存储键不在允许目录内")
-        if not candidate.is_file():
-            raise RuntimeError("参考视频文件不存在或无法读取")
         return candidate
 
     @contextmanager
@@ -69,6 +75,11 @@ class LocalAssetStorage:
         """将本地素材以统一上下文接口提供给媒体 Worker，无需复制文件。"""
 
         yield self.source_video_path(storage_key)
+
+    def delete_source_video(self, storage_key: str) -> None:
+        """删除尚未进入分析快照的本地源视频；缺失文件按已清理处理。"""
+
+        self._safe_source_video_path(storage_key).unlink(missing_ok=True)
 
     def save_final_video(self, project_id: str, final_video_id: str, source_path: Path) -> str:
         """原子保存 FFmpeg 合成的 MP4，并返回不暴露给浏览器的内部存储键。
@@ -110,6 +121,9 @@ class SourceVideoStorage(Protocol):
 
     def source_video_file(self, storage_key: str) -> Iterator[Path]:
         """在上下文内提供 Worker 可读取的本地视频文件路径。"""
+
+    def delete_source_video(self, storage_key: str) -> None:
+        """删除未被冻结为分析输入的源视频对象。"""
 
 
 class S3SourceVideoStorage:
@@ -174,6 +188,16 @@ class S3SourceVideoStorage:
             if temporary_path.stat().st_size > settings.max_upload_bytes:
                 raise RuntimeError("对象存储中的参考视频超过 MAX_UPLOAD_BYTES 限制")
             yield temporary_path
+
+    def delete_source_video(self, storage_key: str) -> None:
+        """删除 S3 源视频对象；仅由通过业务冻结校验的素材删除流程调用。"""
+
+        if not isinstance(storage_key, str) or not storage_key.startswith("projects/"):
+            raise RuntimeError("参考视频存储键格式无效")
+        try:
+            self._client().delete_object(Bucket=self.bucket, Key=storage_key)
+        except Exception as exc:
+            raise RuntimeError("无法从对象存储删除参考视频") from exc
 
     @staticmethod
     def _client():

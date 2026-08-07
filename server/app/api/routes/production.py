@@ -131,8 +131,15 @@ def create_v1_generation_run_endpoint(
         from fastapi import HTTPException
 
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="未知的 V1 生成节点")
+    requested_source_asset_id = payload.source_asset_id if payload and run_key == "reference_analysis" else None
     requested_shots = payload.shot_plan_ids if payload and run_key == "video_generation" else None
-    run = create_v1_run(db, project_id=project_id, run_key=run_key, shot_plan_ids=requested_shots)
+    run = create_v1_run(
+        db,
+        project_id=project_id,
+        run_key=run_key,
+        source_asset_id=requested_source_asset_id,
+        shot_plan_ids=requested_shots,
+    )
     if getattr(run, "_created", True):
         if run_key == "video_generation":
             dispatch_v1_video_children(background_tasks, run.id)

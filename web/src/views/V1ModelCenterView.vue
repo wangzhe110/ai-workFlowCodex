@@ -2,16 +2,19 @@
 /**
  * LemonFlow V1 模型中心。
  *
- * 这个页面只面向 V1 主流程的“模型槽位”，不再把旧选题、旧分镜等历史步骤混给
- * 制作人员。用户只需要选择一个用途、填中转站展示的模型名，再决定是否人工启用。
- * 真实 API Key 绝不会由本页面收集或发送。
+ * 页面按“能力槽位”管理模型，不把 Gemini、Claude、Banana 或 Seedance 写进业务逻辑。
+ * 所有删除开关均来自后端：浏览器只展示状态，不能绕过进行中任务与历史调用的保护。
  */
 import { computed, onMounted, ref, watch } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import {
+  copyV1ModelProfile,
   createV1ModelProfile,
+  deleteV1ModelProfile,
   getModelSlots,
   getV1ModelProfiles,
   setV1ModelProfileEnabled,
+  updateV1ModelProfile,
 } from '@/api/production'
 import type { ModelSlot, V1ModelProfile } from '@/types/domain'
 
@@ -20,7 +23,6 @@ const profiles = ref<V1ModelProfile[]>([])
 const loading = ref(true)
 const saving = ref(false)
 const error = ref('')
-const notice = ref('')
 
 const slotKey = ref('VIDEO_ANALYSIS')
 const modelKey = ref('')
@@ -34,6 +36,9 @@ const videoRatio = ref('9:16')
 const videoDuration = ref(5)
 const estimatedCost = ref<number | null>(null)
 const enableAfterSave = ref(false)
+const editingProfileId = ref<string | null>(null)
+const editingAdapterKey = ref('')
+const editingProviderConfig = ref<Record<string, unknown>>({})
 
 const slotLabels: Record<string, string> = {
   VIDEO_ANALYSIS: '分析参考视频',
@@ -56,16 +61,21 @@ const isImage = computed(() => ['CHARACTER_IMAGE_GENERATE', 'SCENE_IMAGE_GENERAT
 const isKeyframe = computed(() => slotKey.value === 'SHOT_KEYFRAME_GENERATE')
 const isVideo = computed(() => slotKey.value === 'VIDEO_GENERATE')
 const isFinalCompose = computed(() => slotKey.value === 'FINAL_COMPOSE')
-const adapterKey = computed(() => {
+const defaultAdapterKey = computed(() => {
   if (isVision.value) return 'openai_compatible_vision'
   if (isText.value) return 'openai_compatible'
   if (isImage.value) return 'openai_compatible_image'
   if (isVideo.value) return 'volcengine_ark_video'
   return 'ffmpeg_concat'
 })
+const adapterKey = computed(() => editingAdapterKey.value || defaultAdapterKey.value)
 const slotProfiles = computed(() => profiles.value.filter((item) => item.slot_key === slotKey.value))
+const editingVersionLabel = computed(() => {
+  const profile = profiles.value.find((item) => item.id === editingProfileId.value)
+  return profile ? `保存第 ${profile.version} 版修改` : '保存当前版本修改'
+})
 
-/** 重新读取，确保“是否已启用”的显示来自服务端正式状态，而非浏览器猜测。 */
+/** 读取服务端正式配置；删除权限、活动任务数不能由浏览器自行判断。 */
 async function load() {
   loading.value = true
   error.value = ''
@@ -77,16 +87,14 @@ async function load() {
       slotKey.value = loadedSlots[0].slot_key
     }
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : '模型中心加载失败，请确认后端服务已启动。'
+    error.value = cause instanceof Error ? cause.message : '模型中心加载失败，请确认后端服务与数据库迁移已启动。'
   } finally {
     loading.value = false
   }
 }
 
-/** 切换用途时填入安全的推荐值；用户只需从中转站复制“模型名称”。 */
+/** 切换槽位时给出小白可理解的推荐输入，真实 Key 始终不在网页表单中出现。 */
 function applySlotTemplate(next: string) {
-  error.value = ''
-  notice.value = ''
   modelVersion.value = ''
   estimatedCost.value = null
   enableAfterSave.value = false
@@ -113,19 +121,29 @@ function applySlotTemplate(next: string) {
     apiBaseUrl.value = ''
   }
 }
-watch(slotKey, applySlotTemplate)
+
+watch(slotKey, (next) => {
+  // 编辑时槽位不可变，不能用模板覆盖原配置。
+  if (!editingProfileId.value) applySlotTemplate(next)
+})
 
 function currentProviderConfig(): Record<string, unknown> {
-  if (isVideo.value) {
-    return withEstimatedCost({ secret_env_name: 'ARK_API_KEY', ratio: videoRatio.value, duration: videoDuration.value })
+  const preserved = { ...editingProviderConfig.value }
+  delete preserved.estimated_cost_per_call
+  delete preserved.currency
+  if (adapterKey.value === 'mock_v1' || adapterKey.value === 'configurable_async_video') {
+    return withEstimatedCost(preserved)
   }
-  if (isFinalCompose.value) return withEstimatedCost({})
+  if (isVideo.value) {
+    return withEstimatedCost({ ...preserved, secret_env_name: 'ARK_API_KEY', ratio: videoRatio.value, duration: videoDuration.value })
+  }
+  if (isFinalCompose.value) return withEstimatedCost(preserved)
   const config: Record<string, unknown> = {
+    ...preserved,
     api_base_url: apiBaseUrl.value.trim(),
     secret_env_name: secretEnvName.value.trim(),
   }
   if (isVision.value) {
-    // 指定 V1 契约，确保审核页一定会得到五类正式分析字段。
     config.result_contract = 'V1_REFERENCE_ANALYSIS'
     config.frame_sample_count = 6
   }
@@ -134,13 +152,20 @@ function currentProviderConfig(): Record<string, unknown> {
   return withEstimatedCost(config)
 }
 
-/** 成本是人为填写的单次预估，不是模型厂商账单；未填写就不会显示成本平均值。 */
+/** 预估成本只用于报表对比，不是供应商账单或自动切换依据。 */
 function withEstimatedCost(config: Record<string, unknown>): Record<string, unknown> {
   if (estimatedCost.value !== null && Number.isFinite(estimatedCost.value) && estimatedCost.value >= 0) {
     config.estimated_cost_per_call = estimatedCost.value
     config.currency = 'CNY'
   }
   return config
+}
+
+function resetToCandidate() {
+  editingProfileId.value = null
+  editingAdapterKey.value = ''
+  editingProviderConfig.value = {}
+  applySlotTemplate(slotKey.value)
 }
 
 async function saveCandidate() {
@@ -150,23 +175,29 @@ async function saveCandidate() {
   }
   saving.value = true
   error.value = ''
-  notice.value = ''
   try {
-    const shouldReplace = Boolean(enableAfterSave.value && selectedSlot.value?.selection_mode === 'SINGLE')
-    await createV1ModelProfile({
-      slot_key: slotKey.value,
+    const payload = {
       adapter_key: adapterKey.value,
       model_key: modelKey.value.trim(),
       display_name: displayName.value.trim(),
       model_version: modelVersion.value.trim() || undefined,
       provider_config: currentProviderConfig(),
-      enable_in_slot: enableAfterSave.value,
-      replace_existing: shouldReplace,
-      priority: 100,
-    })
-    notice.value = enableAfterSave.value
-      ? '已保存并按你的确认启用。以前的版本仍保留，可随时人工切回。'
-      : '已保存为候选。请确认服务器已经配置 Key，再点击下方“启用此版本”。'
+    }
+    if (editingProfileId.value) {
+      await updateV1ModelProfile(editingProfileId.value, payload)
+      ElMessage.success('已保存当前模型版本的修改')
+      resetToCandidate()
+    } else {
+      const shouldReplace = Boolean(enableAfterSave.value && selectedSlot.value?.selection_mode === 'SINGLE')
+      await createV1ModelProfile({
+        slot_key: slotKey.value,
+        ...payload,
+        enable_in_slot: enableAfterSave.value,
+        replace_existing: shouldReplace,
+        priority: 100,
+      })
+      ElMessage.success(enableAfterSave.value ? '模型已保存并启用' : '模型已保存为候选草稿')
+    }
     await load()
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : '保存失败，请检查填写内容。'
@@ -175,11 +206,79 @@ async function saveCandidate() {
   }
 }
 
-/** 单模型槽位会在用户点击时替换旧版本；故事槽位则允许多个真实模型并行。 */
+/** 加载可编辑版本；产生调用记录的历史版本只能复制，不能覆盖。 */
+function beginEdit(profile: V1ModelProfile) {
+  if (!profile.can_edit) {
+    error.value = '该版本已经产生模型调用，不能覆盖修改；请复制创建新版本。'
+    return
+  }
+  editingProfileId.value = profile.id
+  editingAdapterKey.value = profile.adapter_key
+  editingProviderConfig.value = { ...profile.provider_config }
+  slotKey.value = profile.slot_key
+  modelKey.value = profile.model_key
+  displayName.value = profile.display_name
+  modelVersion.value = profile.model_version || ''
+  apiBaseUrl.value = String(profile.provider_config.api_base_url || '')
+  secretEnvName.value = String(profile.provider_config.secret_env_name || '')
+  imageSize.value = String(profile.provider_config.image_size || '')
+  referenceImageField.value = String(profile.provider_config.reference_image_field || '')
+  videoRatio.value = String(profile.provider_config.ratio || '9:16')
+  videoDuration.value = Number(profile.provider_config.duration || 5)
+  estimatedCost.value = typeof profile.provider_config.estimated_cost_per_call === 'number'
+    ? profile.provider_config.estimated_cost_per_call
+    : null
+  enableAfterSave.value = false
+  error.value = ''
+}
+
+async function copyProfile(profile: V1ModelProfile) {
+  saving.value = true
+  error.value = ''
+  try {
+    const copied = await copyV1ModelProfile(profile.id)
+    await load()
+    beginEdit(copied)
+    ElMessage.success(`已复制为第 ${copied.version} 版草稿，请修改并测试后启用`)
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : '复制新版本失败，请重试。'
+  } finally {
+    saving.value = false
+  }
+}
+
+/** 删除前再次向用户说明后果，实际安全校验仍由后端执行。 */
+async function removeProfile(profile: V1ModelProfile) {
+  try {
+    const currentModelWarning = profile.is_enabled_in_slot
+      ? '它当前已启用；删除后该功能可能暂时没有可用模型。'
+      : '这会删除该候选配置及其槽位绑定。'
+    await ElMessageBox.confirm(`${currentModelWarning} 删除后无法恢复，是否继续？`, '删除模型版本', {
+      type: 'warning',
+      confirmButtonText: '确认删除',
+      cancelButtonText: '取消',
+    })
+  } catch {
+    return
+  }
+  saving.value = true
+  error.value = ''
+  try {
+    await deleteV1ModelProfile(profile.id)
+    if (editingProfileId.value === profile.id) resetToCandidate()
+    await load()
+    ElMessage.success('模型候选已删除')
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : '删除失败，请稍后重试。'
+  } finally {
+    saving.value = false
+  }
+}
+
+/** 单模型槽位替换旧绑定，多模型故事槽位则可并行启用多个版本。 */
 async function toggleProfile(profile: V1ModelProfile) {
   saving.value = true
   error.value = ''
-  notice.value = ''
   try {
     const slot = slots.value.find((item) => item.slot_key === profile.slot_key)
     const enable = !profile.is_enabled_in_slot
@@ -189,8 +288,8 @@ async function toggleProfile(profile: V1ModelProfile) {
       enable,
       Boolean(enable && slot?.selection_mode === 'SINGLE'),
     )
-    notice.value = enable ? '已按你的确认启用该版本。' : '已停止在该槽位使用此版本，历史记录仍会保留。'
     await load()
+    ElMessage.success(enable ? '已启用此版本' : '已停止使用此版本')
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : '切换失败，请重试。'
   } finally {
@@ -198,105 +297,196 @@ async function toggleProfile(profile: V1ModelProfile) {
   }
 }
 
+function profileStatusLabel(profile: V1ModelProfile): string {
+  if (profile.is_enabled_in_slot) return '已启用'
+  return profile.profile_status === 'DRAFT' ? '草稿候选' : '历史版本'
+}
+
+function profileStatusType(profile: V1ModelProfile): 'success' | 'info' | 'warning' {
+  if (profile.is_enabled_in_slot) return 'success'
+  return profile.profile_status === 'DRAFT' ? 'info' : 'warning'
+}
+
 onMounted(load)
 applySlotTemplate(slotKey.value)
 </script>
 
 <template>
-  <section class="page-heading">
-    <div>
-      <RouterLink class="muted" to="/">← 返回项目</RouterLink>
-      <h1>V1 模型中心</h1>
-      <p>按“功能”配置模型，不需要理解程序代码。系统不会自动换模型，任何启用与替换都需要你点击确认。</p>
+  <section class="model-center-page">
+    <div class="page-topbar">
+      <div>
+        <RouterLink to="/"><el-button text>← 返回项目</el-button></RouterLink>
+        <h1>模型配置中心</h1>
+        <p>按功能管理模型版本。模型 Key 只保存在服务器环境变量中，不会出现在这里。</p>
+      </div>
+      <el-space wrap>
+        <RouterLink to="/model-quality"><el-button>质量与成本报表</el-button></RouterLink>
+        <RouterLink to="/prompt-templates"><el-button>Prompt 模板</el-button></RouterLink>
+      </el-space>
     </div>
+
+    <el-alert
+      title="安全规则：未使用候选可编辑、可删除；正在运行的任务或历史调用会锁住对应版本。"
+      type="info"
+      :closable="false"
+      show-icon
+      class="guide-alert"
+    />
+
+    <el-row :gutter="20" class="model-layout">
+      <el-col :xs="24" :xl="9">
+        <el-card shadow="never" class="config-card">
+          <template #header>
+            <div class="card-heading">
+              <div>
+                <span class="eyebrow">{{ editingProfileId ? '正在编辑' : '新增候选' }}</span>
+                <h2>{{ editingProfileId ? '编辑模型版本' : '添加模型版本' }}</h2>
+              </div>
+              <el-tag v-if="editingProfileId" type="warning" effect="plain">版本号与槽位不可改</el-tag>
+            </div>
+          </template>
+
+          <el-form label-position="top" @submit.prevent="saveCandidate">
+            <el-form-item label="它要完成什么功能？">
+              <el-select v-model="slotKey" :disabled="Boolean(editingProfileId)" class="full-width">
+                <el-option v-for="slot in slots" :key="slot.id" :label="slotLabels[slot.slot_key] || slot.description" :value="slot.slot_key" />
+              </el-select>
+              <div class="form-help">{{ selectedSlot?.description || '正在读取功能说明…' }}</div>
+            </el-form-item>
+
+            <template v-if="isVideo">
+              <el-alert title="视频生成使用火山方舟原生协议，不需要填写 API 地址。" type="info" :closable="false" show-icon class="compact-alert" />
+              <el-form-item label="模型名称"><el-input v-model="modelKey" maxlength="160" /></el-form-item>
+              <el-form-item label="视频画幅">
+                <el-select v-model="videoRatio" class="full-width">
+                  <el-option label="竖屏短剧（9:16）" value="9:16" />
+                  <el-option label="横屏（16:9）" value="16:9" />
+                  <el-option label="方形（1:1）" value="1:1" />
+                </el-select>
+              </el-form-item>
+              <el-form-item label="每段时长"><el-select v-model="videoDuration" class="full-width"><el-option :value="3" label="3 秒（测试）" /><el-option :value="5" label="5 秒（推荐）" /><el-option :value="8" label="8 秒" /></el-select></el-form-item>
+            </template>
+
+            <template v-else-if="isFinalCompose">
+              <el-alert title="这一环节由服务器 FFmpeg 合成已审核视频，不会调用 AI。" type="info" :closable="false" show-icon class="compact-alert" />
+              <el-form-item label="合成器名称"><el-input v-model="modelKey" readonly /></el-form-item>
+            </template>
+
+            <template v-else>
+              <el-form-item label="模型名称"><el-input v-model="modelKey" placeholder="从中转站后台直接复制" maxlength="160" /></el-form-item>
+              <el-form-item label="中转站 API 地址"><el-input v-model="apiBaseUrl" placeholder="https://…/v1" /></el-form-item>
+              <el-form-item label="服务器密钥变量名"><el-input v-model="secretEnvName" placeholder="例如 YUNWU_API_KEY" /></el-form-item>
+              <div class="form-help">只填变量名，绝不在网页粘贴 API Key。</div>
+            </template>
+
+            <template v-if="isImage">
+              <el-form-item label="图片尺寸"><el-input v-model="imageSize" placeholder="例如 1728x2304" /></el-form-item>
+              <el-form-item v-if="isKeyframe" label="中转站文档中的参考图字段名"><el-input v-model="referenceImageField" placeholder="通常为 images，以文档为准" /></el-form-item>
+            </template>
+
+            <el-divider />
+            <el-form-item label="给自己看的名称"><el-input v-model="displayName" maxlength="160" placeholder="例如：云雾 Claude 故事模型-测试版" /></el-form-item>
+            <el-form-item label="模型版本（可不填）"><el-input v-model="modelVersion" maxlength="160" placeholder="例如：preview 或供应商版本号" /></el-form-item>
+            <el-form-item label="预计每次生成费用（元，可不填）"><el-input-number v-model="estimatedCost" :min="0" :precision="4" :step="0.1" class="full-width" controls-position="right" /></el-form-item>
+            <div class="form-help">这是质量报表用的人工预估值，不是供应商账单。</div>
+            <el-form-item v-if="!editingProfileId" class="enable-switch">
+              <el-switch v-model="enableAfterSave" active-text="保存后立即启用" />
+            </el-form-item>
+
+            <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon class="compact-alert" />
+            <div class="form-actions">
+              <el-button type="primary" native-type="submit" :loading="saving">{{ editingProfileId ? editingVersionLabel : `保存「${slotLabel}」候选` }}</el-button>
+              <el-button v-if="editingProfileId" :disabled="saving" @click="resetToCandidate">取消编辑</el-button>
+            </div>
+          </el-form>
+        </el-card>
+      </el-col>
+
+      <el-col :xs="24" :xl="15" class="versions-column">
+        <el-card shadow="never" class="versions-card">
+          <template #header>
+            <div class="card-heading">
+              <div>
+                <span class="eyebrow">{{ slotLabel }}</span>
+                <h2>模型版本列表</h2>
+              </div>
+              <el-badge :value="slotProfiles.length" type="primary"><span class="count-label">个版本</span></el-badge>
+            </div>
+          </template>
+
+          <el-table :data="slotProfiles" v-loading="loading" empty-text="当前功能还没有候选模型" class="profiles-table">
+            <el-table-column label="版本 / 状态" min-width="180">
+              <template #default="{ row: profile }">
+                <div class="profile-title">{{ profile.display_name }}</div>
+                <el-space size="small" wrap>
+                  <el-tag size="small" effect="plain">v{{ profile.version }}</el-tag>
+                  <el-tag size="small" :type="profileStatusType(profile)">{{ profileStatusLabel(profile) }}</el-tag>
+                  <el-tag v-if="profile.active_run_count" size="small" type="danger">{{ profile.active_run_count }} 个任务进行中</el-tag>
+                </el-space>
+              </template>
+            </el-table-column>
+            <el-table-column label="模型信息" min-width="220">
+              <template #default="{ row: profile }">
+                <div class="model-key">{{ profile.model_key }}</div>
+                <div class="table-subline">{{ profile.model_version || '未填写模型版本' }}</div>
+                <div class="table-subline">{{ profile.adapter_key }} · 优先级 {{ profile.priority ?? '—' }}</div>
+              </template>
+            </el-table-column>
+            <el-table-column label="可操作性" min-width="180">
+              <template #default="{ row: profile }">
+                <el-tag v-if="profile.has_model_invocations" size="small" type="warning" effect="plain">已有历史调用</el-tag>
+                <span v-else class="table-subline">尚无调用，可安全修改</span>
+                <el-tooltip v-if="!profile.can_delete" :content="profile.delete_block_reason || '当前不可删除'" placement="top">
+                  <div class="blocked-reason">{{ profile.delete_block_reason }}</div>
+                </el-tooltip>
+              </template>
+            </el-table-column>
+            <el-table-column label="操作" width="210" fixed="right">
+              <template #default="{ row: profile }">
+                <div class="row-actions">
+                  <el-button v-if="profile.can_edit" link type="primary" :disabled="saving" @click="beginEdit(profile)">编辑</el-button>
+                  <el-button link type="primary" :disabled="saving" @click="copyProfile(profile)">复制</el-button>
+                  <el-button link :type="profile.is_enabled_in_slot ? 'warning' : 'success'" :disabled="saving" @click="toggleProfile(profile)">{{ profile.is_enabled_in_slot ? '停用' : '启用' }}</el-button>
+                  <el-tooltip v-if="!profile.can_delete" :content="profile.delete_block_reason || '当前不可删除'" placement="top">
+                    <span><el-button link type="danger" disabled>删除</el-button></span>
+                  </el-tooltip>
+                  <el-button v-else link type="danger" :disabled="saving" @click="removeProfile(profile)">删除</el-button>
+                </div>
+              </template>
+            </el-table-column>
+          </el-table>
+
+          <el-alert title="提示：已有调用记录的模型不能覆盖修改或删除。请复制为新草稿，再修改、测试并人工启用。" type="warning" :closable="false" show-icon class="bottom-tip" />
+        </el-card>
+      </el-col>
+    </el-row>
   </section>
-
-  <section class="panel stack">
-    <h2>先理解这三件事</h2>
-    <ol class="setup-steps">
-      <li>先让负责人把 API Key 写入服务器的 <code>infra/backend.env</code>；这里不填写 Key。</li>
-      <li>选择一个用途，把中转站后台显示的“模型名称”复制进来，先保存为候选。</li>
-      <li>用小项目测试后，再点“启用此版本”。故事生成可启用多个模型并行出方案。</li>
-    </ol>
-    <p class="notice info">提示：真实视频需要公网 HTTPS 图片。正式生产建议开启图片对象存储转存；本地模拟模式不产生真实图片或视频。</p>
-  </section>
-
-  <div class="grid">
-    <form class="panel stack" @submit.prevent="saveCandidate">
-      <h2>添加 V1 候选模型</h2>
-      <label class="field">它要完成什么功能？
-        <select v-model="slotKey">
-          <option v-for="slot in slots" :key="slot.id" :value="slot.slot_key">
-            {{ slotLabels[slot.slot_key] || slot.description }}
-          </option>
-        </select>
-      </label>
-      <p class="notice info">{{ selectedSlot?.description || '正在读取功能说明…' }}</p>
-
-      <template v-if="isVideo">
-        <p class="notice info">系统使用火山方舟原生 Adapter：模型、任务提交、轮询和首帧字段均由系统处理，不用填写 API 地址。</p>
-        <label class="field">模型名称<input v-model="modelKey" maxlength="160" /></label>
-        <label class="field">视频画幅
-          <select v-model="videoRatio"><option value="9:16">竖屏短剧（推荐）</option><option value="16:9">横屏</option><option value="1:1">方形</option></select>
-        </label>
-        <label class="field">每段时长
-          <select v-model.number="videoDuration"><option :value="3">3 秒（测试）</option><option :value="5">5 秒（推荐）</option><option :value="8">8 秒</option></select>
-        </label>
-      </template>
-
-      <template v-else-if="isFinalCompose">
-        <p class="notice info">这一步不调用 AI。服务器用 FFmpeg 把人工审核通过的视频片段合成为完整 MP4。</p>
-        <label class="field">合成器名称<input v-model="modelKey" readonly /></label>
-      </template>
-
-      <template v-else>
-        <label class="field">模型名称
-          <input v-model="modelKey" placeholder="从云雾或中转站后台复制" maxlength="160" />
-        </label>
-        <small class="muted">不要猜名称。中转站后台显示什么，就复制什么。</small>
-        <label class="field">中转站 API 地址<input v-model="apiBaseUrl" type="url" placeholder="https://…/v1" /></label>
-        <label class="field">服务器里保存 Key 的变量名<input v-model="secretEnvName" placeholder="例如 YUNWU_API_KEY" /></label>
-        <p class="muted">这里只写变量名，不写 Key 内容。实际 Key 只能放在服务器的环境文件里。</p>
-      </template>
-
-      <template v-if="isImage">
-        <label class="field">图片尺寸<input v-model="imageSize" placeholder="例如 1728x2304" /></label>
-        <label v-if="isKeyframe" class="field">中转站文档中的“参考图字段名”
-          <input v-model="referenceImageField" placeholder="通常是 images，以文档为准" />
-        </label>
-        <small v-if="isKeyframe" class="muted">关键帧必须使用已经锁定的角色图和场景图。若中转站不支持参考图，请不要用它生成关键帧。</small>
-      </template>
-
-      <label class="field">给自己看的名称<input v-model="displayName" maxlength="160" placeholder="例如：云雾 Claude 故事模型-测试版" /></label>
-      <label class="field">模型版本（可不填）<input v-model="modelVersion" maxlength="160" placeholder="例如：preview 或供应商版本号" /></label>
-      <label class="field">预计每次生成费用（元，可不填）<input v-model.number="estimatedCost" type="number" min="0" step="0.0001" placeholder="例如 0.8" /></label>
-      <small class="muted">这是便于比较的预估值，不是平台扣费；不填就不会在质量报表中显示平均成本。</small>
-      <label class="field"><span><input v-model="enableAfterSave" type="checkbox" /> 我已经测试过，保存后立即启用</span></label>
-      <p class="muted">单模型功能会替换当前版本；“并行生成原创故事”会保留多个已启用模型同时出方案。</p>
-      <RouterLink class="button secondary" to="/model-quality">查看模型质量与成本报表</RouterLink>
-      <RouterLink class="button secondary" to="/prompt-templates">管理 Prompt 模板版本</RouterLink>
-
-      <p v-if="error" class="notice error">{{ error }}</p>
-      <p v-if="notice" class="notice success">{{ notice }}</p>
-      <button class="button" :disabled="saving">{{ saving ? '保存中…' : `保存「${slotLabel}」候选` }}</button>
-    </form>
-
-    <section class="panel stack">
-      <div class="meta-row"><h2>当前功能的模型版本</h2><span>{{ slotProfiles.length }} 项</span></div>
-      <p v-if="loading" class="muted">正在读取…</p>
-      <p v-else-if="!slotProfiles.length" class="muted">还没有候选模型。你可以先使用系统的本地模拟模式完成流程演示。</p>
-      <article v-for="profile in slotProfiles" :key="profile.id" class="panel stack">
-        <div class="meta-row">
-          <strong>{{ profile.display_name }} · 第 {{ profile.version }} 版</strong>
-          <span :class="profile.is_enabled_in_slot ? 'status success' : 'status muted'">{{ profile.is_enabled_in_slot ? '当前启用' : '候选未启用' }}</span>
-        </div>
-        <p class="muted">模型：{{ profile.model_key }}<span v-if="profile.model_version"> · {{ profile.model_version }}</span></p>
-        <p class="muted">协议：{{ profile.adapter_key }} · 优先级：{{ profile.priority ?? '—' }}</p>
-        <p v-if="profile.adapter_key === 'mock_v1'" class="notice info">这是本地模拟，不读取你的 Key，也不会生成真实视频。</p>
-        <button class="button secondary" :disabled="saving" @click="toggleProfile(profile)">
-          {{ profile.is_enabled_in_slot ? '停止使用此版本' : '启用此版本' }}
-        </button>
-      </article>
-    </section>
-  </div>
 </template>
+
+<style scoped>
+.model-center-page { display: grid; gap: 20px; }
+.page-topbar { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; }
+.page-topbar h1 { margin: 4px 0 8px; color: #1f2d3d; font-size: 30px; letter-spacing: -0.5px; }
+.page-topbar p { margin: 0; color: #718096; }
+.guide-alert, .bottom-tip { border-radius: 12px; }
+.model-layout { align-items: flex-start; }
+.versions-column { margin-top: 0; }
+.config-card, .versions-card { border: 0; border-radius: 16px; box-shadow: 0 8px 28px rgb(31 45 61 / 7%); }
+.card-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.card-heading h2 { margin: 2px 0 0; color: #303133; font-size: 20px; }
+.eyebrow { color: #409eff; font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+.full-width { width: 100%; }
+.form-help { margin-top: 6px; color: #909399; font-size: 12px; line-height: 1.5; }
+.compact-alert { margin: 0 0 18px; }
+.enable-switch { margin-top: 18px; }
+.form-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 22px; }
+.count-label { padding: 0 3px; color: #606266; }
+.profiles-table { width: 100%; }
+.profile-title, .model-key { margin-bottom: 7px; color: #303133; font-weight: 600; overflow-wrap: anywhere; }
+.table-subline { color: #909399; font-size: 12px; line-height: 1.65; overflow-wrap: anywhere; }
+.blocked-reason { margin-top: 6px; color: #f56c6c; font-size: 12px; line-height: 1.45; }
+.row-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 0 4px; }
+.bottom-tip { margin-top: 18px; }
+@media (max-width: 1199px) { .versions-column { margin-top: 20px; } }
+@media (max-width: 640px) { .page-topbar { flex-direction: column; } .page-topbar h1 { font-size: 26px; } }
+</style>

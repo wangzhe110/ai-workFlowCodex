@@ -12,7 +12,7 @@
 - `DirectorPlan` / `ShotPlan` / `ShotKeyframe`：导演方案、镜头与关键帧。`ShotPlan` 同时保存锁定关键帧和 `selected_video_clip_id`。
 - `ShotAssetBinding` / `VideoClipAssetBinding`：明确镜头和视频实际引用的角色图、场景图、关键帧版本。
 - `VideoClip` / `FinalVideo`：独立镜头视频版本与冻结片段列表的成片版本。
-- `ModelSlot` / `ModelProfile` / `PromptTemplate` / `ModelInvocation` / `ModelQualityEvaluation`：可替换模型、Prompt、调用审计和人工质量统计。
+- `ModelSlot` / `ModelProfile` / `PromptTemplate` / `ModelInvocation` / `ModelQualityEvaluation`：可替换模型、Prompt、调用审计和人工质量统计。`ModelProfile` 的 `DRAFT` / `ACTIVE` / `HISTORICAL` 只描述版本生命周期；是否可编辑以“是否已存在 `ModelInvocation`”为准。
 
 ## 不可覆盖规则
 

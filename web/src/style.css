@@ -15,20 +15,21 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, a:focus-visib
 }
 
 .app-header {
+  height: 64px;
   min-height: 64px;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 28px;
   padding: 0 32px;
   background: #0f172a;
   color: #e2e8f0;
 }
-.brand { color: #fff; text-decoration: none; font-weight: 700; }
-.top-nav { display: flex; align-items: center; gap: 18px; }
-.top-nav a { color: #cbd5e1; text-decoration: none; font-size: 14px; }
-.top-nav a.router-link-active { color: #fff; font-weight: 700; }
-.phase { color: #94a3b8; font-size: 14px; }
-.app-main { max-width: 1180px; margin: 0 auto; padding: 32px 24px 56px; }
+.brand { flex: 0 0 auto; color: #fff; text-decoration: none; font-size: 19px; font-weight: 750; letter-spacing: .02em; }
+.top-nav { flex: 1; min-width: 0; --el-menu-bg-color: transparent; --el-menu-text-color: #cbd5e1; --el-menu-hover-text-color: #fff; --el-menu-hover-bg-color: rgb(255 255 255 / 8%); --el-menu-active-color: #fff; --el-menu-border-color: transparent; }
+.top-nav.el-menu--horizontal { border-bottom: 0; }
+.top-nav.el-menu--horizontal > .el-menu-item { height: 64px; line-height: 64px; border-bottom-width: 2px; }
+.phase { flex: 0 0 auto; }
+.app-main { max-width: 1280px; width: 100%; margin: 0 auto; padding: 32px 24px 56px; }
 
 .page-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 24px; }
 .page-heading h1 { margin: 0 0 6px; font-size: 28px; }
@@ -65,4 +66,4 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, a:focus-visib
 .progress-track { height: 8px; background: #e2e8f0; border-radius: 999px; overflow: hidden; margin-top: 8px; }
 .progress-value { height: 100%; background: #3b82f6; transition: width .3s ease; }
 .result { white-space: pre-wrap; background: #f8fafc; border-radius: 8px; padding: 12px; font-size: 14px; line-height: 1.7; }
-@media (max-width: 640px) { .app-header { padding: 0 16px; } .app-main { padding: 24px 16px; } .page-heading { flex-direction: column; } }
+@media (max-width: 760px) { .app-header { gap: 12px; padding: 0 16px; } .brand { font-size: 16px; } .top-nav.el-menu--horizontal > .el-menu-item { padding: 0 9px; } .app-main { padding: 24px 16px; } .page-heading { flex-direction: column; } }

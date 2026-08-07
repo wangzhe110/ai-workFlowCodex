@@ -14,6 +14,7 @@ from sqlalchemy import select
 from app.core.database import SessionLocal
 from app.main import app
 from app.models import (
+    AssetKind,
     MediaAsset,
     FinalVideo,
     ModelInvocation,
@@ -43,7 +44,12 @@ def _upload_project(client: TestClient, title: str = "V1 完整性") -> str:
 
 
 def _run(client: TestClient, project_id: str, key: str, payload: Optional[dict] = None) -> dict:
-    response = client.post(f"/api/v1/production/projects/{project_id}/generation-runs/{key}", json=payload or {})
+    request_payload = dict(payload or {})
+    if key == "reference_analysis" and "source_asset_id" not in request_payload:
+        project = client.get(f"/api/v1/projects/{project_id}").json()
+        source = next(asset for asset in project["assets"] if asset["kind"] == AssetKind.SOURCE_VIDEO.value)
+        request_payload["source_asset_id"] = source["id"]
+    response = client.post(f"/api/v1/production/projects/{project_id}/generation-runs/{key}", json=request_payload)
     assert response.status_code == 202, response.text
     return response.json()
 
@@ -120,7 +126,19 @@ def test_workflow_creation_freezes_source_model_prompt_and_story_order() -> None
         project_id = _upload_project(client, "冻结快照")
         db = SessionLocal()
         try:
-            run = create_v1_run(db, project_id=project_id, run_key="reference_analysis")
+            selected_source_id = db.scalar(
+                select(MediaAsset.id).where(
+                    MediaAsset.project_id == project_id,
+                    MediaAsset.kind == AssetKind.SOURCE_VIDEO,
+                )
+            )
+            assert selected_source_id is not None
+            run = create_v1_run(
+                db,
+                project_id=project_id,
+                run_key="reference_analysis",
+                source_asset_id=selected_source_id,
+            )
             source_id = run.input_snapshot["context"]["source_asset_id"]
             model_before = run.input_snapshot["model_bindings"]["VIDEO_ANALYSIS"][0]["profile_snapshot"]["display_name"]
             prompt_before = run.input_snapshot["prompt_templates"]["VIDEO_ANALYSIS"]["content"]
@@ -189,7 +207,19 @@ def test_duplicate_and_concurrent_requests_return_one_active_v1_run() -> None:
         def create_once() -> str:
             db = SessionLocal()
             try:
-                return create_v1_run(db, project_id=project_id, run_key="reference_analysis").id
+                selected_source_id = db.scalar(
+                    select(MediaAsset.id).where(
+                        MediaAsset.project_id == project_id,
+                        MediaAsset.kind == AssetKind.SOURCE_VIDEO,
+                    )
+                )
+                assert selected_source_id is not None
+                return create_v1_run(
+                    db,
+                    project_id=project_id,
+                    run_key="reference_analysis",
+                    source_asset_id=selected_source_id,
+                ).id
             finally:
                 db.close()
 

@@ -18,6 +18,7 @@ from app.schemas import (
     PromptTemplateResponse,
     V1ModelProfileCreateRequest,
     V1ModelProfileResponse,
+    V1ModelProfileUpdateRequest,
 )
 from app.services.v1_configuration_service import (
     activate_prompt_template,
@@ -25,11 +26,16 @@ from app.services.v1_configuration_service import (
     bind_profile_to_slot,
     create_prompt_template,
     create_v1_model_profile,
+    copy_v1_model_profile,
+    delete_v1_model_profile,
     get_v1_definition,
     list_model_slots,
     list_v1_model_profiles,
     list_prompt_templates,
     set_slot_strategy,
+    update_v1_model_profile,
+    model_profile_deletion_status,
+    profile_has_model_invocations,
 )
 from app.services.v1_quality_service import list_latest_quality_evaluations, refresh_quality_evaluations
 
@@ -62,9 +68,11 @@ def _binding_response(item) -> ModelSlotBindingResponse:
     )
 
 
-def _v1_profile_response(profile, binding) -> V1ModelProfileResponse:
+def _v1_profile_response(db: Session, profile, binding) -> V1ModelProfileResponse:
     """模型中心只显示 V1 相关版本与其在槽位中的实际启用状态。"""
 
+    has_model_invocations = profile_has_model_invocations(db, profile.id)
+    active_run_count, delete_block_reason = model_profile_deletion_status(db, profile)
     return V1ModelProfileResponse(
         id=profile.id,
         slot_key=profile.step_key,
@@ -77,6 +85,12 @@ def _v1_profile_response(profile, binding) -> V1ModelProfileResponse:
         is_bound=binding is not None,
         is_enabled_in_slot=bool(binding and binding.is_enabled),
         priority=binding.priority if binding is not None else None,
+        profile_status=profile.profile_status,
+        has_model_invocations=has_model_invocations,
+        can_edit=not has_model_invocations,
+        active_run_count=active_run_count,
+        can_delete=delete_block_reason is None,
+        delete_block_reason=delete_block_reason,
         created_at=profile.created_at,
     )
 
@@ -189,7 +203,7 @@ def bind_model_profile_endpoint(
 def list_v1_model_profiles_endpoint(db: Session = Depends(get_db)) -> list[V1ModelProfileResponse]:
     """列出 V1 生产模型候选、当前启用状态和版本，不展示旧流程配置。"""
 
-    return [_v1_profile_response(profile, binding) for profile, binding in list_v1_model_profiles(db)]
+    return [_v1_profile_response(db, profile, binding) for profile, binding in list_v1_model_profiles(db)]
 
 
 @router.get("/model-quality-evaluations", response_model=list[ModelQualityEvaluationResponse])
@@ -240,7 +254,54 @@ def create_v1_model_profile_endpoint(
         (item for item_profile, item in list_v1_model_profiles(db) if item_profile.id == profile.id),
         None,
     )
-    return _v1_profile_response(profile, binding)
+    return _v1_profile_response(db, profile, binding)
+
+
+@router.patch("/v1-model-profiles/{profile_id}", response_model=V1ModelProfileResponse)
+def update_v1_model_profile_endpoint(
+    profile_id: str,
+    payload: V1ModelProfileUpdateRequest,
+    db: Session = Depends(get_db),
+) -> V1ModelProfileResponse:
+    """编辑尚未产生调用记录的配置；已使用版本必须先复制。"""
+
+    profile = update_v1_model_profile(
+        db,
+        profile_id=profile_id,
+        adapter=payload.adapter_key,
+        model_key=payload.model_key,
+        display_name=payload.display_name,
+        model_version=payload.model_version,
+        provider_config=payload.provider_config,
+    )
+    binding = next(
+        (item for item_profile, item in list_v1_model_profiles(db) if item_profile.id == profile.id),
+        None,
+    )
+    return _v1_profile_response(db, profile, binding)
+
+
+@router.post(
+    "/v1-model-profiles/{profile_id}/copy",
+    response_model=V1ModelProfileResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def copy_v1_model_profile_endpoint(profile_id: str, db: Session = Depends(get_db)) -> V1ModelProfileResponse:
+    """复制历史或已使用模型为可编辑的下一版 Draft。"""
+
+    profile = copy_v1_model_profile(db, profile_id)
+    binding = next(
+        (item for item_profile, item in list_v1_model_profiles(db) if item_profile.id == profile.id),
+        None,
+    )
+    return _v1_profile_response(db, profile, binding)
+
+
+@router.delete("/v1-model-profiles/{profile_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_v1_model_profile_endpoint(profile_id: str, db: Session = Depends(get_db)) -> None:
+    """删除未使用模型候选；正在运行或已有历史调用的版本由服务端正式拒绝。"""
+
+    delete_v1_model_profile(db, profile_id)
 
 
 @router.get("/prompt-templates", response_model=list[PromptTemplateResponse])

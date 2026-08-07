@@ -18,6 +18,7 @@ DATABASE_SCHEMA_MODE=migrate alembic upgrade head
 - `0005_v1_asset_ownership_and_versions`：角色/场景归属与多版本锁图指针。
 - `0006_v1_quality_review_metrics`：模型质量人工评分、采用率等指标。
 - `0007_v1_production_integrity`：视频当前采用指针、冻结快照补全、任务/调用幂等键、镜头子任务供应商任务号和数据库唯一约束。
+- `0008_v1_model_profile_editing`：模型配置版本的 `DRAFT` / `ACTIVE` / `HISTORICAL` 生命周期状态，支持安全编辑与复制新版本。
 
 ## 新增迁移规则
 

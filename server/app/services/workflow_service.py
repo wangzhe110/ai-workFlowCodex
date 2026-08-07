@@ -87,8 +87,51 @@ def add_source_video(
     return asset
 
 
+def get_deletable_source_video(db: Session, project_id: str, asset_id: str) -> MediaAsset:
+    """返回尚未被冻结为 V1 分析输入的源视频。
+
+    上传列表允许制作人在分析前删掉误传素材；一旦素材 ID 已写进参考分析运行的
+    ``input_snapshot``，它就是可复现历史的一部分，不能再物理删除。
+    """
+
+    asset = db.scalar(
+        select(MediaAsset).where(
+            MediaAsset.id == asset_id,
+            MediaAsset.project_id == project_id,
+            MediaAsset.kind == AssetKind.SOURCE_VIDEO,
+        )
+    )
+    if asset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="待删除的参考视频不存在")
+    runs = db.scalars(
+        select(WorkflowRun).where(
+            WorkflowRun.project_id == project_id,
+            WorkflowRun.workflow_key == "v1_reference_analysis",
+        )
+    ).all()
+    for run in runs:
+        context = (run.input_snapshot or {}).get("context")
+        if isinstance(context, dict) and context.get("source_asset_id") == asset.id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="该视频已被冻结为分析任务输入，不能删除；历史任务会继续保留该素材",
+            )
+    return asset
+
+
+def delete_source_video_record(db: Session, asset: MediaAsset) -> None:
+    """删除通过冻结校验的素材数据库记录；对象删除由存储层在此之前完成。"""
+
+    db.delete(asset)
+    db.commit()
+
+
 def _latest_source_video(db: Session, project_id: str) -> Optional[MediaAsset]:
-    """V1 每次分析使用最近上传的视频；后续 UI 可扩展为显式选择素材。"""
+    """仅供历史 ``video_analysis`` 工作流读取最近素材。
+
+    LemonFlow V1 主流程绝不调用本函数：V1 参考视频分析必须由生产台提交并冻结
+    ``source_asset_id``，不能根据上传时间猜测用户要分析哪一条视频。
+    """
 
     statement = (
         select(MediaAsset)
@@ -99,11 +142,11 @@ def _latest_source_video(db: Session, project_id: str) -> Optional[MediaAsset]:
 
 
 def create_video_analysis_run(db: Session, project_id: str) -> WorkflowRun:
-    """创建待执行的多模态分析运行及其两个可独立配置的步骤。
+    """创建历史兼容的多模态分析运行及其两个可独立配置的步骤。
 
-    第一步只把音轨转成短暂的内存文本；第二步把视频帧和该文本合成为抽象创作
-    机制。转写原文绝不存入步骤输出。只创建记录、不执行模型调用，从而保证 HTTP
-    请求可快速返回并支持队列化。
+    该入口保留给旧项目，不是 LemonFlow V1 主生产链路。V1 使用
+    ``create_v1_run(..., run_key='reference_analysis', source_asset_id=...)``，并且由
+    用户明确勾选的素材 ID 驱动。历史工作流仍按旧行为读取最近素材以保持兼容。
     """
 
     get_project_or_404(db, project_id)

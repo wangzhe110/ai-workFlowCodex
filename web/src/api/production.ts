@@ -15,6 +15,7 @@ import type {
   VideoClipV1,
   V1ModelProfile,
   V1ModelProfileCreatePayload,
+  V1ModelProfileUpdatePayload,
   WorkflowRun,
 } from '@/types/domain'
 
@@ -35,9 +36,15 @@ export function getProjectModelInvocations(projectId: string, limit = 200): Prom
 }
 
 /** 创建一个 V1 后台生成节点；模型、Prompt 和 Workflow 快照由服务端冻结。 */
-export function startProductionRun(projectId: string, runKey: string, shotPlanIds: string[] = []): Promise<WorkflowRun> {
+export function startProductionRun(
+  projectId: string,
+  runKey: string,
+  shotPlanIds: string[] = [],
+  sourceAssetId?: string,
+): Promise<WorkflowRun> {
   return jsonPost<WorkflowRun>(`/production/projects/${projectId}/generation-runs/${encodeURIComponent(runKey)}`, {
     shot_plan_ids: shotPlanIds,
+    source_asset_id: sourceAssetId,
   })
 }
 
@@ -121,6 +128,28 @@ export function refreshModelQualityEvaluations(taskType?: string): Promise<Model
 /** 新建一版 V1 候选模型，默认不启用；真实 Key 只能配置在服务器环境中。 */
 export function createV1ModelProfile(payload: V1ModelProfileCreatePayload): Promise<V1ModelProfile> {
   return jsonPost<V1ModelProfile>('/production/v1-model-profiles', payload)
+}
+
+/** 编辑尚未产生调用记录的模型版本；历史生产版本必须先复制。 */
+export function updateV1ModelProfile(
+  profileId: string,
+  payload: V1ModelProfileUpdatePayload,
+): Promise<V1ModelProfile> {
+  return request<V1ModelProfile>(`/production/v1-model-profiles/${encodeURIComponent(profileId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+/** 从任意历史版本复制出同槽位的下一版 Draft。 */
+export function copyV1ModelProfile(profileId: string): Promise<V1ModelProfile> {
+  return jsonPost<V1ModelProfile>(`/production/v1-model-profiles/${encodeURIComponent(profileId)}/copy`)
+}
+
+/** 删除未被生产历史或进行中 V1 任务引用的模型候选。 */
+export function deleteV1ModelProfile(profileId: string): Promise<void> {
+  return request<void>(`/production/v1-model-profiles/${encodeURIComponent(profileId)}`, { method: 'DELETE' })
 }
 
 /** 人工启用/停用一个已有版本；单模型槽位的替换必须显式传 replaceExisting。 */

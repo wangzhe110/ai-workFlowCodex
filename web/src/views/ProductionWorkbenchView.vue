@@ -26,7 +26,7 @@ import {
   selectStoryProposal,
   startProductionRun,
 } from '@/api/production'
-import { getProject, getWorkflowRun, uploadSourceVideo } from '@/api/projects'
+import { deleteSourceVideo, getProject, getWorkflowRun, uploadSourceVideo } from '@/api/projects'
 import type {
   CharacterReferenceImageV1,
   ProductionStage,
@@ -49,12 +49,14 @@ const characterImages = ref<CharacterReferenceImageV1[]>([])
 const sceneImages = ref<SceneReferenceImageV1[]>([])
 const keyframes = ref<ShotKeyframeV1[]>([])
 const videoClips = ref<VideoClipV1[]>([])
-const selectedFile = ref<File | null>(null)
+const selectedFiles = ref<File[]>([])
+const selectedSourceAssetId = ref('')
 const reviewerLabel = ref('制作人')
 const reviewNote = ref('')
 const qualityScore = ref<number | null>(null)
 const loading = ref(false)
 const uploading = ref(false)
+const deletingSourceAssetId = ref('')
 const actionId = ref('')
 const generatingKey = ref('')
 const error = ref('')
@@ -76,7 +78,8 @@ const stages: Array<{ key: ProductionStage; label: string; description: string }
 ]
 
 const currentStageIndex = computed(() => stages.findIndex((item) => item.key === state.value?.active_stage))
-const hasSourceVideo = computed(() => Boolean(project.value?.assets.some((item) => item.kind === 'SOURCE_VIDEO')))
+const sourceVideos = computed(() => project.value?.assets.filter((item) => item.kind === 'SOURCE_VIDEO') ?? [])
+const hasSourceVideo = computed(() => sourceVideos.value.length > 0)
 function reviewPayload() {
   return {
     reviewer_label: reviewerLabel.value.trim() || '制作人',
@@ -101,6 +104,9 @@ async function loadWorkbench() {
       getV1VideoClips(props.projectId),
     ])
     project.value = nextProject
+    if (!nextProject.assets.some((asset) => asset.id === selectedSourceAssetId.value)) {
+      selectedSourceAssetId.value = ''
+    }
     state.value = nextState
     analyses.value = nextAnalyses
     stories.value = nextStories
@@ -117,24 +123,49 @@ async function loadWorkbench() {
 
 function selectVideo(event: Event) {
   const input = event.target as HTMLInputElement
-  selectedFile.value = input.files?.[0] ?? null
+  selectedFiles.value = Array.from(input.files ?? [])
 }
 
 async function submitUpload() {
-  if (!selectedFile.value) {
-    error.value = '请选择一个视频文件'
+  if (!selectedFiles.value.length) {
+    error.value = '请选择至少一个视频文件'
     return
   }
   uploading.value = true
   error.value = ''
   try {
-    await uploadSourceVideo(props.projectId, selectedFile.value)
-    selectedFile.value = null
+    // 上传只创建 media_asset；绝不在这里隐式创建或扣费执行分析任务。
+    for (const file of selectedFiles.value) {
+      await uploadSourceVideo(props.projectId, file)
+    }
+    selectedFiles.value = []
     await loadWorkbench()
   } catch (caught) {
     error.value = caught instanceof Error ? caught.message : '上传失败，请重试'
   } finally {
     uploading.value = false
+  }
+}
+
+/** V1 一次参考分析只使用一条视频，用户可在待分析列表中随时改选。 */
+function toggleSourceAsset(assetId: string, event: Event) {
+  const input = event.target as HTMLInputElement
+  selectedSourceAssetId.value = input.checked ? assetId : ''
+}
+
+/** 仅允许删除从未被冻结为分析输入的待分析素材。 */
+async function removeSourceVideo(assetId: string) {
+  if (!window.confirm('确定删除这条待分析视频吗？删除后无法恢复。')) return
+  deletingSourceAssetId.value = assetId
+  error.value = ''
+  try {
+    await deleteSourceVideo(props.projectId, assetId)
+    if (selectedSourceAssetId.value === assetId) selectedSourceAssetId.value = ''
+    await loadWorkbench()
+  } catch (caught) {
+    error.value = caught instanceof Error ? caught.message : '删除参考视频失败，请重试'
+  } finally {
+    deletingSourceAssetId.value = ''
   }
 }
 
@@ -158,13 +189,18 @@ async function review(id: string, operation: () => Promise<unknown>) {
  * 创建后台任务后只做短时状态刷新。真实视频可能耗时数分钟，页面停止等待不代表
  * 后台失败；刷新页面会继续读取同一个 WorkflowRun 的子任务状态。
  */
-async function startGeneration(runKey: string, label: string, shotPlanIds: string[] = []) {
+async function startGeneration(
+  runKey: string,
+  label: string,
+  shotPlanIds: string[] = [],
+  sourceAssetId?: string,
+) {
   const actionKey = shotPlanIds.length ? `${runKey}:${shotPlanIds.join(',')}` : runKey
   generatingKey.value = actionKey
   error.value = ''
   backgroundNotice.value = ''
   try {
-    const created = await startProductionRun(props.projectId, runKey, shotPlanIds)
+    const created = await startProductionRun(props.projectId, runKey, shotPlanIds, sourceAssetId)
     let latest = created
     for (let attempt = 0; attempt < 15 && ['PENDING', 'RUNNING'].includes(latest.status); attempt += 1) {
       await new Promise((resolve) => window.setTimeout(resolve, 2000))
@@ -180,6 +216,14 @@ async function startGeneration(runKey: string, label: string, shotPlanIds: strin
   } finally {
     generatingKey.value = ''
   }
+}
+
+async function startReferenceAnalysis() {
+  if (!selectedSourceAssetId.value) {
+    error.value = '请先在待分析视频列表中勾选一条参考视频'
+    return
+  }
+  await startGeneration('reference_analysis', '参考视频分析', [], selectedSourceAssetId.value)
 }
 
 /** 角色/场景资产分别由“文字设计”和“参考图生成”两个模型槽位完成，页面为小白合并成一个按钮。 */
@@ -242,24 +286,27 @@ watch(() => props.projectId, () => void loadWorkbench())
           <p class="muted">系统只提炼结构、节奏与情绪机制，不复制原视频人物、台词或画面。</p>
         </div>
         <label class="field">视频文件
-          <input accept="video/mp4,video/quicktime,video/x-matroska,video/webm" type="file" @change="selectVideo" />
+          <input accept="video/mp4,video/quicktime,video/x-matroska,video/webm" type="file" multiple @change="selectVideo" />
         </label>
-        <button class="button" :disabled="uploading || !selectedFile" @click="submitUpload">
-          {{ uploading ? '正在上传…' : '上传参考视频' }}
+        <small v-if="selectedFiles.length" class="muted">已选择 {{ selectedFiles.length }} 个文件，上传仅保存到待分析列表，不会调用模型。</small>
+        <button class="button" :disabled="uploading || !selectedFiles.length" @click="submitUpload">
+          {{ uploading ? '正在上传…' : `上传 ${selectedFiles.length || ''} 个参考视频` }}
         </button>
-        <div v-if="project.assets.length" class="stack">
-          <strong>已上传素材</strong>
-          <div v-for="asset in project.assets" :key="asset.id" class="meta-row">
-            <span>{{ asset.original_filename }}</span><span>{{ Math.ceil(asset.byte_size / 1024 / 1024) }} MB</span>
-          </div>
+        <div v-if="sourceVideos.length" class="stack">
+          <strong>待分析视频（一次只能勾选一条）</strong>
+          <label v-for="asset in sourceVideos" :key="asset.id" class="source-video-row">
+            <span><input type="checkbox" :checked="selectedSourceAssetId === asset.id" @change="toggleSourceAsset(asset.id, $event)" /> {{ asset.original_filename }}</span>
+            <span class="muted">{{ Math.ceil(asset.byte_size / 1024 / 1024) }} MB</span>
+            <button type="button" class="button danger compact" :disabled="Boolean(deletingSourceAssetId)" @click.prevent="removeSourceVideo(asset.id)">{{ deletingSourceAssetId === asset.id ? '正在删除…' : '删除' }}</button>
+          </label>
         </div>
       </section>
 
       <section class="panel stack">
         <h2>当前等待什么？</h2>
         <template v-if="state?.active_stage === 'REFERENCE_ANALYSIS'">
-          <p v-if="!hasSourceVideo" class="notice info">先上传参考视频；上传后，Gemini 视频分析任务会在此处创建。</p>
-          <template v-else><p class="notice info">参考视频已就绪。分析模型会生成“脚本结构、爆款开头、爆款元素、场景分析和创作简报”，完成后自动进入人工确认。</p><button class="button" :disabled="Boolean(generatingKey)" @click="startGeneration('reference_analysis', '参考视频分析')">{{ generatingKey === 'reference_analysis' ? '正在分析…' : '开始视频分析' }}</button></template>
+          <p v-if="!hasSourceVideo" class="notice info">先上传参考视频。上传只保存素材，不会自动调用 Gemini 或其他模型。</p>
+          <template v-else><p class="notice info">请在左侧待分析视频列表中勾选一条后，再开始分析。分析模型会生成“脚本结构、爆款开头、爆款元素、场景分析和创作简报”。</p><button class="button" :disabled="Boolean(generatingKey) || !selectedSourceAssetId" @click="startReferenceAnalysis">{{ generatingKey === 'reference_analysis' ? '正在分析…' : '开始分析已勾选视频' }}</button></template>
         </template>
         <template v-else-if="state?.active_stage === 'STORY_GENERATION'">
           <p class="notice info">创作简报已经锁定。多个编剧模型会并行生成原创故事候选，不能复刻原故事或人物。</p>
@@ -400,6 +447,8 @@ watch(() => props.projectId, () => void loadWorkbench())
 .asset-preview img { display: block; width: 140px; height: 180px; object-fit: cover; border-radius: 8px; background: #f1f5f9; }
 .action-row { display: flex; flex-wrap: wrap; gap: 10px; }
 .analysis-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; }
+.source-video-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 10px; align-items: center; padding: 10px; border: 1px solid #dbe3ef; border-radius: 8px; cursor: pointer; }
+.compact { padding: 6px 10px; font-size: 13px; }
 details { border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px; }
 summary { cursor: pointer; font-weight: 600; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 10px 0 0; padding: 10px; border-radius: 7px; background: #f8fafc; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }

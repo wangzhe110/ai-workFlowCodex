@@ -11,7 +11,12 @@ from conftest import real_video_bytes
 def _run(client: TestClient, project_id: str, run_key: str) -> None:
     """TestClient 会等待 BackgroundTask；随后由接口读取结果验证真实状态而非返回初态。"""
 
-    response = client.post(f"/api/v1/production/projects/{project_id}/generation-runs/{run_key}")
+    payload: dict[str, str] = {}
+    if run_key == "reference_analysis":
+        project = client.get(f"/api/v1/projects/{project_id}").json()
+        source = next(asset for asset in project["assets"] if asset["kind"] == "SOURCE_VIDEO")
+        payload["source_asset_id"] = source["id"]
+    response = client.post(f"/api/v1/production/projects/{project_id}/generation-runs/{run_key}", json=payload)
     assert response.status_code == 202, response.text
 
 

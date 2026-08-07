@@ -11,7 +11,13 @@ from app.models import AssetKind, Project, WorkflowRun
 from app.schemas import AssetResponse, ProjectCreateRequest, ProjectDetailResponse, ProjectSummaryResponse, WorkflowRunResponse
 from app.services.storage import asset_storage
 from app.services.v1_configuration_service import get_or_create_project_state
-from app.services.workflow_service import add_source_video, create_project, get_project_or_404
+from app.services.workflow_service import (
+    add_source_video,
+    create_project,
+    delete_source_video_record,
+    get_deletable_source_video,
+    get_project_or_404,
+)
 
 
 router = APIRouter(prefix="/api/v1/projects", tags=["项目"])
@@ -187,3 +193,18 @@ def upload_source_video_endpoint(
         storage_key=storage_key,
     )
     return _asset_response(asset)
+
+
+@router.delete("/{project_id}/source-videos/{asset_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_source_video_endpoint(project_id: str, asset_id: str, db: Session = Depends(get_db)) -> None:
+    """删除上传列表中尚未被 V1 分析冻结的参考视频。
+
+    删除对象前先检查历史运行快照，避免用户误删仍被分析、追溯或重新执行所需的素材。
+    """
+
+    asset = get_deletable_source_video(db, project_id, asset_id)
+    try:
+        asset_storage.delete_source_video(asset.storage_key)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_507_INSUFFICIENT_STORAGE, detail="参考视频删除失败") from exc
+    delete_source_video_record(db, asset)

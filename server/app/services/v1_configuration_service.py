@@ -14,7 +14,10 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import (
+    ModelEvaluation,
     ModelProfile,
+    ModelInvocation,
+    ModelQualityEvaluation,
     ModelSelectionMode,
     ModelSlot,
     ModelSlotProfileBinding,
@@ -22,13 +25,16 @@ from app.models import (
     ProjectProductionState,
     PromptTemplate,
     PromptTemplateStatus,
+    RunStatus,
     WorkflowDefinition,
     WorkflowDefinitionStatus,
+    WorkflowRun,
 )
 
 
 V1_WORKFLOW_CODE = "LEMONFLOW_PRODUCTION"
 V1_WORKFLOW_VERSION = "LemonFlow_V1"
+V1_DEFAULT_PROMPT_VERSION = 1
 
 V1_SLOT_SPECS: tuple[tuple[str, str, ModelSelectionMode, str], ...] = (
     ("VIDEO_ANALYSIS", "VIDEO_ANALYSIS", ModelSelectionMode.SINGLE, "视频结构与创作简报分析"),
@@ -109,7 +115,13 @@ def v1_definition_payload() -> dict[str, Any]:
 
 
 def ensure_v1_foundation(db: Session) -> WorkflowDefinition:
-    """确保 V1 工作流定义和能力槽位存在，适用于本地 auto 模式和已迁移生产库。"""
+    """幂等确保 V1 的初始化配置存在。
+
+    该函数会被模型中心、项目生产台和 Worker 多次调用，因此每一种初始化对象都必须
+    先按自身唯一业务键查询，再决定是否创建：Workflow 用 ``code + version``、槽位用
+    ``slot_key``、本地模拟绑定用 ``slot + profile``、默认 Prompt 用
+    ``task_type + name + version``。它只补齐缺失的种子数据，绝不删除或覆盖已有配置。
+    """
 
     definition = db.scalars(
         select(WorkflowDefinition).where(
@@ -178,6 +190,7 @@ def _ensure_local_mock_profiles(db: Session, slots_by_key: dict[str, ModelSlot])
                 provider_config={"display_name": display_name, "local_only": True},
                 # 旧模型配置页不应把模拟 V1 配置误显示为旧流程的活动生产模型。
                 is_active=False,
+                profile_status="DRAFT",
             )
             db.add(profile)
             db.flush()
@@ -197,16 +210,30 @@ def _ensure_local_mock_profiles(db: Session, slots_by_key: dict[str, ModelSlot])
                     priority=priority,
                 )
             )
+        # 种子模拟配置是 V1 开箱即用的当前绑定；无论数据库是新建还是从旧版补齐，
+        # 都应显示为 ACTIVE，不能因绕过 ``bind_profile_to_slot`` 而误标为 DRAFT。
+        profile.profile_status = "ACTIVE"
 
 
 def _ensure_prompt_templates(db: Session) -> None:
-    """只为尚无生效模板的任务写入基础 Prompt。
+    """按 ``task_type + name + version`` 幂等写入默认 Prompt。
 
-    不能按“默认模板名称”补建：制作人激活了自定义名称后，下一次服务初始化不应把
-    默认版本悄悄重新设为 ACTIVE，影响已经确认的生产配置。
+    默认 Prompt 的身份固定为版本 1。即使该模板后来被归档、或制作人启用了另一个
+    Prompt，也不能在服务初始化时重新插入同一个版本，更不能改变已有模板状态。
+    当某个任务已有自定义 ACTIVE Prompt 但默认模板缺失时同样不补建，避免初始化行为
+    偷偷改变制作人已经确认的生产配置。
     """
 
     for task_type, name, content in V1_PROMPT_SEEDS:
+        existing_default = db.scalars(
+            select(PromptTemplate).where(
+                PromptTemplate.task_type == task_type,
+                PromptTemplate.name == name,
+                PromptTemplate.version == V1_DEFAULT_PROMPT_VERSION,
+            )
+        ).first()
+        if existing_default is not None:
+            continue
         active = db.scalars(
             select(PromptTemplate).where(
                 PromptTemplate.task_type == task_type,
@@ -215,17 +242,11 @@ def _ensure_prompt_templates(db: Session) -> None:
         ).first()
         if active is not None:
             continue
-        version = db.scalar(
-            select(func.max(PromptTemplate.version)).where(
-                PromptTemplate.task_type == task_type,
-                PromptTemplate.name == name,
-            )
-        ) or 0
         db.add(
             PromptTemplate(
                 task_type=task_type,
                 name=name,
-                version=version + 1,
+                version=V1_DEFAULT_PROMPT_VERSION,
                 content=content,
                 variables_schema={"type": "object", "properties": {}},
                 status=PromptTemplateStatus.ACTIVE,
@@ -431,6 +452,7 @@ def create_v1_model_profile(
         provider_config=config,
         # V1 使用槽位绑定决定启用态，避免旧流程的“活动模型”混入新主流程。
         is_active=False,
+        profile_status="DRAFT",
     )
     db.add(profile)
     db.flush()
@@ -445,6 +467,182 @@ def create_v1_model_profile(
     )
     db.refresh(profile)
     return profile
+
+
+def profile_has_model_invocations(db: Session, profile_id: str) -> bool:
+    """判断配置版本是否已经成为生产调用事实的一部分。"""
+
+    return db.scalar(
+        select(ModelInvocation.id).where(ModelInvocation.model_profile_id == profile_id).limit(1)
+    ) is not None
+
+
+def active_v1_run_count_for_profile(db: Session, profile_id: str) -> int:
+    """统计仍冻结引用某模型版本的 V1 活动任务数。
+
+    运行一经创建就把实际模型列表写进 ``WorkflowRun.input_snapshot``。删除模型前必须
+    检查该快照，而不能只看当前槽位绑定：否则制作人切换模型后，正在执行的旧任务会
+    失去所需的可追溯配置。
+    """
+
+    runs = db.scalars(
+        select(WorkflowRun).where(
+            WorkflowRun.workflow_key.like("v1_%"),
+            WorkflowRun.status.in_((RunStatus.PENDING, RunStatus.RUNNING)),
+        )
+    ).all()
+    matching_runs = 0
+    for run in runs:
+        snapshot = run.input_snapshot or {}
+        slots = snapshot.get("model_bindings") if isinstance(snapshot, dict) else None
+        if not isinstance(slots, dict):
+            continue
+        if any(
+            isinstance(binding, dict) and binding.get("model_profile_id") == profile_id
+            for bindings in slots.values()
+            if isinstance(bindings, list)
+            for binding in bindings
+        ):
+            matching_runs += 1
+    return matching_runs
+
+
+def _profile_deletion_block_reason(
+    db: Session,
+    profile: ModelProfile,
+    *,
+    active_run_count: Optional[int] = None,
+) -> Optional[str]:
+    """返回阻止物理删除的原因；``None`` 表示可安全删除无历史的候选版本。"""
+
+    active_runs = active_run_count if active_run_count is not None else active_v1_run_count_for_profile(db, profile.id)
+    if active_runs:
+        return f"该模型正被 {active_runs} 个进行中的 V1 任务冻结使用，任务结束前不能删除"
+    if profile_has_model_invocations(db, profile.id):
+        return "该模型已有调用记录，删除会破坏历史追溯；请保留或复制新版本"
+    if db.scalar(select(ModelEvaluation.id).where(ModelEvaluation.model_profile_id == profile.id).limit(1)) is not None:
+        return "该模型已有历史评测记录，不能删除"
+    if db.scalar(select(ModelQualityEvaluation.id).where(ModelQualityEvaluation.model_profile_id == profile.id).limit(1)) is not None:
+        return "该模型已进入质量报表历史，不能删除"
+    # 本地模拟配置由初始化服务保证存在。允许停用，但删除后会在下一次初始化时被重新
+    # 建立，容易造成“删除后又出现”的误解，因此明确把它视为系统保留配置。
+    if (profile.adapter_key or profile.provider_key) == "mock_v1" and profile.model_key.startswith("mock-v1-"):
+        return "这是系统本地模拟配置，可停用但不建议删除"
+    return None
+
+
+def model_profile_deletion_status(db: Session, profile: ModelProfile) -> tuple[int, Optional[str]]:
+    """为模型中心计算删除开关和提示文案，不把安全判断留给浏览器。"""
+
+    active_run_count = active_v1_run_count_for_profile(db, profile.id)
+    return active_run_count, _profile_deletion_block_reason(db, profile, active_run_count=active_run_count)
+
+
+def delete_v1_model_profile(db: Session, profile_id: str) -> None:
+    """删除未使用且未被运行冻结的 V1 模型候选及其槽位绑定。
+
+    已启用配置只要没有活动任务、没有历史调用或评测，同样允许显式删除；对应绑定会
+    一并移除。真正的生产历史绝不删除，需改用“复制为新草稿”继续测试。
+    """
+
+    profile = db.get(ModelProfile, profile_id)
+    if profile is None or profile.step_key not in V1_SLOT_ADAPTERS:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="V1 模型配置不存在")
+    reason = _profile_deletion_block_reason(db, profile)
+    if reason:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=reason)
+    bindings = db.scalars(
+        select(ModelSlotProfileBinding).where(ModelSlotProfileBinding.model_profile_id == profile.id)
+    ).all()
+    for binding in bindings:
+        db.delete(binding)
+    db.delete(profile)
+    db.commit()
+
+
+def update_v1_model_profile(
+    db: Session,
+    *,
+    profile_id: str,
+    adapter: str,
+    model_key: str,
+    display_name: str,
+    model_version: Optional[str],
+    provider_config: dict[str, Any],
+) -> ModelProfile:
+    """更新尚未产生调用记录的同一模型版本。
+
+    ``ModelInvocation`` 一旦存在，配置即为可追溯生产事实，必须通过复制创建新版本，
+    不允许原地修改。Draft 与已启用但从未被调用的配置都可以安全编辑。
+    """
+
+    profile = db.get(ModelProfile, profile_id)
+    if profile is None or profile.step_key not in V1_SLOT_ADAPTERS:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="V1 模型配置不存在")
+    if profile_has_model_invocations(db, profile.id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="该模型版本已产生调用记录，不能覆盖修改；请复制创建新版本",
+        )
+    clean_adapter = adapter.strip()
+    clean_model_key = model_key.strip()
+    clean_display_name = display_name.strip()
+    if clean_adapter not in V1_SLOT_ADAPTERS[profile.step_key]:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="该模型协议不能用于当前 V1 功能")
+    if not clean_model_key or not clean_display_name:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="模型名称和显示名称不能为空")
+    config = _normalize_v1_provider_config(provider_config)
+    _validate_v1_profile_config(profile.step_key, clean_adapter, config)
+    profile.provider_key = clean_adapter
+    profile.adapter_key = clean_adapter
+    profile.model_key = clean_model_key
+    profile.display_name = clean_display_name
+    profile.model_version = (model_version or clean_model_key).strip()[:160]
+    profile.provider_config = config
+    db.commit()
+    db.refresh(profile)
+    return profile
+
+
+def copy_v1_model_profile(db: Session, profile_id: str) -> ModelProfile:
+    """复制任一 V1 模型版本为同槽位下一版 DRAFT，历史版本和调用永不改写。"""
+
+    source = db.get(ModelProfile, profile_id)
+    if source is None or source.step_key not in V1_SLOT_ADAPTERS:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="V1 模型配置不存在")
+    version = db.scalar(select(func.max(ModelProfile.version)).where(ModelProfile.step_key == source.step_key)) or 0
+    copied = ModelProfile(
+        step_key=source.step_key,
+        provider_key=source.provider_key,
+        adapter_key=source.adapter_key or source.provider_key,
+        model_key=source.model_key,
+        model_version=source.model_version,
+        display_name=f"{source.display_name or source.model_key}（复制草稿）"[:160],
+        version=version + 1,
+        profile_status="DRAFT",
+        provider_config=deepcopy(source.provider_config),
+        is_active=False,
+    )
+    db.add(copied)
+    db.flush()
+    source_binding = db.scalars(
+        select(ModelSlotProfileBinding).where(ModelSlotProfileBinding.model_profile_id == source.id)
+    ).first()
+    slot = db.scalars(select(ModelSlot).where(ModelSlot.slot_key == source.step_key)).first()
+    if slot is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="模型槽位不存在，无法复制配置")
+    db.add(
+        ModelSlotProfileBinding(
+            slot_id=slot.id,
+            model_profile_id=copied.id,
+            is_enabled=False,
+            priority=source_binding.priority if source_binding is not None else 100,
+            weight=source_binding.weight if source_binding is not None else None,
+        )
+    )
+    db.commit()
+    db.refresh(copied)
+    return copied
 
 
 def list_v1_model_profiles(db: Session) -> list[tuple[ModelProfile, Optional[ModelSlotProfileBinding]]]:
@@ -539,6 +737,10 @@ def bind_profile_to_slot(
         binding.is_enabled = enabled
         binding.priority = priority
         binding.weight = weight
+    if enabled:
+        profile.profile_status = "ACTIVE"
+    else:
+        profile.profile_status = "HISTORICAL" if profile_has_model_invocations(db, profile.id) else "DRAFT"
     if enabled and replace_existing and slot.selection_mode == ModelSelectionMode.SINGLE:
         for existing in db.scalars(
             select(ModelSlotProfileBinding).where(
@@ -548,6 +750,11 @@ def bind_profile_to_slot(
             )
         ):
             existing.is_enabled = False
+            previous_profile = db.get(ModelProfile, existing.model_profile_id)
+            if previous_profile is not None:
+                previous_profile.profile_status = (
+                    "HISTORICAL" if profile_has_model_invocations(db, previous_profile.id) else "DRAFT"
+                )
     db.commit()
     db.refresh(binding)
     return binding

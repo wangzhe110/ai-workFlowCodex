@@ -71,8 +71,13 @@ class WorkflowRunResponse(BaseModel):
 
 
 class V1GenerationRunRequest(BaseModel):
-    """仅视频阶段可选指定镜头，其他 V1 节点不接受浏览器指定模型或 Prompt。"""
+    """V1 生成请求中允许显式选择参考素材或指定视频重做镜头。
 
+    参考视频分析必须由浏览器提交 ``source_asset_id``，不允许服务端再猜测“最新上传”；
+    视频重做可提交 ``shot_plan_ids``。模型、Prompt 和供应商协议仍由服务端冻结。
+    """
+
+    source_asset_id: Optional[str] = Field(default=None, min_length=1, max_length=36)
     shot_plan_ids: list[str] = Field(default_factory=list, max_length=80)
 
 
@@ -521,7 +526,23 @@ class V1ModelProfileResponse(BaseModel):
     is_bound: bool
     is_enabled_in_slot: bool
     priority: Optional[int]
+    profile_status: str
+    has_model_invocations: bool
+    can_edit: bool
+    active_run_count: int
+    can_delete: bool
+    delete_block_reason: Optional[str]
     created_at: datetime
+
+
+class V1ModelProfileUpdateRequest(BaseModel):
+    """安全更新同一模型版本的可编辑配置字段；槽位和版本本身不可原地迁移。"""
+
+    adapter_key: str = Field(min_length=1, max_length=80)
+    model_key: str = Field(min_length=1, max_length=160)
+    display_name: str = Field(min_length=1, max_length=160)
+    model_version: Optional[str] = Field(default=None, max_length=160)
+    provider_config: dict[str, Any] = Field(default_factory=dict)
 
 
 class ModelQualityEvaluationResponse(BaseModel):

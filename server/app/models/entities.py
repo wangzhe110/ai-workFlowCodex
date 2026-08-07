@@ -265,6 +265,9 @@ class ModelProfile(Base):
     model_version: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)
     display_name: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # V1 以版本化配置替代原地覆盖：新建或复制的候选是 DRAFT，绑定启用后为 ACTIVE，
+    # 已被替换的旧版本保留为 HISTORICAL。是否允许编辑仍须以 ModelInvocation 为准。
+    profile_status: Mapped[str] = mapped_column(String(20), nullable=False, default="DRAFT")
     provider_config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)

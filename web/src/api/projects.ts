@@ -39,6 +39,11 @@ export function uploadSourceVideo(projectId: string, file: File): Promise<Asset>
   })
 }
 
+/** 删除尚未被冻结为 V1 分析输入的待分析视频。 */
+export function deleteSourceVideo(projectId: string, assetId: string): Promise<void> {
+  return request<void>(`/projects/${projectId}/source-videos/${assetId}`, { method: 'DELETE' })
+}
+
 /** 创建并后台投递视频分析任务；接口返回的是初始 PENDING 状态。 */
 export function startAnalysis(projectId: string): Promise<WorkflowRun> {
   return request<WorkflowRun>(`/projects/${projectId}/analysis-runs`, { method: 'POST' })

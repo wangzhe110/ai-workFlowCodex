@@ -365,6 +365,12 @@ export interface V1ModelProfile {
   is_bound: boolean
   is_enabled_in_slot: boolean
   priority: number | null
+  profile_status: 'DRAFT' | 'ACTIVE' | 'HISTORICAL'
+  has_model_invocations: boolean
+  can_edit: boolean
+  active_run_count: number
+  can_delete: boolean
+  delete_block_reason: string | null
   created_at: string
 }
 
@@ -378,6 +384,14 @@ export interface V1ModelProfileCreatePayload {
   enable_in_slot: boolean
   replace_existing: boolean
   priority?: number
+}
+
+export interface V1ModelProfileUpdatePayload {
+  adapter_key: string
+  model_key: string
+  display_name: string
+  model_version?: string
+  provider_config: Record<string, unknown>
 }
 
 /** 可版本化的生产 Prompt；真实调用会另外冻结一份快照。 */

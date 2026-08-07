@@ -4,9 +4,9 @@
 
 ## V1 路由职责
 
-- `routes/projects.py`：项目和参考视频上传。
+- `routes/projects.py`：项目、参考视频上传和未冻结候选素材删除；上传只保存 `media_asset`，不会隐式创建 V1 分析任务。
 - `routes/production.py`：生产台状态、生成运行入口、分析锁定、故事选择、图片锁定、视频审核和运行状态查询。
-- `routes/v1_modeling.py`：Workflow 定义、模型槽位、模型绑定、Prompt 模板版本和人工启用。
+- `routes/v1_modeling.py`：Workflow 定义、模型槽位、模型绑定、Prompt 模板版本和人工启用；未使用候选可编辑或删除，删除前会校验是否被进行中的 V1 任务冻结引用，已有调用版本不可覆盖或删除。
 - `routes/model_profiles.py`：非敏感模型配置、无扣费预检和兼容管理接口。
 
 `workflows.py`、`topics.py`、`stories.py`、`storyboards.py`、`images.py`、`videos.py` 和 `creative_library.py` 为历史兼容或辅助功能；它们不得成为 V1 主链路前置条件。所有 API 以 `/api/v1` 开头。

@@ -121,6 +121,7 @@ def create_v1_run(
     *,
     project_id: str,
     run_key: str,
+    source_asset_id: str | None = None,
     shot_plan_ids: list[str] | None = None,
 ) -> WorkflowRun:
     """创建 V1 运行，并在数据库提交前冻结本次执行的全部可变配置。
@@ -148,14 +149,26 @@ def create_v1_run(
         return existing
     if state.active_stage not in ALLOWED_STAGES[run_key]:
         _conflict(f"当前阶段为 {state.active_stage.value}，不能创建 {RUN_SPECS[run_key][2]} 任务")
-    _validate_inputs(db, state, run_key, shot_plan_ids=shot_plan_ids)
+    _validate_inputs(
+        db,
+        state,
+        run_key,
+        source_asset_id=source_asset_id,
+        shot_plan_ids=shot_plan_ids,
+    )
 
     slot_key, task_type, _ = RUN_SPECS[run_key]
     bindings = enabled_profiles_for_slot(db, slot_key)
     if not bindings:
         _conflict(f"模型槽位 {slot_key} 尚无启用配置，请先在模型中心绑定并验收模型")
     definition = get_v1_definition(db)
-    frozen_context = _freeze_run_context(db, state, run_key, shot_plan_ids=shot_plan_ids)
+    frozen_context = _freeze_run_context(
+        db,
+        state,
+        run_key,
+        source_asset_id=source_asset_id,
+        shot_plan_ids=shot_plan_ids,
+    )
     frozen_models = _freeze_model_bindings(db, bindings, slot_key=slot_key)
     frozen_prompt = _freeze_prompt(db, task_type)
     input_snapshot = {
@@ -290,19 +303,36 @@ def _create_video_child_steps(db: Session, run: WorkflowRun, parent_step: Workfl
     run.input_snapshot = snapshot
 
 
-def _validate_inputs(db: Session, state, run_key: str, *, shot_plan_ids: list[str] | None = None) -> None:
+def _source_asset_for_reference_analysis(db: Session, project_id: str, source_asset_id: str | None) -> MediaAsset:
+    """读取用户明确勾选的参考视频，绝不按上传时间猜测分析输入。"""
+
+    if not source_asset_id:
+        _conflict("请先在待分析视频列表中勾选一条参考视频")
+    source = db.scalar(
+        select(MediaAsset).where(
+            MediaAsset.id == source_asset_id,
+            MediaAsset.project_id == project_id,
+            MediaAsset.kind == AssetKind.SOURCE_VIDEO,
+        )
+    )
+    if source is None:
+        _conflict("所选参考视频不存在、已删除或不属于当前项目")
+    return source
+
+
+def _validate_inputs(
+    db: Session,
+    state,
+    run_key: str,
+    *,
+    source_asset_id: str | None = None,
+    shot_plan_ids: list[str] | None = None,
+) -> None:
     """集中校验每个生成任务的冻结前置条件，前端无法跳过这些判断。"""
 
     project_id = state.project_id
     if run_key == "reference_analysis":
-        source = db.scalar(
-            select(MediaAsset.id)
-            .where(MediaAsset.project_id == project_id, MediaAsset.kind == AssetKind.SOURCE_VIDEO)
-            .order_by(MediaAsset.created_at.desc())
-            .limit(1)
-        )
-        if source is None:
-            _conflict("请先上传有授权的参考视频")
+        _source_asset_for_reference_analysis(db, project_id, source_asset_id)
     elif run_key == "story_generation" and state.locked_reference_analysis_id is None:
         _conflict("请先人工锁定创作简报")
     elif run_key.startswith(("character_", "scene_")) and state.selected_story_proposal_id is None:
@@ -374,15 +404,24 @@ def _freeze_prompt(db: Session, task_type: str) -> dict[str, Any]:
     }
 
 
-def _freeze_run_context(db: Session, state, run_key: str, *, shot_plan_ids: list[str] | None) -> dict[str, Any]:
+def _freeze_run_context(
+    db: Session,
+    state,
+    run_key: str,
+    *,
+    source_asset_id: str | None,
+    shot_plan_ids: list[str] | None,
+) -> dict[str, Any]:
     """冻结本次节点会消费的素材、审核选择和资产版本 ID。"""
 
     project_id = state.project_id
-    source = db.scalars(
-        select(MediaAsset)
-        .where(MediaAsset.project_id == project_id, MediaAsset.kind == AssetKind.SOURCE_VIDEO)
-        .order_by(MediaAsset.created_at.desc())
-    ).first()
+    # 只有参考视频分析消费源视频，并且它只能使用用户从待分析列表明确勾选的素材。
+    # 后续阶段依赖已经锁定的分析/故事/资产快照，绝不因后来上传新视频而改变输入。
+    source = (
+        _source_asset_for_reference_analysis(db, project_id, source_asset_id)
+        if run_key == "reference_analysis"
+        else None
+    )
     analysis = db.get(ReferenceAnalysis, state.locked_reference_analysis_id) if state.locked_reference_analysis_id else None
     story = db.get(StoryProposal, state.selected_story_proposal_id) if state.selected_story_proposal_id else None
     plan = db.get(DirectorPlan, state.director_plan_id) if state.director_plan_id else None

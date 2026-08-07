@@ -1,8 +1,11 @@
 """V1 模型质量报表的审核评分、采用率与只读统计边界测试。"""
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
+from app.core.database import SessionLocal
 from app.main import app
+from app.models import ModelInvocation
 from conftest import real_video_bytes
 
 
@@ -17,7 +20,10 @@ def test_quality_report_uses_review_score_without_auto_switching_models() -> Non
         )
         assert uploaded.status_code == 201
 
-        generated = client.post(f"/api/v1/production/projects/{project_id}/generation-runs/reference_analysis")
+        generated = client.post(
+            f"/api/v1/production/projects/{project_id}/generation-runs/reference_analysis",
+            json={"source_asset_id": uploaded.json()["id"]},
+        )
         assert generated.status_code == 202, generated.text
         analysis = client.get(f"/api/v1/production/projects/{project_id}/reference-analyses").json()[0]
 
@@ -40,7 +46,22 @@ def test_quality_report_uses_review_score_without_auto_switching_models() -> Non
         )
         assert refreshed.status_code == 200, refreshed.text
         rows = refreshed.json()
-        analysis_row = next(row for row in rows if row["task_type"] == "VIDEO_ANALYSIS")
+        # 同一个任务类型可以存在多版模型；必须验证本次运行实际冻结的配置，而不是
+        # 依赖报表数组顺序恰好把它排在第一条。
+        db = SessionLocal()
+        try:
+            model_profile_id = db.scalar(
+                select(ModelInvocation.model_profile_id).where(
+                    ModelInvocation.workflow_run_id == generated.json()["id"]
+                )
+            )
+        finally:
+            db.close()
+        assert model_profile_id is not None
+        analysis_row = next(
+            row for row in rows
+            if row["task_type"] == "VIDEO_ANALYSIS" and row["model_profile_id"] == model_profile_id
+        )
         assert analysis_row["sample_count"] >= 1
         assert analysis_row["success_count"] >= 1
         assert analysis_row["average_human_score"] == 8

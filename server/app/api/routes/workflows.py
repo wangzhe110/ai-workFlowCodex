@@ -19,7 +19,11 @@ def start_video_analysis_endpoint(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ) -> WorkflowRunResponse:
-    """创建分析运行后立刻投递任务，接口不等待模型完成。"""
+    """历史兼容分析入口，接口不等待模型完成。
+
+    LemonFlow V1 生产台不能调用此接口；它必须将用户勾选的 ``source_asset_id`` 提交
+    给 ``/production/projects/{project_id}/generation-runs/reference_analysis``。
+    """
 
     run = create_video_analysis_run(db, project_id)
     dispatch_video_analysis(background_tasks, run.id)

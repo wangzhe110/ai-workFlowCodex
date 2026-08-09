@@ -21,6 +21,11 @@
   版本、同项目/同 StoryRun、相对时长和植入定位。它还提供脚本分析、产品生产版本和
   故事大纲的“创建下一版本、状态转换、不可覆盖内容”规则；未来 API 不得绕过它。
 
+成功的 `ScriptAnalysisVersion` 是不可逆终态，所有分析生产字段都不能再覆盖；重新分析
+只能追加版本。产品生产版本若填写 `source_analysis_version_id`，服务会在创建和草稿更新
+前验证来源分析存在且属于同一 `ProductAsset`。只有真实的“主体 + version”唯一冲突才
+转换为版本冲突提示，其他数据库完整性错误不会被误报。
+
 ## 任务与模型规则
 
 Worker 执行时只读取 `WorkflowRun`/`WorkflowStep` 的冻结快照，不能回查当前启用模型、ACTIVE Prompt 或最新上传素材。视频任务首次提交后必须先保存 `provider_task_id`；恢复时只轮询该任务号。`final` 执行器只使用运行创建时冻结的当前采用、审核通过片段 ID。

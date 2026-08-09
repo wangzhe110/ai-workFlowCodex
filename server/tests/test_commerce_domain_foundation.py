@@ -1,5 +1,6 @@
 """带货短剧工作流第一阶段：领域模型、约束和定义初始化测试。"""
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
@@ -8,7 +9,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy import create_engine, inspect, select
+from sqlalchemy import MetaData, create_engine, inspect, select
 from sqlalchemy.exc import IntegrityError
 
 from app.core.database import Base, SessionLocal, engine
@@ -516,9 +517,12 @@ def test_alembic_commerce_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
         config.set_main_option("script_location", str(server_root / "migrations"))
         migration_engine = create_engine(migration_url)
         try:
-            with migration_engine.begin() as connection:
+            with migration_engine.connect() as connection:
+                connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+                connection.commit()
                 config.attributes["connection"] = connection
                 getattr(command, action)(config, revision)
+                config.attributes.pop("connection", None)
         finally:
             migration_engine.dispose()
 
@@ -553,5 +557,198 @@ def test_alembic_commerce_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
         assert "product_identification" in {
             column["name"] for column in inspect(migration_engine).get_columns("product_analysis_versions")
         }
+    finally:
+        migration_engine.dispose()
+
+
+def test_alembic_nonempty_sqlite_0011_round_trip_preserves_references_and_foreign_keys(tmp_path) -> None:
+    """真实非空 SQLite 在同一外键开启连接上执行 0010/0011 往返不丢数据。"""
+
+    server_root = Path(__file__).resolve().parents[1]
+    database_path = tmp_path / "commerce-nonempty-migration.db"
+    migration_engine = create_engine(f"sqlite:///{database_path}")
+    now = datetime.now(timezone.utc)
+    ids = {
+        "project": str(uuid4()),
+        "media": str(uuid4()),
+        "product": str(uuid4()),
+        "analysis": str(uuid4()),
+        "version": str(uuid4()),
+    }
+
+    def migration_config(connection):
+        config = Config(str(server_root / "alembic.ini"))
+        config.set_main_option("script_location", str(server_root / "migrations"))
+        config.attributes["connection"] = connection
+        return config
+
+    def set_foreign_keys_on(connection) -> None:
+        connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+        connection.commit()
+        assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+        connection.commit()
+
+    def run_revision(connection, action: str, revision: str) -> None:
+        config = migration_config(connection)
+        try:
+            getattr(command, action)(config, revision)
+        finally:
+            config.attributes.pop("connection", None)
+
+    try:
+        with migration_engine.connect() as connection:
+            # 真实 Alembic 入口使用的就是下面这个未开启事务的 Connection；不是另开
+            # 一个测试连接设置 PRAGMA，再让迁移走其他连接。
+            set_foreign_keys_on(connection)
+            run_revision(connection, "upgrade", "0010_commerce_domain_foundation")
+            assert connection.info["lemonflow_alembic_foreign_keys_before_disable"] == 1
+
+            metadata = MetaData()
+            metadata.reflect(
+                bind=connection,
+                only=["projects", "media_assets", "product_assets", "product_analysis_versions", "product_asset_versions"],
+            )
+            tables = metadata.tables
+            connection.execute(
+                tables["projects"].insert(),
+                {
+                    "id": ids["project"],
+                    "title": "非空迁移来源项目",
+                    "description": "0011 非空迁移验证",
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
+            connection.execute(
+                tables["media_assets"].insert(),
+                {
+                    "id": ids["media"],
+                    "project_id": ids["project"],
+                    "kind": AssetKind.SOURCE_VIDEO.value,
+                    "original_filename": "source.mp4",
+                    "content_type": "video/mp4",
+                    "byte_size": 1,
+                    "storage_key": f"migration/{ids['media']}.mp4",
+                    "created_at": now,
+                },
+            )
+            connection.execute(
+                tables["product_assets"].insert(),
+                {
+                    "id": ids["product"],
+                    "name": "非空迁移产品",
+                    "description": "共享产品资产",
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
+            connection.execute(
+                tables["product_analysis_versions"].insert(),
+                {
+                    "id": ids["analysis"],
+                    "product_asset_id": ids["product"],
+                    "source_media_asset_id": ids["media"],
+                    "version": 1,
+                    "raw_analysis": {"source": "nonempty-0010"},
+                    "analysis_status": ProductAnalysisStatus.SUCCEEDED.value,
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
+            connection.execute(
+                tables["product_asset_versions"].insert(),
+                {
+                    "id": ids["version"],
+                    "product_asset_id": ids["product"],
+                    "source_analysis_version_id": ids["analysis"],
+                    "version": 1,
+                    "product_name": "非空迁移产品生产版本",
+                    "appearance_description": "蓝色包装",
+                    "selling_points": [],
+                    "user_pain_points": [],
+                    "usage_scenarios": [],
+                    "package_ocr": {},
+                    "reference_images": [],
+                    "status": ProductAssetVersionStatus.CONFIRMED.value,
+                    "frozen_at": None,
+                    "created_at": now,
+                },
+            )
+            connection.commit()
+
+            set_foreign_keys_on(connection)
+            run_revision(connection, "upgrade", "0011_commerce_domain_integrity_fixes")
+            assert connection.info["lemonflow_alembic_foreign_keys_before_disable"] == 1
+            assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == (
+                "0011_commerce_domain_integrity_fixes"
+            )
+            connection.commit()
+
+            upgraded = MetaData()
+            upgraded.reflect(
+                bind=connection,
+                only=["media_assets", "product_assets", "product_analysis_versions", "product_asset_versions"],
+            )
+            analysis_row = connection.execute(
+                select(upgraded.tables["product_analysis_versions"]).where(
+                    upgraded.tables["product_analysis_versions"].c.id == ids["analysis"]
+                )
+            ).mappings().one()
+            product_version_row = connection.execute(
+                select(upgraded.tables["product_asset_versions"]).where(
+                    upgraded.tables["product_asset_versions"].c.id == ids["version"]
+                )
+            ).mappings().one()
+            assert analysis_row["source_media_asset_id"] == ids["media"]
+            assert analysis_row["raw_analysis"] == {"source": "nonempty-0010"}
+            assert product_version_row["source_analysis_version_id"] == ids["analysis"]
+            assert not connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+            connection.commit()
+            assert not [
+                table_name for table_name in inspect(connection).get_table_names() if table_name.startswith("_alembic_tmp_")
+            ]
+
+            # 外键恢复后删除来源媒体，必须由 0011 的 SET NULL 保留共享产品追溯链。
+            connection.execute(
+                upgraded.tables["media_assets"].delete().where(upgraded.tables["media_assets"].c.id == ids["media"])
+            )
+            connection.commit()
+            retained_analysis = connection.execute(
+                select(upgraded.tables["product_analysis_versions"]).where(
+                    upgraded.tables["product_analysis_versions"].c.id == ids["analysis"]
+                )
+            ).mappings().one()
+            assert retained_analysis["source_media_asset_id"] is None
+            assert connection.execute(
+                select(upgraded.tables["product_assets"].c.id).where(upgraded.tables["product_assets"].c.id == ids["product"])
+            ).scalar_one() == ids["product"]
+            # ``SELECT`` 会让 SQLAlchemy 标记连接处于隐式事务；下一次 Alembic 调用
+            # 必须从事务外开始，才能可靠切换 SQLite foreign_keys。
+            connection.commit()
+
+            # 非空引用在降级后仍存在；再次升级恢复 0011 后再验证外键、引用和临时表。
+            run_revision(connection, "downgrade", "0010_commerce_domain_foundation")
+            run_revision(connection, "upgrade", "0011_commerce_domain_integrity_fixes")
+            final_metadata = MetaData()
+            final_metadata.reflect(
+                bind=connection,
+                only=["product_analysis_versions", "product_asset_versions"],
+            )
+            assert connection.execute(
+                select(final_metadata.tables["product_asset_versions"].c.source_analysis_version_id).where(
+                    final_metadata.tables["product_asset_versions"].c.id == ids["version"]
+                )
+            ).scalar_one() == ids["analysis"]
+            assert not connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+            connection.commit()
+            assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+            connection.commit()
+            assert not [
+                table_name for table_name in inspect(connection).get_table_names() if table_name.startswith("_alembic_tmp_")
+            ]
+            assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == (
+                "0011_commerce_domain_integrity_fixes"
+            )
+            connection.commit()
     finally:
         migration_engine.dispose()

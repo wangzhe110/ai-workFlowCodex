@@ -39,3 +39,8 @@ DATABASE_SCHEMA_MODE=migrate alembic upgrade head
 
 `0011` 可单独在 `0010 → 0011 → 0010 → 0011` 间往返：它只撤销自己的新增列、来源
 外键语义和约束，不会删除 0010 创建的任何表。
+
+SQLite 在线执行迁移时，`migrations/env.py` 会在**同一条 Alembic 连接**且尚未开始
+迁移事务时临时关闭 `foreign_keys`，以便 batch 重建被其他 Commerce 表引用的旧表。DDL
+结束后会执行 `PRAGMA foreign_key_check`，任意结果都会使迁移失败；成功或异常都会在清理
+路径中重新开启外键。API/Worker 的 ORM 连接始终保持外键开启，不受此迁移范围策略影响。

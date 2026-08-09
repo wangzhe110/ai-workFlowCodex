@@ -20,6 +20,7 @@ from app.models import (
     DialogueLine,
     MediaAsset,
     OutlineVersionStatus,
+    ProductAnalysisVersion,
     ProductAsset,
     ProductAssetVersion,
     ProductAssetVersionStatus,
@@ -95,16 +96,44 @@ def _next_version(db: Session, entity_type, owner_column, owner_id: str) -> int:
 
 
 def _flush_append(db: Session, entity: EntityT, label: str) -> EntityT:
-    """在保存点内写入新增版本，把并发唯一冲突转换为可读的 409。"""
+    """在保存点内写入新增版本，只把真正的版本号冲突转换为 409。"""
 
     try:
         with db.begin_nested():
             db.add(entity)
             db.flush()
     except IntegrityError as exc:
-        _conflict(f"{label}版本号冲突，请重新读取最新版本后再创建")
-        raise AssertionError("unreachable") from exc
+        if _is_version_unique_conflict(exc, entity):
+            _conflict(f"{label}版本号冲突，请重新读取最新版本后再创建")
+        raise
     return entity
+
+
+def _is_version_unique_conflict(error: IntegrityError, entity: EntityT) -> bool:
+    """识别三个追加版本表的真实 ``owner + version`` 唯一冲突。
+
+    PostgreSQL 提供约束名，SQLite 通常只返回列名。其他外键、非空或检查约束错误
+    必须原样上抛，不能被误报成“版本号冲突”。
+    """
+
+    table_name = getattr(entity, "__tablename__", "")
+    constraints = {
+        "script_analysis_versions": ("uq_script_analysis_version", "script_asset_id"),
+        "product_asset_versions": ("uq_product_asset_version", "product_asset_id"),
+        "story_outline_versions": ("uq_story_outline_version", "story_run_id"),
+    }
+    expected = constraints.get(table_name)
+    if expected is None:
+        return False
+    constraint_name, owner_column = expected
+    postgres_constraint = getattr(getattr(error.orig, "diag", None), "constraint_name", None)
+    if postgres_constraint == constraint_name:
+        return True
+    message = str(error.orig).lower()
+    return (
+        constraint_name in message
+        or f"{table_name}.{owner_column}, {table_name}.version" in message
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +166,21 @@ def validate_project_product_selection(
     if product_version.status != ProductAssetVersionStatus.CONFIRMED or product_version.frozen_at is None:
         _conflict("项目只能选择已确认且已冻结、允许投入生产的产品版本")
     return product_version
+
+
+def validate_product_version_source_analysis(
+    db: Session,
+    *,
+    product_asset_id: str,
+    source_analysis_version_id: Optional[str],
+) -> None:
+    """确保产品生产版本只能追溯到同一产品主体的分析版本。"""
+
+    if source_analysis_version_id is None:
+        return
+    source_analysis = _get_or_404(db, ProductAnalysisVersion, source_analysis_version_id, "来源产品分析版本")
+    if source_analysis.product_asset_id != product_asset_id:
+        _invalid("产品生产版本的来源分析必须属于同一产品主体")
 
 
 def validate_story_run_bindings(
@@ -635,12 +679,18 @@ def create_next_script_analysis_version(db: Session, *, script_asset_id: str, **
 
 
 def update_script_analysis_version(db: Session, *, analysis_id: str, **changes: Any) -> ScriptAnalysisVersion:
-    """只允许未成功分析的内容修改；成功后仅能通过追加新版本修订。"""
+    """只允许未成功分析的内容修改；成功状态不可逆且只能追加新版本。"""
 
     analysis = _get_or_404(db, ScriptAnalysisVersion, analysis_id, "脚本分析版本")
     content_changes = set(changes) & _SCRIPT_ANALYSIS_CONTENT_FIELDS
-    if analysis.analysis_status == ScriptAnalysisStatus.SUCCEEDED and content_changes:
-        _conflict("已成功完成的脚本分析内容不可覆盖，请创建下一版本")
+    if analysis.analysis_status == ScriptAnalysisStatus.SUCCEEDED:
+        if content_changes:
+            _conflict("已成功完成的脚本分析内容不可覆盖，请创建下一版本")
+        if "analysis_status" in changes and changes["analysis_status"] not in {
+            ScriptAnalysisStatus.SUCCEEDED,
+            ScriptAnalysisStatus.SUCCEEDED.value,
+        }:
+            _conflict("已成功完成的脚本分析状态不可逆，请创建下一版本重新分析")
     _apply_fields(
         analysis,
         changes,
@@ -660,6 +710,11 @@ def create_next_product_asset_version(
     if unexpected:
         _invalid(f"产品生产版本不支持字段：{'、'.join(sorted(unexpected))}")
     _lock_parent_for_next_version(db, ProductAsset, product_asset_id, "产品主体")
+    validate_product_version_source_analysis(
+        db,
+        product_asset_id=product_asset_id,
+        source_analysis_version_id=contents.get("source_analysis_version_id"),
+    )
     version = _next_version(db, ProductAssetVersion, ProductAssetVersion.product_asset_id, product_asset_id)
     product_version = ProductAssetVersion(
         product_asset_id=product_asset_id,
@@ -715,6 +770,12 @@ def update_product_asset_version(db: Session, *, product_asset_version_id: str, 
     if product_version.status != ProductAssetVersionStatus.DRAFT or product_version.frozen_at is not None:
         if content_changes:
             _conflict("已确认、已冻结或已归档的产品生产版本内容不可覆盖，请创建下一版本")
+    if "source_analysis_version_id" in changes:
+        validate_product_version_source_analysis(
+            db,
+            product_asset_id=product_version.product_asset_id,
+            source_analysis_version_id=changes["source_analysis_version_id"],
+        )
     _apply_fields(product_version, changes, _PRODUCT_VERSION_CONTENT_FIELDS, "产品生产版本")
     db.flush()
     return product_version

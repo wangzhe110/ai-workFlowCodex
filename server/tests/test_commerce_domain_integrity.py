@@ -1,5 +1,6 @@
 """Commerce Phase 1 审核修复：删除策略、跨对象归属、时间与版本规则。"""
 
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Optional
 from uuid import uuid4
@@ -70,6 +71,7 @@ from app.services.commerce_domain_service import (
     validate_product_placement_bindings,
 )
 from app.services.v1_configuration_service import V1_WORKFLOW_CODE
+from app.services import commerce_domain_service
 
 
 def _utcnow() -> datetime:
@@ -804,6 +806,170 @@ def test_version_services_append_and_protect_locked_content(commerce_db) -> None
         premise="新前提",
     )
     assert (outline_v1.version, outline_v2.version) == (1, 2)
+
+
+def test_succeeded_script_analysis_is_terminal_and_preserves_original_content(commerce_db) -> None:
+    """成功脚本分析不能改内容、降级状态或通过两次调用解冻后覆盖。"""
+
+    graph = _run_with_graph(commerce_db, label="script-terminal")
+    media = MediaAsset(
+        project_id=graph["project"].id,
+        kind=AssetKind.SOURCE_VIDEO,
+        original_filename="terminal.mp4",
+        content_type="video/mp4",
+        byte_size=1,
+        storage_key=f"commerce/terminal/{uuid4().hex}.mp4",
+    )
+    commerce_db.add(media)
+    _flush(commerce_db)
+    script = ScriptAsset(project_id=graph["project"].id, media_asset_id=media.id, name="成功分析脚本")
+    commerce_db.add(script)
+    _flush(commerce_db)
+    completed = create_next_script_analysis_version(
+        commerce_db,
+        script_asset_id=script.id,
+        timeline_transcript=[{"text": "原始开场"}],
+        story_beats=[{"beat": "原始冲突"}],
+        raw_analysis={"provider": "mock", "version": 1},
+        analysis_status=ScriptAnalysisStatus.SUCCEEDED,
+    )
+    commerce_db.commit()
+    original_content = {
+        "timeline_transcript": deepcopy(completed.timeline_transcript),
+        "story_beats": deepcopy(completed.story_beats),
+        "raw_analysis": deepcopy(completed.raw_analysis),
+    }
+
+    with pytest.raises(CommerceDomainValidationError):
+        update_script_analysis_version(
+            commerce_db,
+            analysis_id=completed.id,
+            timeline_transcript=[{"text": "尝试覆盖"}],
+            story_beats=[{"beat": "尝试覆盖"}],
+            raw_analysis={"provider": "unexpected"},
+        )
+    # 旧的两次调用绕过在第一步（SUCCEEDED -> PENDING）即失败。
+    with pytest.raises(CommerceDomainValidationError) as status_error:
+        update_script_analysis_version(
+            commerce_db,
+            analysis_id=completed.id,
+            analysis_status=ScriptAnalysisStatus.PENDING,
+        )
+    assert "不可逆" in status_error.value.detail
+
+    commerce_db.expire_all()
+    persisted = commerce_db.get(ScriptAnalysisVersion, completed.id)
+    assert persisted is not None
+    assert persisted.analysis_status == ScriptAnalysisStatus.SUCCEEDED
+    assert persisted.timeline_transcript == original_content["timeline_transcript"]
+    assert persisted.story_beats == original_content["story_beats"]
+    assert persisted.raw_analysis == original_content["raw_analysis"]
+
+    reanalyzed = create_next_script_analysis_version(
+        commerce_db,
+        script_asset_id=script.id,
+        timeline_transcript=[{"text": "重新分析的新开场"}],
+        analysis_status=ScriptAnalysisStatus.PENDING,
+    )
+    assert (persisted.version, reanalyzed.version) == (1, 2)
+
+
+def test_product_version_source_analysis_must_belong_to_same_product(commerce_db, monkeypatch) -> None:
+    """创建/更新草稿都不能把另一产品的分析结果串入追溯链。"""
+
+    first_product = ProductAsset(name=f"来源产品 {uuid4().hex[:8]}")
+    second_product = ProductAsset(name=f"目标产品 {uuid4().hex[:8]}")
+    commerce_db.add_all([first_product, second_product])
+    _flush(commerce_db)
+    first_analysis = ProductAnalysisVersion(
+        product_asset_id=first_product.id,
+        version=1,
+        raw_analysis={"product": "first"},
+        analysis_status=ProductAnalysisStatus.SUCCEEDED,
+    )
+    second_analysis = ProductAnalysisVersion(
+        product_asset_id=second_product.id,
+        version=1,
+        raw_analysis={"product": "second"},
+        analysis_status=ProductAnalysisStatus.SUCCEEDED,
+    )
+    commerce_db.add_all([first_analysis, second_analysis])
+    _flush(commerce_db)
+    draft = create_next_product_asset_version(
+        commerce_db,
+        product_asset_id=second_product.id,
+        product_name="目标产品草稿",
+        appearance_description="原始外观",
+    )
+    commerce_db.commit()
+
+    with pytest.raises(CommerceDomainValidationError) as create_error:
+        create_next_product_asset_version(
+            commerce_db,
+            product_asset_id=second_product.id,
+            product_name="错误来源版本",
+            appearance_description="不应创建",
+            source_analysis_version_id=first_analysis.id,
+        )
+    assert "同一产品主体" in create_error.value.detail
+    assert commerce_db.scalars(
+        select(ProductAssetVersion).where(ProductAssetVersion.product_asset_id == second_product.id)
+    ).all() == [draft]
+
+    original_appearance = draft.appearance_description
+    with pytest.raises(CommerceDomainValidationError) as update_error:
+        update_product_asset_version(
+            commerce_db,
+            product_asset_version_id=draft.id,
+            appearance_description="不应写入",
+            source_analysis_version_id=first_analysis.id,
+        )
+    assert "同一产品主体" in update_error.value.detail
+    commerce_db.expire(draft)
+    assert draft.appearance_description == original_appearance
+    assert draft.source_analysis_version_id is None
+
+    valid_next = create_next_product_asset_version(
+        commerce_db,
+        product_asset_id=second_product.id,
+        product_name="同产品来源版本",
+        appearance_description="正确来源",
+        source_analysis_version_id=second_analysis.id,
+    )
+    assert valid_next.source_analysis_version_id == second_analysis.id
+    update_product_asset_version(
+        commerce_db,
+        product_asset_version_id=draft.id,
+        source_analysis_version_id=second_analysis.id,
+    )
+    assert draft.source_analysis_version_id == second_analysis.id
+
+    missing_id = str(uuid4())
+    with pytest.raises(CommerceDomainValidationError) as missing_error:
+        create_next_product_asset_version(
+            commerce_db,
+            product_asset_id=second_product.id,
+            product_name="不存在分析",
+            appearance_description="不应创建",
+            source_analysis_version_id=missing_id,
+        )
+    assert missing_error.value.status_code == 404
+    assert "来源产品分析版本不存在" in missing_error.value.detail
+    assert "版本号冲突" not in missing_error.value.detail
+
+    # 用稳定的旧版本号模拟并发读取到相同 max(version) 的写入竞争；只有真正的
+    # owner + version 唯一冲突才应被包装为明确的 409。
+    monkeypatch.setattr(commerce_domain_service, "_next_version", lambda *_: valid_next.version)
+    with pytest.raises(CommerceDomainValidationError) as collision_error:
+        create_next_product_asset_version(
+            commerce_db,
+            product_asset_id=second_product.id,
+            product_name="并发冲突",
+            appearance_description="重复版本号",
+            source_analysis_version_id=second_analysis.id,
+        )
+    assert collision_error.value.status_code == 409
+    assert "版本号冲突" in collision_error.value.detail
 
 
 def test_story_run_rejects_product_version_archived_after_project_selection(commerce_db) -> None:

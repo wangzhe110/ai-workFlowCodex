@@ -15,16 +15,20 @@ from app.core.database import get_db
 from app.models import (
     CharacterDefinition,
     CharacterReferenceImage,
+    DirectorPlan,
     ReferenceAnalysis,
     SceneDefinition,
     SceneReferenceImage,
     ShotKeyframe,
+    ShotAssetBinding,
     ShotPlan,
     StoryProposal,
     VideoClip,
 )
 from app.schemas import (
     CharacterReferenceImageV1Response,
+    DirectorPlanV1Response,
+    DirectorShotResponse,
     ModelInvocationTraceResponse,
     ProductionStateResponse,
     ReferenceAnalysisResponse,
@@ -41,6 +45,8 @@ from app.services.worker_runtime import dispatch_v1_video_children, dispatch_wor
 from app.services.v1_execution_service import RUN_SPECS, create_v1_run
 from app.services.v1_production_service import (
     approve_video_clip,
+    adopt_character_asset_version,
+    adopt_scene_asset_version,
     get_project_production_state,
     lock_character_reference_image,
     lock_reference_analysis,
@@ -108,6 +114,59 @@ def _story_response(item: StoryProposal) -> StoryProposalV1Response:
     )
 
 
+def _director_plan_response(db: Session, plan: DirectorPlan) -> DirectorPlanV1Response:
+    """编码 Phase 4 结构化导演方案；镜头资产版本来自明确绑定，禁止按最新版本猜测。"""
+
+    shots = list(
+        db.scalars(
+            select(ShotPlan)
+            .where(ShotPlan.director_plan_id == plan.id)
+            .order_by(ShotPlan.shot_number)
+        ).all()
+    )
+    rows: list[DirectorShotResponse] = []
+    for shot in shots:
+        bindings = list(db.scalars(select(ShotAssetBinding).where(ShotAssetBinding.shot_id == shot.id)).all())
+        scene_binding = next((item for item in bindings if item.scene_id), None)
+        if scene_binding is None:
+            # 历史不完整草稿仍可被读取，不对生产时的严格校验作任何放松。
+            continue
+        rows.append(
+            DirectorShotResponse(
+                id=shot.id,
+                shot_number=shot.shot_number,
+                duration=float(shot.duration_seconds),
+                character_ids=[item.character_id for item in bindings if item.character_id],
+                character_asset_version_ids=[
+                    item.character_asset_version_id for item in bindings if item.character_asset_version_id
+                ],
+                scene_id=scene_binding.scene_id,
+                scene_asset_version_id=scene_binding.scene_asset_version_id,
+                action=shot.action_description,
+                emotion=shot.emotion,
+                camera_type=shot.camera_type,
+                camera_move=shot.camera_move,
+                lighting=shot.lighting,
+                image_prompt=shot.image_prompt,
+                video_prompt=shot.video_prompt,
+                sound_prompt=shot.sound_prompt,
+                locked_keyframe_id=shot.locked_keyframe_id,
+                created_at=shot.created_at,
+            )
+        )
+    return DirectorPlanV1Response(
+        id=plan.id,
+        project_id=plan.project_id,
+        story_proposal_id=plan.story_proposal_id,
+        workflow_run_id=plan.workflow_run_id,
+        visual_bible=plan.visual_bible,
+        status=_enum_value(plan.status),
+        shots=rows,
+        created_at=plan.created_at,
+        updated_at=plan.updated_at,
+    )
+
+
 @router.post(
     "/projects/{project_id}/generation-runs/{run_key}",
     response_model=WorkflowRunResponse,
@@ -153,6 +212,21 @@ def get_production_state_endpoint(project_id: str, db: Session = Depends(get_db)
     """读取 V1 唯一主流程的当前阶段和冻结输入指针。"""
 
     return _state_response(get_project_production_state(db, project_id))
+
+
+@router.get("/projects/{project_id}/director-plan", response_model=Optional[DirectorPlanV1Response])
+def get_current_director_plan_endpoint(
+    project_id: str, db: Session = Depends(get_db)
+) -> Optional[DirectorPlanV1Response]:
+    """读取当前项目已冻结的导演方案及可直接投产的结构化镜头数据。"""
+
+    state = get_project_production_state(db, project_id)
+    if not state.director_plan_id:
+        return None
+    plan = db.get(DirectorPlan, state.director_plan_id)
+    if plan is None:
+        return None
+    return _director_plan_response(db, plan)
 
 
 @router.get("/projects/{project_id}/model-invocations", response_model=list[ModelInvocationTraceResponse])
@@ -266,6 +340,7 @@ def list_character_reference_images_endpoint(
             character_code=character.character_code,
             character_name=character.name,
             version=image.version,
+            asset_version_id=image.asset_version_id,
             image_url=image.image_url,
             generation_status=_enum_value(image.generation_status),
             review_status=_enum_value(image.review_status),
@@ -295,6 +370,43 @@ def lock_character_reference_image_endpoint(
         character_code=character.character_code,
         character_name=character.name,
         version=image.version,
+        asset_version_id=image.asset_version_id,
+        image_url=image.image_url,
+        generation_status=_enum_value(image.generation_status),
+        review_status=_enum_value(image.review_status),
+        created_at=image.created_at,
+    )
+
+
+@router.post(
+    "/projects/{project_id}/characters/{character_id}/asset-versions/{asset_version_id}/adopt",
+    response_model=CharacterReferenceImageV1Response,
+    status_code=status.HTTP_201_CREATED,
+)
+def adopt_character_asset_version_endpoint(
+    project_id: str,
+    character_id: str,
+    asset_version_id: str,
+    db: Session = Depends(get_db),
+) -> CharacterReferenceImageV1Response:
+    """把资产中心角色版本放入项目作为待审核锁图候选，不调用图片模型。"""
+
+    image = adopt_character_asset_version(
+        db,
+        project_id=project_id,
+        character_id=character_id,
+        asset_version_id=asset_version_id,
+    )
+    character = db.get(CharacterDefinition, image.character_id)
+    assert character is not None
+    return CharacterReferenceImageV1Response(
+        id=image.id,
+        project_id=image.project_id,
+        character_id=character.id,
+        character_code=character.character_code,
+        character_name=character.name,
+        version=image.version,
+        asset_version_id=image.asset_version_id,
         image_url=image.image_url,
         generation_status=_enum_value(image.generation_status),
         review_status=_enum_value(image.review_status),
@@ -326,6 +438,7 @@ def list_scene_reference_images_endpoint(
             scene_code=scene.scene_code,
             scene_name=scene.name,
             version=image.version,
+            asset_version_id=image.asset_version_id,
             image_url=image.image_url,
             generation_status=_enum_value(image.generation_status),
             review_status=_enum_value(image.review_status),
@@ -355,6 +468,43 @@ def lock_scene_reference_image_endpoint(
         scene_code=scene.scene_code,
         scene_name=scene.name,
         version=image.version,
+        asset_version_id=image.asset_version_id,
+        image_url=image.image_url,
+        generation_status=_enum_value(image.generation_status),
+        review_status=_enum_value(image.review_status),
+        created_at=image.created_at,
+    )
+
+
+@router.post(
+    "/projects/{project_id}/scenes/{scene_id}/asset-versions/{asset_version_id}/adopt",
+    response_model=SceneReferenceImageV1Response,
+    status_code=status.HTTP_201_CREATED,
+)
+def adopt_scene_asset_version_endpoint(
+    project_id: str,
+    scene_id: str,
+    asset_version_id: str,
+    db: Session = Depends(get_db),
+) -> SceneReferenceImageV1Response:
+    """把资产中心场景版本放入项目作为待审核锁图候选，不调用图片模型。"""
+
+    image = adopt_scene_asset_version(
+        db,
+        project_id=project_id,
+        scene_id=scene_id,
+        asset_version_id=asset_version_id,
+    )
+    scene = db.get(SceneDefinition, image.scene_id)
+    assert scene is not None
+    return SceneReferenceImageV1Response(
+        id=image.id,
+        project_id=image.project_id,
+        scene_id=scene.id,
+        scene_code=scene.scene_code,
+        scene_name=scene.name,
+        version=image.version,
+        asset_version_id=image.asset_version_id,
         image_url=image.image_url,
         generation_status=_enum_value(image.generation_status),
         review_status=_enum_value(image.review_status),

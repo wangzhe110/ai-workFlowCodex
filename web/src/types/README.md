@@ -6,4 +6,6 @@
 
 `ModelSlot`、`ModelProfile`、`PromptTemplate`、`ModelInvocation` 和质量类型只包含非敏感配置、快照摘要和统计。真实 Key、内部存储路径、供应商完整错误与原始媒体不得进入 TypeScript 状态。
 
+Phase 4 的 `CharacterAsset`、`SceneAsset` 与对应 `Version` 类型表示跨项目资产的不可变版本；`DirectorPlanV1` / `DirectorShot` 表示能被图片、视频、声音步骤直接消费的导演结构化输出。二者都必须与后端契约同步修改。
+
 新增工作流字段时，先更新后端契约和本目录类型，再修改 API、Store 与页面，避免隐式字段依赖。

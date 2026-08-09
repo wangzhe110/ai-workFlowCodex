@@ -10,6 +10,9 @@ import { computed, onMounted, ref, watch } from 'vue'
 
 import {
   approveV1VideoClip,
+  adoptCharacterAssetVersion,
+  adoptSceneAssetVersion,
+  getCurrentDirectorPlan,
   getCharacterReferenceImages,
   getProductionState,
   getReferenceAnalyses,
@@ -26,14 +29,18 @@ import {
   selectStoryProposal,
   startProductionRun,
 } from '@/api/production'
+import { getCharacterAssets, getSceneAssets } from '@/api/asset-library'
 import { deleteSourceVideo, getProject, getWorkflowRun, uploadSourceVideo } from '@/api/projects'
 import type {
   CharacterReferenceImageV1,
+  CharacterAsset,
+  DirectorPlanV1,
   ProductionStage,
   ProductionState,
   ProjectDetail,
   ReferenceAnalysis,
   SceneReferenceImageV1,
+  SceneAsset,
   ShotKeyframeV1,
   StoryProposalV1,
   VideoClipV1,
@@ -49,6 +56,11 @@ const characterImages = ref<CharacterReferenceImageV1[]>([])
 const sceneImages = ref<SceneReferenceImageV1[]>([])
 const keyframes = ref<ShotKeyframeV1[]>([])
 const videoClips = ref<VideoClipV1[]>([])
+const directorPlan = ref<DirectorPlanV1 | null>(null)
+const characterLibraryAssets = ref<CharacterAsset[]>([])
+const sceneLibraryAssets = ref<SceneAsset[]>([])
+const selectedCharacterLibraryVersion = ref<Record<string, string>>({})
+const selectedSceneLibraryVersion = ref<Record<string, string>>({})
 const selectedFiles = ref<File[]>([])
 const selectedSourceAssetId = ref('')
 const reviewerLabel = ref('制作人')
@@ -93,15 +105,18 @@ async function loadWorkbench() {
   loading.value = true
   error.value = ''
   try {
-    const [nextProject, nextState, nextAnalyses, nextStories, nextCharacters, nextScenes, nextKeyframes, nextClips] = await Promise.all([
+    const [nextProject, nextState, nextAnalyses, nextStories, nextCharacters, nextScenes, nextDirectorPlan, nextKeyframes, nextClips, nextCharacterLibraryAssets, nextSceneLibraryAssets] = await Promise.all([
       getProject(props.projectId),
       getProductionState(props.projectId),
       getReferenceAnalyses(props.projectId),
       getStoryProposals(props.projectId),
       getCharacterReferenceImages(props.projectId),
       getSceneReferenceImages(props.projectId),
+      getCurrentDirectorPlan(props.projectId),
       getShotKeyframes(props.projectId),
       getV1VideoClips(props.projectId),
+      getCharacterAssets(),
+      getSceneAssets(),
     ])
     project.value = nextProject
     if (!nextProject.assets.some((asset) => asset.id === selectedSourceAssetId.value)) {
@@ -112,8 +127,11 @@ async function loadWorkbench() {
     stories.value = nextStories
     characterImages.value = nextCharacters
     sceneImages.value = nextScenes
+    directorPlan.value = nextDirectorPlan
     keyframes.value = nextKeyframes
     videoClips.value = nextClips
+    characterLibraryAssets.value = nextCharacterLibraryAssets
+    sceneLibraryAssets.value = nextSceneLibraryAssets
   } catch (caught) {
     error.value = caught instanceof Error ? caught.message : '加载生产台失败，请刷新后重试'
   } finally {
@@ -243,6 +261,30 @@ function formatTime(value: string): string {
 
 function safeExternalUrl(value: string | null): string | null {
   return value && /^(https?:|data:image\/)/.test(value) ? value : null
+}
+
+const characterLibraryVersions = computed(() => characterLibraryAssets.value.flatMap((asset) => asset.versions.map((version) => ({
+  id: version.id, label: `${asset.name} · v${version.version}`,
+}))))
+const sceneLibraryVersions = computed(() => sceneLibraryAssets.value.flatMap((asset) => asset.versions.map((version) => ({
+  id: version.id, label: `${asset.name} · v${version.version}`,
+}))))
+
+/** 资产库采用不会直接锁图，仍回到当前审核卡片由制作人确认，维持 V1 审核闸门。 */
+async function adoptLibraryCharacter(image: CharacterReferenceImageV1) {
+  const versionId = selectedCharacterLibraryVersion.value[image.character_id]
+  if (!versionId) return
+  await review(`character-adopt-${image.character_id}`, async () => {
+    await adoptCharacterAssetVersion(props.projectId, image.character_id, versionId)
+  })
+}
+
+async function adoptLibraryScene(image: SceneReferenceImageV1) {
+  const versionId = selectedSceneLibraryVersion.value[image.scene_id]
+  if (!versionId) return
+  await review(`scene-adopt-${image.scene_id}`, async () => {
+    await adoptSceneAssetVersion(props.projectId, image.scene_id, versionId)
+  })
 }
 
 onMounted(() => void loadWorkbench())
@@ -391,7 +433,8 @@ watch(() => props.projectId, () => void loadWorkbench())
       <div class="meta-row"><h2>角色参考图锁定</h2><span>{{ characterImages.length }} 个版本</span></div>
       <article v-for="image in characterImages" :key="image.id" class="asset-card asset-preview">
         <a v-if="safeExternalUrl(image.image_url)" :href="safeExternalUrl(image.image_url) || undefined" target="_blank" rel="noreferrer"><img :src="safeExternalUrl(image.image_url) || undefined" :alt="`${image.character_name} 角色参考图`" /></a>
-        <div class="stack"><div class="meta-row"><strong>{{ image.character_name }} · v{{ image.version }}</strong><span class="status" :class="image.review_status === 'LOCKED' ? 'SUCCEEDED' : 'PENDING'">{{ image.review_status }}</span></div><small class="muted">{{ image.character_code }} · {{ formatTime(image.created_at) }}</small>
+        <div class="stack"><div class="meta-row"><strong>{{ image.character_name }} · v{{ image.version }}</strong><span class="status" :class="image.review_status === 'LOCKED' ? 'SUCCEEDED' : 'PENDING'">{{ image.review_status }}</span></div><small class="muted">{{ image.character_code }} · {{ formatTime(image.created_at) }}<template v-if="image.asset_version_id"> · 资产中心版本已绑定</template></small>
+          <div v-if="state?.active_stage === 'CHARACTER_ASSETS' && characterLibraryVersions.length" class="library-adopt-row"><el-select v-model="selectedCharacterLibraryVersion[image.character_id]" placeholder="或采用资产中心角色版本" size="small" filterable><el-option v-for="option in characterLibraryVersions" :key="option.id" :label="option.label" :value="option.id" /></el-select><el-button size="small" plain type="primary" :disabled="Boolean(actionId) || !selectedCharacterLibraryVersion[image.character_id]" @click="adoptLibraryCharacter(image)">采用为候选</el-button></div>
           <button v-if="image.review_status === 'PENDING_REVIEW' && state?.active_stage === 'CHARACTER_ASSETS'" class="button" :disabled="Boolean(actionId)" @click="review(`character-${image.id}`, () => lockCharacterReferenceImage(image.id, reviewPayload()))">{{ actionId === `character-${image.id}` ? '正在锁定…' : '锁定此角色图版本' }}</button>
         </div>
       </article>
@@ -401,9 +444,23 @@ watch(() => props.projectId, () => void loadWorkbench())
       <div class="meta-row"><h2>场景参考图锁定</h2><span>{{ sceneImages.length }} 个版本</span></div>
       <article v-for="image in sceneImages" :key="image.id" class="asset-card asset-preview">
         <a v-if="safeExternalUrl(image.image_url)" :href="safeExternalUrl(image.image_url) || undefined" target="_blank" rel="noreferrer"><img :src="safeExternalUrl(image.image_url) || undefined" :alt="`${image.scene_name} 场景参考图`" /></a>
-        <div class="stack"><div class="meta-row"><strong>{{ image.scene_name }} · v{{ image.version }}</strong><span class="status" :class="image.review_status === 'LOCKED' ? 'SUCCEEDED' : 'PENDING'">{{ image.review_status }}</span></div><small class="muted">{{ image.scene_code }} · {{ formatTime(image.created_at) }}</small>
+        <div class="stack"><div class="meta-row"><strong>{{ image.scene_name }} · v{{ image.version }}</strong><span class="status" :class="image.review_status === 'LOCKED' ? 'SUCCEEDED' : 'PENDING'">{{ image.review_status }}</span></div><small class="muted">{{ image.scene_code }} · {{ formatTime(image.created_at) }}<template v-if="image.asset_version_id"> · 资产中心版本已绑定</template></small>
+          <div v-if="state?.active_stage === 'SCENE_ASSETS' && sceneLibraryVersions.length" class="library-adopt-row"><el-select v-model="selectedSceneLibraryVersion[image.scene_id]" placeholder="或采用资产中心场景版本" size="small" filterable><el-option v-for="option in sceneLibraryVersions" :key="option.id" :label="option.label" :value="option.id" /></el-select><el-button size="small" plain type="primary" :disabled="Boolean(actionId) || !selectedSceneLibraryVersion[image.scene_id]" @click="adoptLibraryScene(image)">采用为候选</el-button></div>
           <button v-if="image.review_status === 'PENDING_REVIEW' && state?.active_stage === 'SCENE_ASSETS'" class="button" :disabled="Boolean(actionId)" @click="review(`scene-${image.id}`, () => lockSceneReferenceImage(image.id, reviewPayload()))">{{ actionId === `scene-${image.id}` ? '正在锁定…' : '锁定此场景图版本' }}</button>
         </div>
+      </article>
+    </section>
+
+    <section v-if="directorPlan" class="panel stack review-panel">
+      <div class="meta-row"><h2>AI 导演结构化分镜</h2><span>{{ directorPlan.shots.length }} 个镜头 · {{ directorPlan.status }}</span></div>
+      <p class="muted">每个镜头已冻结角色/场景资产版本，图片、视频和声音提示词均来自同一份导演方案；资产中心后续新增版本不会改写这里。</p>
+      <details><summary>视觉圣经</summary><pre>{{ formatJson(directorPlan.visual_bible) }}</pre></details>
+      <article v-for="shot in directorPlan.shots" :key="shot.id" class="director-shot">
+        <div class="meta-row"><strong>镜头 {{ shot.shot_number }} · {{ shot.duration }} 秒</strong><span class="muted">角色资产 v{{ shot.character_asset_version_ids.length }} · 场景资产 {{ shot.scene_asset_version_id ? '已冻结' : '历史兼容' }}</span></div>
+        <dl class="director-fields">
+          <div><dt>动作</dt><dd>{{ shot.action }}</dd></div><div><dt>情绪</dt><dd>{{ shot.emotion }}</dd></div><div><dt>镜头</dt><dd>{{ shot.camera_type }} · {{ shot.camera_move }}</dd></div><div><dt>光线</dt><dd>{{ shot.lighting }}</dd></div>
+          <div><dt>图片提示</dt><dd>{{ shot.image_prompt }}</dd></div><div><dt>视频提示</dt><dd>{{ shot.video_prompt }}</dd></div><div><dt>声音提示</dt><dd>{{ shot.sound_prompt }}</dd></div>
+        </dl>
       </article>
     </section>
 
@@ -445,12 +502,19 @@ watch(() => props.projectId, () => void loadWorkbench())
 .asset-card { border: 1px solid #dbe3ef; border-radius: 10px; padding: 16px; }
 .asset-preview { display: grid; grid-template-columns: 140px 1fr; gap: 16px; align-items: start; }
 .asset-preview img { display: block; width: 140px; height: 180px; object-fit: cover; border-radius: 8px; background: #f1f5f9; }
+.library-adopt-row { display: flex; gap: 8px; align-items: center; max-width: 520px; }
+.library-adopt-row .el-select { min-width: 220px; flex: 1; }
 .action-row { display: flex; flex-wrap: wrap; gap: 10px; }
 .analysis-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; }
+.director-shot { border: 1px solid #dbe3ef; border-radius: 10px; padding: 14px; display: grid; gap: 12px; }
+.director-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; margin: 0; }
+.director-fields div { padding: 10px; border-radius: 8px; background: #f8fafc; }
+.director-fields dt { font-size: 12px; color: #64748b; }
+.director-fields dd { margin: 5px 0 0; white-space: pre-wrap; font-size: 13px; line-height: 1.55; }
 .source-video-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 10px; align-items: center; padding: 10px; border: 1px solid #dbe3ef; border-radius: 8px; cursor: pointer; }
 .compact { padding: 6px 10px; font-size: 13px; }
 details { border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px; }
 summary { cursor: pointer; font-weight: 600; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 10px 0 0; padding: 10px; border-radius: 7px; background: #f8fafc; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
-@media (max-width: 640px) { .review-fields, .asset-preview { grid-template-columns: 1fr; } .asset-preview img { width: 100%; height: auto; max-height: 320px; } }
+@media (max-width: 640px) { .review-fields, .asset-preview { grid-template-columns: 1fr; } .asset-preview img { width: 100%; height: auto; max-height: 320px; } .library-adopt-row { align-items: stretch; flex-direction: column; } }
 </style>

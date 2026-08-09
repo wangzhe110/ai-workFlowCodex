@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.models import (
     CharacterDefinition,
+    CharacterAssetVersion,
     CharacterReferenceImage,
     DesignStatus,
     DirectorPlan,
@@ -27,6 +28,7 @@ from app.models import (
     ReviewStatus,
     RunStatus,
     SceneDefinition,
+    SceneAssetVersion,
     SceneReferenceImage,
     ShotKeyframe,
     ShotPlan,
@@ -39,6 +41,14 @@ from app.models import (
 )
 from app.services.v1_configuration_service import get_or_create_project_state
 from app.services.workflow_service import get_project_or_404
+from app.services.asset_library_service import (
+    ensure_character_asset_version_for_image,
+    ensure_scene_asset_version_for_image,
+    select_character_asset_version_for_project,
+    select_scene_asset_version_for_project,
+    create_character_image_candidate_from_asset_version,
+    create_scene_image_candidate_from_asset_version,
+)
 
 
 def utcnow() -> datetime:
@@ -358,6 +368,16 @@ def lock_character_reference_image(
     image.review_status = ReviewStatus.LOCKED
     character.locked_reference_image_id = image.id
     character.design_status = DesignStatus.LOCKED
+    # 锁定项目图时同步“选择”对应资产中心版本。若为升级前历史图片，服务会追加一
+    # 个版本而非改写旧记录，之后导演/视频任务冻结的便是该版本 ID。
+    asset_version = ensure_character_asset_version_for_image(db, character, image)
+    select_character_asset_version_for_project(
+        db,
+        character=character,
+        asset_version=asset_version,
+        source_reference_image_id=image.id,
+        locked=True,
+    )
     if _characters_are_locked(db, state):
         state.active_stage = ProductionStage.SCENE_ASSETS
     _review(
@@ -373,6 +393,29 @@ def lock_character_reference_image(
     db.commit()
     db.refresh(image)
     return image
+
+
+def adopt_character_asset_version(
+    db: Session,
+    *,
+    project_id: str,
+    character_id: str,
+    asset_version_id: str,
+) -> CharacterReferenceImage:
+    """将资产中心角色版本带入当前项目，仍须经原有锁图审核节点确认。"""
+
+    state = _get_v1_state(db, project_id)
+    _require_stage(state, [ProductionStage.CHARACTER_ASSETS], "采用角色资产库版本")
+    character = _get_or_404(db, CharacterDefinition, character_id, "项目角色")
+    if character.project_id != project_id or character.story_proposal_id != state.selected_story_proposal_id:
+        _conflict("角色不属于当前选中的故事")
+    asset_version = _get_or_404(db, CharacterAssetVersion, asset_version_id, "角色资产版本")
+    candidate = create_character_image_candidate_from_asset_version(
+        db, character=character, asset_version=asset_version
+    )
+    db.commit()
+    db.refresh(candidate)
+    return candidate
 
 
 def lock_scene_reference_image(
@@ -395,6 +438,14 @@ def lock_scene_reference_image(
     image.review_status = ReviewStatus.LOCKED
     scene.locked_reference_image_id = image.id
     scene.design_status = DesignStatus.LOCKED
+    asset_version = ensure_scene_asset_version_for_image(db, scene, image)
+    select_scene_asset_version_for_project(
+        db,
+        scene=scene,
+        asset_version=asset_version,
+        source_reference_image_id=image.id,
+        locked=True,
+    )
     if _scenes_are_locked(db, state):
         state.active_stage = ProductionStage.DIRECTOR_PLANNING
     _review(
@@ -410,6 +461,27 @@ def lock_scene_reference_image(
     db.commit()
     db.refresh(image)
     return image
+
+
+def adopt_scene_asset_version(
+    db: Session,
+    *,
+    project_id: str,
+    scene_id: str,
+    asset_version_id: str,
+) -> SceneReferenceImage:
+    """将资产中心场景版本带入当前项目，之后仍由人工锁图放行导演阶段。"""
+
+    state = _get_v1_state(db, project_id)
+    _require_stage(state, [ProductionStage.SCENE_ASSETS], "采用场景资产库版本")
+    scene = _get_or_404(db, SceneDefinition, scene_id, "项目场景")
+    if scene.project_id != project_id or scene.story_proposal_id != state.selected_story_proposal_id:
+        _conflict("场景不属于当前选中的故事")
+    asset_version = _get_or_404(db, SceneAssetVersion, asset_version_id, "场景资产版本")
+    candidate = create_scene_image_candidate_from_asset_version(db, scene=scene, asset_version=asset_version)
+    db.commit()
+    db.refresh(candidate)
+    return candidate
 
 
 def _keyframes_are_locked(db: Session, state: ProjectProductionState) -> bool:

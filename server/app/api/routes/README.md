@@ -6,6 +6,7 @@
 - 生产台的阶段读取、审核节点和异步生成任务使用 `production.py`。
 - 模型中心、Prompt 中心和 Workflow/槽位配置使用 `v1_modeling.py` 与 `model_profiles.py`。
 - 项目级冻结版本、模型、Prompt 和供应商任务号追溯由 `production.py` 的 V1 追溯接口提供。
+- `asset_library.py` 管理跨项目角色/场景资产及其追加版本；不提供历史版本 PATCH。项目采用资产的入口仍在 `production.py`，这样不会绕过 V1 锁图审核。
 
 生成入口只接受服务端允许的 V1 节点和必要的业务参数。浏览器不能指定供应商协议、真实 Key 或任意模型调用参数；服务端在创建任务时完成快照冻结与幂等检查。
 

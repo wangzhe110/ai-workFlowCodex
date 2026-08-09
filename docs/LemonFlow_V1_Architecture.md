@@ -2,7 +2,7 @@
 
 > 文档状态：`已确认并已实施，作为 V1 架构基线`  
 > 适用范围：LemonFlow V1 主生产链路  
-> 实施状态：数据库迁移已至 `0007_v1_production_integrity`；状态机、版本冻结、幂等、镜头视频子任务与本地 Mock 自动化验证已完成。真实模型 Key 和真实供应商小样本验收尚需由负责人授权执行。
+> 实施状态：数据库迁移已至 `0009_phase4_asset_center_and_structured_shots`；状态机、版本冻结、幂等、镜头视频子任务、资产中心与本地 Mock 自动化验证已完成。真实模型 Key 和真实供应商小样本验收尚需由负责人授权执行。
 
 ## 1. 产品定位与架构原则
 
@@ -14,6 +14,7 @@ V1 的生产原则：
 - 业务服务只依赖模型能力槽位，不直接依赖 Gemini、Claude、Banana 或 Seedance 的 HTTP 协议。
 - 每次执行冻结 Workflow 版本、模型配置版本、Prompt 模板版本及其渲染参数。
 - 所有已锁定或已审核通过的结果不可覆盖；重新生成永远创建新版本。
+- 角色与场景的可复用资产属于资产中心；项目只选择某个资产版本，导演、关键帧和视频任务冻结该选择。
 - V1 只提供模型效果分析和推荐，**不得自动替换生产模型**。
 - 参考视频只提炼可迁移的结构与机制；不得复刻原视频的逐字台词、人物、画面、音乐或剧情表达。
 
@@ -26,9 +27,9 @@ flowchart LR
     C --> D["多模型并行生成原创故事"]
     D --> E["人工选择故事方案"]
     E --> F["角色资产设计"]
-    F --> G["角色参考图生成与锁定"]
+    F --> G["角色参考图生成或采用资产中心版本，再锁定"]
     G --> H["场景资产设计"]
-    H --> I["场景参考图生成与锁定"]
+    H --> I["场景参考图生成或采用资产中心版本，再锁定"]
     I --> J["AI 导演分镜规划"]
     J --> K["分镜关键画面生成与锁定"]
     K --> L["Seedance 视频片段生成"]
@@ -184,6 +185,12 @@ erDiagram
     STORY_GENERATION_BATCH ||--o{ STORY_PROPOSAL : produces
     STORY_PROPOSAL ||--o{ CHARACTER_DEFINITION : designs_before_directing
     STORY_PROPOSAL ||--o{ SCENE_DEFINITION : designs_before_directing
+    ASSET_LIBRARY ||--o{ CHARACTER_ASSET : contains
+    CHARACTER_ASSET ||--o{ CHARACTER_ASSET_VERSION : appends
+    ASSET_LIBRARY ||--o{ SCENE_ASSET : contains
+    SCENE_ASSET ||--o{ SCENE_ASSET_VERSION : appends
+    CHARACTER_DEFINITION ||--o{ PROJECT_CHARACTER_ASSET_REFERENCE : selects
+    SCENE_DEFINITION ||--o{ PROJECT_SCENE_ASSET_REFERENCE : selects
     STORY_PROPOSAL ||--o{ DIRECTOR_PLAN : selected_for
     DIRECTOR_PLAN ||--o{ SHOT_PLAN : plans
     CHARACTER_DEFINITION ||--o{ CHARACTER_REFERENCE_IMAGE : has
@@ -210,15 +217,17 @@ erDiagram
 | `story_generation_batches` | `reference_analysis_id`、`requested_profile_ids`、`workflow_run_id` | 一次并行故事生成任务 |
 | `story_proposals` | `batch_id`、`model_invocation_id`、`content`、`status` | 每个模型的一份候选故事 |
 | `director_plans` | `story_proposal_id`、`visual_bible`、`status` | 基于已锁定角色/场景资产生成的导演分镜方案 |
-| `character_definitions` | `story_proposal_id`、`name`、`age`、`appearance`、`costume`、`temperament`、`locked_reference_image_id` | 角色文字设定在导演分镜前生成；指针选择本轮角色图 |
-| `scene_definitions` | `story_proposal_id`、`name`、`location`、`environment`、`style`、`mood`、`locked_reference_image_id` | 场景文字设定在导演分镜前生成；指针选择本轮场景图 |
-| `shot_plans` | `director_plan_id`、`shot_number`、`action`、`camera`、`duration`、`video_action_prompt`、`locked_keyframe_id`、`selected_video_clip_id` | 每个导演分镜；只由该指针选择一个当前采用视频版本 |
-| `character_reference_images` | `character_id`、`version`、`prompt`、`image_url`、`review_status` | 角色参考图不可变版本 |
-| `scene_reference_images` | `scene_id`、`version`、`prompt`、`image_url`、`review_status` | 场景参考图不可变版本 |
+| `asset_libraries` | `kind`、`name`、`status` | 角色/场景资产中心资料库 |
+| `character_assets` / `character_asset_versions` | `name`、`version`、`age`、`gender`、`personality`、`appearance`、`costume`、`reference_images` | 角色主体与不可变版本；支持正面、侧面、全身、表情多视图 |
+| `scene_assets` / `scene_asset_versions` | `name`、`version`、`style`、`weather`、`time_of_day`、`environment`、`reference_images` | 场景主体与不可变版本；支持环境多角度图 |
+| `character_definitions` / `project_character_asset_references` | `story_proposal_id`、`locked_reference_image_id`、`character_asset_version_id`、`is_selected` | 项目角色语义与其采用的资产中心版本分离保存 |
+| `scene_definitions` / `project_scene_asset_references` | `story_proposal_id`、`locked_reference_image_id`、`scene_asset_version_id`、`is_selected` | 项目场景语义与其采用的资产中心版本分离保存 |
+| `shot_plans` | `director_plan_id`、`shot_number`、`action`、`emotion`、`camera_type`、`camera_move`、`lighting`、`image_prompt`、`video_prompt`、`sound_prompt`、`locked_keyframe_id`、`selected_video_clip_id` | 每个导演分镜是图片、视频、声音步骤共用的结构化生产输入 |
+| `character_reference_images` / `scene_reference_images` | `version`、`asset_version_id`、`prompt`、`image_url`、`review_status` | 项目锁图版本，同时可回溯资产中心版本 |
 | `shot_keyframes` | `shot_id`、`version`、`prompt`、`image_url`、`review_status` | 分镜关键画面不可变版本 |
-| `shot_asset_bindings` | `shot_id`、`character_id`、`character_reference_image_id`、`scene_reference_image_id` | 明确分镜引用了哪些锁定基础资产 |
+| `shot_asset_bindings` | `shot_id`、`character_id`、`character_reference_image_id`、`character_asset_version_id`、`scene_reference_image_id`、`scene_asset_version_id` | 明确分镜引用哪些锁图和资产中心版本 |
 | `video_clips` | `shot_id`、`version`、`video_url`、`provider_task_id`、`idempotency_key`、`generation_status`、`review_status` | 一个导演分镜可有多个历史版本；仅 `ShotPlan.selected_video_clip_id` 所指向且已通过审核的版本可参与成片 |
-| `video_clip_asset_bindings` | `video_clip_id`、`asset_type`、`character_reference_image_id` / `scene_reference_image_id` / `shot_keyframe_id` | 通过三类明确外键冻结视频调用实际输入的图片资产 |
+| `video_clip_asset_bindings` | `video_clip_id`、`asset_type`、项目锁图 ID、资产中心版本 ID、`shot_keyframe_id` | 冻结视频调用实际输入及其跨项目资产版本来源 |
 | `final_videos` | `project_id`、`version`、`approved_clip_ids`、`output_url` | 只由已审核通过片段合成 |
 
 ### 6.2 模型与质量表
@@ -311,6 +320,7 @@ Adapter 负责 API 调用、参数转换、供应商错误映射与返回结果�
 
 ```text
 GET  /projects/{project_id}/state
+GET  /projects/{project_id}/director-plan
 POST /projects/{project_id}/generation-runs/{run_key}
 GET  /projects/{project_id}/reference-analyses
 POST /reference-analyses/{analysis_id}/lock
@@ -319,8 +329,10 @@ GET  /projects/{project_id}/story-proposals
 POST /story-proposals/{proposal_id}/select
 GET  /projects/{project_id}/character-reference-images
 POST /character-reference-images/{image_id}/lock
+POST /projects/{project_id}/characters/{character_id}/asset-versions/{asset_version_id}/adopt
 GET  /projects/{project_id}/scene-reference-images
 POST /scene-reference-images/{image_id}/lock
+POST /projects/{project_id}/scenes/{scene_id}/asset-versions/{asset_version_id}/adopt
 GET  /projects/{project_id}/shot-keyframes
 POST /shot-keyframes/{image_id}/lock
 GET  /projects/{project_id}/video-clips
@@ -331,7 +343,22 @@ GET  /projects/{project_id}/model-invocations
 
 `run_key` 只能是服务端声明的 V1 节点。创建时服务端冻结 Workflow、素材、模型、Prompt 和上游锁定资产，并在已有 `PENDING`/`RUNNING` 运行时返回既有任务。视频生成可传指定 `shot_plan_ids`，用于单镜头重做。
 
-### 9.2 模型、Prompt 与质量
+### 9.2 资产中心
+
+资产中心使用独立前缀 `/api/v1/asset-library`，只允许创建资产或追加版本，不提供历史版本编辑接口：
+
+```text
+GET  /asset-library/characters
+POST /asset-library/characters
+POST /asset-library/characters/{asset_id}/versions
+GET  /asset-library/scenes
+POST /asset-library/scenes
+POST /asset-library/scenes/{asset_id}/versions
+```
+
+项目采用接口只创建项目内的待审核锁图候选，不调用图片模型、不跳过 `CHARACTER_ASSETS` / `SCENE_ASSETS` 审核闸门。
+
+### 9.3 模型、Prompt 与质量
 
 ```text
 GET  /workflow-definition

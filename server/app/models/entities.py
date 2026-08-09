@@ -55,6 +55,17 @@ class AssetKind(str, Enum):
     SOURCE_VIDEO = "SOURCE_VIDEO"
 
 
+class AssetLibraryKind(str, Enum):
+    """资产中心的一级类型。
+
+    它与 ``MediaAsset`` 不同：MediaAsset 保存项目文件，而资产中心保存可以被多个
+    项目引用的“角色/场景生产资产”及其不可覆盖版本。
+    """
+
+    CHARACTER = "CHARACTER"
+    SCENE = "SCENE"
+
+
 class LibraryItemKind(str, Enum):
     """创作资产库的两种首批知识类型。"""
 
@@ -245,6 +256,112 @@ class MediaAsset(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     project: Mapped[Project] = relationship(back_populates="assets")
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 资产中心。
+#
+# 资产中心不取代 V1 原有的 CharacterDefinition / SceneDefinition：前者是跨项目可
+# 复用的版本资产，后者仍是“本故事里的角色/场景语义”。项目引用表把两者连接起来，
+# 使既有工作流、审核与冻结机制不需要重写。
+# ---------------------------------------------------------------------------
+
+
+class AssetLibrary(Base):
+    """角色或场景资产的逻辑资料库。
+
+    V1 默认提供一套角色库和一套场景库；未来多团队、品牌项目可以新增更多资料库，
+    但版本内容始终保存在下方的具体 AssetVersion 表中。
+    """
+
+    __tablename__ = "asset_libraries"
+    __table_args__ = (UniqueConstraint("kind", "name", name="uq_asset_library_kind_name"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    kind: Mapped[AssetLibraryKind] = mapped_column(SqlEnum(AssetLibraryKind), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class CharacterAsset(Base):
+    """可跨项目复用的角色资产主体；具体内容只追加到版本表。"""
+
+    __tablename__ = "character_assets"
+    __table_args__ = (UniqueConstraint("library_id", "name", name="uq_character_asset_library_name"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    library_id: Mapped[str] = mapped_column(ForeignKey("asset_libraries.id"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class CharacterAssetVersion(Base):
+    """角色资产的不可变版本，``reference_images`` 支持正侧全身和表情多视图。"""
+
+    __tablename__ = "character_asset_versions"
+    __table_args__ = (UniqueConstraint("character_asset_id", "version", name="uq_character_asset_version"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    character_asset_id: Mapped[str] = mapped_column(ForeignKey("character_assets.id"), nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    age: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    gender: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    personality: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    style: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    appearance: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    costume: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # [{"view": "front|side|full_body|expression", "url": "...", "label": "..."}]
+    # JSON 允许后续接入对象存储 ID、版权来源和审核信息，而不破坏既有版本。
+    reference_images: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class SceneAsset(Base):
+    """可跨项目复用的场景资产主体；具体内容只追加到版本表。"""
+
+    __tablename__ = "scene_assets"
+    __table_args__ = (UniqueConstraint("library_id", "name", name="uq_scene_asset_library_name"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    library_id: Mapped[str] = mapped_column(ForeignKey("asset_libraries.id"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class SceneAssetVersion(Base):
+    """场景资产的不可变版本，保存环境风格、天气、时段和多张参考图。"""
+
+    __tablename__ = "scene_asset_versions"
+    __table_args__ = (UniqueConstraint("scene_asset_id", "version", name="uq_scene_asset_version"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    scene_asset_id: Mapped[str] = mapped_column(ForeignKey("scene_assets.id"), nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    style: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    weather: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    time_of_day: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    location: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    environment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    mood: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    reference_images: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
 class ModelProfile(Base):
@@ -758,6 +875,11 @@ class CharacterDefinition(Base):
         "director_plan_id", ForeignKey("director_plans.id"), nullable=True, index=True
     )
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    # 指向资产中心中的角色主体。该字段不会替代项目内角色语义，而是让此角色可以
+    # 追溯到可跨项目复用的资产版本；旧项目允许为空并在首次继续生产时懒迁移。
+    asset_library_character_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("character_assets.id"), nullable=True, index=True
+    )
     character_code: Mapped[str] = mapped_column(String(80), nullable=False)
     name: Mapped[str] = mapped_column(String(160), nullable=False)
     age_description: Mapped[str] = mapped_column(String(120), nullable=False)
@@ -787,6 +909,10 @@ class SceneDefinition(Base):
         "director_plan_id", ForeignKey("director_plans.id"), nullable=True, index=True
     )
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    # 与角色同理：项目场景语义保持原表，资产中心保存可复用的版本实体。
+    asset_library_scene_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("scene_assets.id"), nullable=True, index=True
+    )
     scene_code: Mapped[str] = mapped_column(String(80), nullable=False)
     name: Mapped[str] = mapped_column(String(160), nullable=False)
     location: Mapped[str] = mapped_column(Text, nullable=False)
@@ -816,6 +942,11 @@ class CharacterReferenceImage(Base):
     model_invocation_id: Mapped[Optional[str]] = mapped_column(
         ForeignKey("model_invocations.id", use_alter=True, name="fk_character_image_invocation"), nullable=True
     )
+    # 对应资产中心的不可变角色版本。一张生成图默认作为 full_body 参考；人工可在
+    # 资产中心基于同一角色追加正面、侧面、表情等完整版本，而不会覆盖此历史图片。
+    asset_version_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("character_asset_versions.id"), nullable=True, index=True
+    )
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     prompt_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
     image_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -840,6 +971,9 @@ class SceneReferenceImage(Base):
     model_invocation_id: Mapped[Optional[str]] = mapped_column(
         ForeignKey("model_invocations.id", use_alter=True, name="fk_scene_image_invocation"), nullable=True
     )
+    asset_version_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("scene_asset_versions.id"), nullable=True, index=True
+    )
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     prompt_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
     image_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -848,6 +982,78 @@ class SceneReferenceImage(Base):
         SqlEnum(ReviewStatus), default=ReviewStatus.PENDING_REVIEW, nullable=False
     )
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class ProjectCharacterAssetReference(Base):
+    """项目角色对资产中心某个角色版本的明确采用记录。
+
+    ``is_selected`` 是项目内的当前采用指针；取消采用或改选只改变引用记录，绝不修改
+    CharacterAssetVersion 的内容，从而保留过去 WorkflowRun 的可复现性。
+    """
+
+    __tablename__ = "project_character_asset_references"
+    __table_args__ = (
+        UniqueConstraint(
+            "character_definition_id",
+            "character_asset_version_id",
+            name="uq_project_character_asset_version_reference",
+        ),
+        Index(
+            "uq_selected_project_character_asset",
+            "character_definition_id",
+            unique=True,
+            postgresql_where=text("is_selected = true"),
+            sqlite_where=text("is_selected = 1"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    character_definition_id: Mapped[str] = mapped_column(ForeignKey("character_definitions.id"), nullable=False, index=True)
+    character_asset_id: Mapped[str] = mapped_column(ForeignKey("character_assets.id"), nullable=False, index=True)
+    character_asset_version_id: Mapped[str] = mapped_column(
+        ForeignKey("character_asset_versions.id"), nullable=False, index=True
+    )
+    source_reference_image_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("character_reference_images.id"), nullable=True, index=True
+    )
+    is_selected: Mapped[bool] = mapped_column(default=False, nullable=False)
+    locked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class ProjectSceneAssetReference(Base):
+    """项目场景对资产中心某个场景版本的明确采用记录。"""
+
+    __tablename__ = "project_scene_asset_references"
+    __table_args__ = (
+        UniqueConstraint(
+            "scene_definition_id",
+            "scene_asset_version_id",
+            name="uq_project_scene_asset_version_reference",
+        ),
+        Index(
+            "uq_selected_project_scene_asset",
+            "scene_definition_id",
+            unique=True,
+            postgresql_where=text("is_selected = true"),
+            sqlite_where=text("is_selected = 1"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    scene_definition_id: Mapped[str] = mapped_column(ForeignKey("scene_definitions.id"), nullable=False, index=True)
+    scene_asset_id: Mapped[str] = mapped_column(ForeignKey("scene_assets.id"), nullable=False, index=True)
+    scene_asset_version_id: Mapped[str] = mapped_column(
+        ForeignKey("scene_asset_versions.id"), nullable=False, index=True
+    )
+    source_reference_image_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("scene_reference_images.id"), nullable=True, index=True
+    )
+    is_selected: Mapped[bool] = mapped_column(default=False, nullable=False)
+    locked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
@@ -865,6 +1071,15 @@ class ShotPlan(Base):
     camera_description: Mapped[str] = mapped_column(Text, nullable=False)
     duration_seconds: Mapped[float] = mapped_column(Numeric(6, 2), nullable=False)
     video_action_prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    # Phase 4 导演方案使用可被图片、视频和声音步骤直接消费的结构化字段。旧字段保留
+    # 作为兼容和可读摘要，所有新增字段都有迁移默认值以不破坏已经存在的导演方案。
+    emotion: Mapped[str] = mapped_column(Text, nullable=False, default="未指定")
+    camera_type: Mapped[str] = mapped_column(String(120), nullable=False, default="中景")
+    camera_move: Mapped[str] = mapped_column(Text, nullable=False, default="固定机位")
+    lighting: Mapped[str] = mapped_column(Text, nullable=False, default="自然光")
+    image_prompt: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    video_prompt: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    sound_prompt: Mapped[str] = mapped_column(Text, nullable=False, default="")
     locked_keyframe_id: Mapped[Optional[str]] = mapped_column(
         ForeignKey("shot_keyframes.id", use_alter=True, name="fk_shot_locked_keyframe"), nullable=True
     )
@@ -894,8 +1109,16 @@ class ShotAssetBinding(Base):
     character_reference_image_id: Mapped[Optional[str]] = mapped_column(
         ForeignKey("character_reference_images.id"), nullable=True
     )
+    # 角色/场景图是具体项目锁图，资产中心版本则是跨项目可复用资产的冻结身份。二者
+    # 同时记录，令任意镜头和视频片段都能回答“使用了哪个资产版本”。
+    character_asset_version_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("character_asset_versions.id"), nullable=True, index=True
+    )
     scene_id: Mapped[str] = mapped_column(ForeignKey("scene_definitions.id"), nullable=False)
     scene_reference_image_id: Mapped[str] = mapped_column(ForeignKey("scene_reference_images.id"), nullable=False)
+    scene_asset_version_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("scene_asset_versions.id"), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
@@ -1051,7 +1274,11 @@ class ModelQualityEvaluation(Base):
 
 
 class VideoClipAssetBinding(Base):
-    """视频片段使用的锁定角色图、场景图、关键帧三类外键。"""
+    """视频片段使用的锁图、关键帧及资产中心版本外键。
+
+    项目参考图保证本次视频生成的实际输入可下载；资产版本字段保证生产审计可跨项目
+    追溯角色/场景资产的版本来源。
+    """
 
     __tablename__ = "video_clip_asset_bindings"
     __table_args__ = (
@@ -1072,8 +1299,14 @@ class VideoClipAssetBinding(Base):
     character_reference_image_id: Mapped[Optional[str]] = mapped_column(
         ForeignKey("character_reference_images.id"), nullable=True
     )
+    character_asset_version_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("character_asset_versions.id"), nullable=True, index=True
+    )
     scene_reference_image_id: Mapped[Optional[str]] = mapped_column(
         ForeignKey("scene_reference_images.id"), nullable=True
+    )
+    scene_asset_version_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("scene_asset_versions.id"), nullable=True, index=True
     )
     shot_keyframe_id: Mapped[Optional[str]] = mapped_column(ForeignKey("shot_keyframes.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)

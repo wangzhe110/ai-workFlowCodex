@@ -63,6 +63,13 @@ from app.services.v1_production_service import (
     mark_reference_analysis_ready,
     mark_story_batch_ready,
 )
+from app.services.asset_library_service import (
+    character_asset_snapshot,
+    ensure_character_asset_version_for_image,
+    ensure_library_backing_for_locked_assets,
+    ensure_scene_asset_version_for_image,
+    scene_asset_snapshot,
+)
 from app.services.v1_model_adapter_service import (
     adapter_key,
     analyze_reference_video,
@@ -266,7 +273,7 @@ def _create_video_child_steps(db: Session, run: WorkflowRun, parent_step: Workfl
             shots_per_group=1,
             version=version,
             image_ids=[keyframe["id"]],
-            prompt=str(frozen_shot.get("video_action_prompt") or ""),
+            prompt=str(frozen_shot.get("video_prompt") or frozen_shot.get("video_action_prompt") or ""),
             status=VideoClipStatus.PENDING,
             generation_status=RunStatus.PENDING.value,
             review_status=VideoReviewStatus.PENDING_REVIEW.value,
@@ -274,16 +281,36 @@ def _create_video_child_steps(db: Session, run: WorkflowRun, parent_step: Workfl
                 "shot_keyframe_id": keyframe["id"],
                 "character_reference_image_ids": deepcopy(frozen_shot.get("character_reference_image_ids") or []),
                 "scene_reference_image_ids": deepcopy(frozen_shot.get("scene_reference_image_ids") or []),
+                "character_asset_version_ids": deepcopy(frozen_shot.get("character_asset_version_ids") or []),
+                "scene_asset_version_ids": deepcopy(frozen_shot.get("scene_asset_version_ids") or []),
             },
             idempotency_key=child_key,
         )
         db.add(clip)
         db.flush()
         db.add(VideoClipAssetBinding(video_clip_id=clip.id, asset_type="SHOT_KEYFRAME", shot_keyframe_id=keyframe["id"]))
-        for image_id in frozen_shot.get("character_reference_image_ids") or []:
-            db.add(VideoClipAssetBinding(video_clip_id=clip.id, asset_type="CHARACTER_REFERENCE", character_reference_image_id=image_id))
-        for image_id in frozen_shot.get("scene_reference_image_ids") or []:
-            db.add(VideoClipAssetBinding(video_clip_id=clip.id, asset_type="SCENE_REFERENCE", scene_reference_image_id=image_id))
+        character_image_ids = frozen_shot.get("character_reference_image_ids") or []
+        character_version_ids = frozen_shot.get("character_asset_version_ids") or []
+        for index, image_id in enumerate(character_image_ids):
+            db.add(
+                VideoClipAssetBinding(
+                    video_clip_id=clip.id,
+                    asset_type="CHARACTER_REFERENCE",
+                    character_reference_image_id=image_id,
+                    character_asset_version_id=character_version_ids[index] if index < len(character_version_ids) else None,
+                )
+            )
+        scene_image_ids = frozen_shot.get("scene_reference_image_ids") or []
+        scene_version_ids = frozen_shot.get("scene_asset_version_ids") or []
+        for index, image_id in enumerate(scene_image_ids):
+            db.add(
+                VideoClipAssetBinding(
+                    video_clip_id=clip.id,
+                    asset_type="SCENE_REFERENCE",
+                    scene_reference_image_id=image_id,
+                    scene_asset_version_id=scene_version_ids[index] if index < len(scene_version_ids) else None,
+                )
+            )
         child = WorkflowStep(
             workflow_run_id=run.id,
             step_key="VIDEO_SHOT",
@@ -348,6 +375,9 @@ def _validate_inputs(
         scenes = list(db.scalars(select(SceneDefinition).where(SceneDefinition.story_proposal_id == state.selected_story_proposal_id)).all())
         if not chars or not scenes or not all(item.locked_reference_image_id for item in chars) or not all(item.locked_reference_image_id for item in scenes):
             _conflict("请先锁定所有角色图和场景图")
+        # Phase 4 兼容层：旧项目的锁图没有资产中心版本时，此处只追加资产/引用记录，
+        # 不会替换原有锁图、故事、审核或 Workflow 数据。随后创建任务会冻结新版本。
+        ensure_library_backing_for_locked_assets(db, characters=chars, scenes=scenes)
     elif run_key == "shot_keyframes" and state.director_plan_id is None:
         _conflict("请先完成 AI 导演分镜")
     elif run_key == "video_generation":
@@ -518,6 +548,8 @@ def _locked_character_asset_snapshot(db: Session, character: CharacterDefinition
     return {
         **_character_definition_snapshot(character),
         "reference_image": {"id": image.id, "version": image.version, "image_url": image.image_url},
+        # 锁定任务同时冻结资产中心版本，后续资产中心新增 v2 不会改变本次导演方案。
+        "asset_library_version": character_asset_snapshot(db, image.asset_version_id),
     }
 
 
@@ -530,6 +562,7 @@ def _locked_scene_asset_snapshot(db: Session, scene: SceneDefinition) -> dict[st
     return {
         **_scene_definition_snapshot(scene),
         "reference_image": {"id": image.id, "version": image.version, "image_url": image.image_url},
+        "asset_library_version": scene_asset_snapshot(db, image.asset_version_id),
     }
 
 
@@ -543,24 +576,51 @@ def _shot_snapshot(db: Session, shot: ShotPlan) -> dict[str, Any]:
             image = db.get(CharacterReferenceImage, binding.character_reference_image_id)
             if image is None or not image.image_url:
                 raise RuntimeError("分镜绑定的角色参考图不存在或没有地址")
-            character_references.append({"id": image.id, "image_url": image.image_url})
+            character_references.append(
+                {
+                    "id": image.id,
+                    "image_url": image.image_url,
+                    "asset_version_id": binding.character_asset_version_id or image.asset_version_id,
+                    "asset_library_version": character_asset_snapshot(
+                        db, binding.character_asset_version_id or image.asset_version_id
+                    ),
+                }
+            )
         if binding.scene_reference_image_id:
             image = db.get(SceneReferenceImage, binding.scene_reference_image_id)
             if image is None or not image.image_url:
                 raise RuntimeError("分镜绑定的场景参考图不存在或没有地址")
-            scene_references.append({"id": image.id, "image_url": image.image_url})
+            scene_references.append(
+                {
+                    "id": image.id,
+                    "image_url": image.image_url,
+                    "asset_version_id": binding.scene_asset_version_id or image.asset_version_id,
+                    "asset_library_version": scene_asset_snapshot(
+                        db, binding.scene_asset_version_id or image.asset_version_id
+                    ),
+                }
+            )
     return {
         "shot_plan_id": shot.id,
         "shot_number": shot.shot_number,
         "action_description": shot.action_description,
         "camera_description": shot.camera_description,
         "duration_seconds": float(shot.duration_seconds),
+        "emotion": shot.emotion,
+        "camera_type": shot.camera_type,
+        "camera_move": shot.camera_move,
+        "lighting": shot.lighting,
+        "image_prompt": shot.image_prompt,
+        "video_prompt": shot.video_prompt,
+        "sound_prompt": shot.sound_prompt,
         "video_action_prompt": shot.video_action_prompt,
         "locked_keyframe": {"id": keyframe.id, "image_url": keyframe.image_url} if keyframe else None,
         "character_reference_images": character_references,
         "scene_reference_images": scene_references,
         "character_reference_image_ids": [item["id"] for item in character_references],
         "scene_reference_image_ids": [item["id"] for item in scene_references],
+        "character_asset_version_ids": [item["asset_version_id"] for item in character_references if item.get("asset_version_id")],
+        "scene_asset_version_ids": [item["asset_version_id"] for item in scene_references if item.get("asset_version_id")],
     }
 
 
@@ -1283,10 +1343,16 @@ def _execute_character_images(db: Session, run: WorkflowRun) -> None:
             )
         image = CharacterReferenceImage(character_id=character_id, project_id=run.project_id, generation_run_id=run.id, model_invocation_id=invocation.id, version=version, prompt_snapshot=prompt, image_url=image_url, generation_status=RunStatus.SUCCEEDED)
         db.add(image)
+        db.flush()
+        definition = db.get(CharacterDefinition, character_id)
+        if definition is None:
+            raise RuntimeError("角色参考图缺少角色定义")
+        # 每次候选图都对应资产中心的一版不可变角色资产；锁图时仅选择其中一版。
+        asset_version = ensure_character_asset_version_for_image(db, definition, image)
         _finish_invocation(
             db,
             invocation,
-            {"image_id": image.id, "version": version},
+            {"image_id": image.id, "version": version, "character_asset_version_id": asset_version.id},
             started_at=started_at,
             media_units={"images": 1},
         )
@@ -1323,10 +1389,15 @@ def _execute_scene_images(db: Session, run: WorkflowRun) -> None:
             )
         image = SceneReferenceImage(scene_id=scene_id, project_id=run.project_id, generation_run_id=run.id, model_invocation_id=invocation.id, version=version, prompt_snapshot=prompt, image_url=image_url, generation_status=RunStatus.SUCCEEDED)
         db.add(image)
+        db.flush()
+        definition = db.get(SceneDefinition, scene_id)
+        if definition is None:
+            raise RuntimeError("场景参考图缺少场景定义")
+        asset_version = ensure_scene_asset_version_for_image(db, definition, image)
         _finish_invocation(
             db,
             invocation,
-            {"image_id": image.id, "version": version},
+            {"image_id": image.id, "version": version, "scene_asset_version_id": asset_version.id},
             started_at=started_at,
             media_units={"images": 1},
         )
@@ -1336,8 +1407,9 @@ def _execute_scene_images(db: Session, run: WorkflowRun) -> None:
 DIRECTOR_PLAN_OUTPUT_CONTRACT = (
     '{"visual_bible":{"continuity":"string","style":"string"},'
     '"shots":[{"number":1,"scene_code":"SCENE_CODE","character_codes":["ROLE_CODE"],'
-    '"action_description":"string","camera_description":"string","duration_seconds":3,'
-    '"video_action_prompt":"string"}]}'
+    '"action":"string","emotion":"string","camera_type":"string","camera_move":"string",'
+    '"lighting":"string","duration":3,"image_prompt":"string","video_prompt":"string",'
+    '"sound_prompt":"string"}]}'
 )
 
 
@@ -1385,17 +1457,37 @@ def _normalize_director_plan(
         if not selected_characters:
             raise RuntimeError(f"第 {number} 镜必须引用至少一个已锁定角色")
         duration = item.get("duration_seconds")
+        if duration is None:
+            duration = item.get("duration")
         if not isinstance(duration, (int, float)) or not 0.5 <= float(duration) <= 30:
-            raise RuntimeError(f"第 {number} 镜的 duration_seconds 必须在 0.5 至 30 秒之间")
+            raise RuntimeError(f"第 {number} 镜的 duration 必须在 0.5 至 30 秒之间")
+        action = _required_text(item.get("action") or item.get("action_description"), f"shots[{index}].action")
+        camera_type = _required_text(item.get("camera_type") or "中景", f"shots[{index}].camera_type", max_length=120)
+        camera_move = _required_text(item.get("camera_move") or "固定机位", f"shots[{index}].camera_move")
+        image_prompt = _required_text(item.get("image_prompt") or action, f"shots[{index}].image_prompt")
+        video_prompt = _required_text(
+            item.get("video_prompt") or item.get("video_action_prompt") or action,
+            f"shots[{index}].video_prompt",
+        )
         normalized.append(
             {
                 "number": number,
                 "scene": scene,
                 "characters": selected_characters,
-                "action_description": _required_text(item.get("action_description"), f"shots[{index}].action_description"),
-                "camera_description": _required_text(item.get("camera_description"), f"shots[{index}].camera_description"),
+                "action_description": action,
+                "emotion": _required_text(item.get("emotion") or "情绪递进", f"shots[{index}].emotion"),
+                "camera_type": camera_type,
+                "camera_move": camera_move,
+                "lighting": _required_text(item.get("lighting") or "自然光", f"shots[{index}].lighting"),
+                "camera_description": _required_text(
+                    item.get("camera_description") or f"{camera_type}，{camera_move}",
+                    f"shots[{index}].camera_description",
+                ),
                 "duration_seconds": float(duration),
-                "video_action_prompt": _required_text(item.get("video_action_prompt"), f"shots[{index}].video_action_prompt"),
+                "image_prompt": image_prompt,
+                "video_prompt": video_prompt,
+                "sound_prompt": _required_text(item.get("sound_prompt") or "环境氛围声与人物动作声", f"shots[{index}].sound_prompt"),
+                "video_action_prompt": video_prompt,
             }
         )
     return visual_bible, sorted(normalized, key=lambda item: item["number"])
@@ -1418,9 +1510,16 @@ def _execute_director_plan(db: Session, run: WorkflowRun) -> None:
                 "scene": scenes[(number - 1) % len(scenes)],
                 "characters": characters,
                 "action_description": f"角色在{scenes[(number - 1) % len(scenes)].get('name', '场景')}中因新线索采取行动",
+                "emotion": "疑虑逐步转为坚定",
+                "camera_type": "中近景",
+                "camera_move": "缓慢推进",
+                "lighting": "场景主光保持一致，人物面部轮廓清晰",
                 "camera_description": "中近景，缓慢推进，强调关系变化",
                 "duration_seconds": 3.0,
-                "video_action_prompt": "角色动作自然克制，保持锁定角色与场景一致",
+                "image_prompt": "电影感短剧关键画面，角色和场景严格依据锁定参考资产，突出行动瞬间",
+                "video_prompt": "角色动作自然克制，保持锁定角色与场景一致，镜头缓慢推进",
+                "sound_prompt": "低强度环境氛围声、脚步声与衣料摩擦声，不使用带版权音乐",
+                "video_action_prompt": "角色动作自然克制，保持锁定角色与场景一致，镜头缓慢推进",
             }
             for number in range(1, 4)
         ]
@@ -1431,7 +1530,8 @@ def _execute_director_plan(db: Session, run: WorkflowRun) -> None:
             system_instruction=_system_instruction(
                 invocation,
                 "生成导演视觉方案和按顺序排列的分镜。只能引用输入中已经锁定的角色和场景编码，"
-                "每镜必须给出动作、机位、时长和图生视频动作描述。",
+                "每镜必须给出动作、情绪、镜头类型、运镜、光线、时长，以及可直接用于图片、视频、"
+                "声音生产的三类原创 Prompt。",
             ),
             user_payload={
                 "selected_story": story_content,
@@ -1454,7 +1554,22 @@ def _execute_director_plan(db: Session, run: WorkflowRun) -> None:
     db.flush()
     for specification in planned_shots:
         scene = specification["scene"]
-        shot = ShotPlan(director_plan_id=plan.id, project_id=run.project_id, shot_number=specification["number"], action_description=specification["action_description"], camera_description=specification["camera_description"], duration_seconds=specification["duration_seconds"], video_action_prompt=specification["video_action_prompt"])
+        shot = ShotPlan(
+            director_plan_id=plan.id,
+            project_id=run.project_id,
+            shot_number=specification["number"],
+            action_description=specification["action_description"],
+            camera_description=specification["camera_description"],
+            duration_seconds=specification["duration_seconds"],
+            video_action_prompt=specification["video_action_prompt"],
+            emotion=specification["emotion"],
+            camera_type=specification["camera_type"],
+            camera_move=specification["camera_move"],
+            lighting=specification["lighting"],
+            image_prompt=specification["image_prompt"],
+            video_prompt=specification["video_prompt"],
+            sound_prompt=specification["sound_prompt"],
+        )
         db.add(shot)
         db.flush()
         for character in specification["characters"]:
@@ -1464,7 +1579,19 @@ def _execute_director_plan(db: Session, run: WorkflowRun) -> None:
             scene_id = scene.get("definition_id")
             if not isinstance(character_id, str) or not isinstance(scene_id, str) or not isinstance(character_image, dict) or not isinstance(scene_image, dict):
                 raise RuntimeError("冻结导演资产快照不完整")
-            db.add(ShotAssetBinding(shot_id=shot.id, character_id=character_id, character_reference_image_id=character_image.get("id"), scene_id=scene_id, scene_reference_image_id=scene_image.get("id")))
+            asset_version = character.get("asset_library_version")
+            scene_asset_version = scene.get("asset_library_version")
+            db.add(
+                ShotAssetBinding(
+                    shot_id=shot.id,
+                    character_id=character_id,
+                    character_reference_image_id=character_image.get("id"),
+                    character_asset_version_id=asset_version.get("asset_version_id") if isinstance(asset_version, dict) else None,
+                    scene_id=scene_id,
+                    scene_reference_image_id=scene_image.get("id"),
+                    scene_asset_version_id=scene_asset_version.get("asset_version_id") if isinstance(scene_asset_version, dict) else None,
+                )
+            )
     _finish_invocation(
         db,
         invocation,
@@ -1505,6 +1632,8 @@ def _execute_shot_keyframes(db: Session, run: WorkflowRun) -> None:
                 "shot_id": shot_id,
                 "character_reference_image_ids": deepcopy(shot.get("character_reference_image_ids") or []),
                 "scene_reference_image_ids": deepcopy(shot.get("scene_reference_image_ids") or []),
+                "character_asset_version_ids": deepcopy(shot.get("character_asset_version_ids") or []),
+                "scene_asset_version_ids": deepcopy(shot.get("scene_asset_version_ids") or []),
             },
             binding=binding,
         )
@@ -1516,8 +1645,9 @@ def _execute_shot_keyframes(db: Session, run: WorkflowRun) -> None:
                 "必须以输入的锁定角色图和场景图为视觉参考，保持人物外观、服装、场景风格一致；"
                 "输出这个镜头的一张关键画面，不出现文字或水印。",
             ),
-            f"第 {shot_number} 镜；动作：{shot.get('action_description', '')}；"
-            f"机位：{shot.get('camera_description', '')}；视频动作要求：{shot.get('video_action_prompt', '')}",
+            f"第 {shot_number} 镜；导演图片提示：{shot.get('image_prompt', '')}；动作：{shot.get('action_description', '')}；"
+            f"情绪：{shot.get('emotion', '')}；镜头：{shot.get('camera_type', '')} / {shot.get('camera_move', '')}；"
+            f"光线：{shot.get('lighting', '')}。",
         )
         started_at = perf_counter()
         if _is_mock(snapshot):
@@ -1531,7 +1661,26 @@ def _execute_shot_keyframes(db: Session, run: WorkflowRun) -> None:
                 version=version,
                 source_url=provider_url,
             )
-        frame = ShotKeyframe(shot_id=shot_id, project_id=run.project_id, generation_run_id=run.id, model_invocation_id=invocation.id, version=version, prompt_snapshot=prompt, image_url=image_url, input_asset_snapshot={"character_reference_image_ids": deepcopy(shot.get("character_reference_image_ids") or []), "scene_reference_image_ids": deepcopy(shot.get("scene_reference_image_ids") or [])}, generation_status=RunStatus.SUCCEEDED)
+        frame = ShotKeyframe(
+            shot_id=shot_id,
+            project_id=run.project_id,
+            generation_run_id=run.id,
+            model_invocation_id=invocation.id,
+            version=version,
+            prompt_snapshot=prompt,
+            image_url=image_url,
+            input_asset_snapshot={
+                "character_reference_image_ids": deepcopy(shot.get("character_reference_image_ids") or []),
+                "scene_reference_image_ids": deepcopy(shot.get("scene_reference_image_ids") or []),
+                "character_asset_version_ids": deepcopy(shot.get("character_asset_version_ids") or []),
+                "scene_asset_version_ids": deepcopy(shot.get("scene_asset_version_ids") or []),
+                "director_shot": {
+                    key: deepcopy(shot.get(key))
+                    for key in ("emotion", "camera_type", "camera_move", "lighting", "image_prompt", "video_prompt", "sound_prompt")
+                },
+            },
+            generation_status=RunStatus.SUCCEEDED,
+        )
         db.add(frame)
         _finish_invocation(
             db,
@@ -1614,7 +1763,9 @@ def execute_v1_video_child(run_id: str, step_id: str) -> None:
                 create_video_request(
                     project_id=run.project_id,
                     shot_number=int(frozen_shot["shot_number"]),
-                    prompt=str(frozen_shot.get("video_action_prompt") or ""),
+                    # 视频 Adapter 只消费创建时冻结的导演视频 Prompt；旧任务回放时仍可
+                    # 通过 video_action_prompt 兼容，但不会重新读取当前导演方案。
+                    prompt=str(frozen_shot.get("video_prompt") or frozen_shot.get("video_action_prompt") or ""),
                     image_urls=[keyframe["image_url"]],
                 )
             )

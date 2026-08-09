@@ -371,6 +371,7 @@ class CharacterReferenceImageV1Response(BaseModel):
     character_code: str
     character_name: str
     version: int
+    asset_version_id: Optional[str]
     image_url: Optional[str]
     generation_status: str
     review_status: str
@@ -386,6 +387,7 @@ class SceneReferenceImageV1Response(BaseModel):
     scene_code: str
     scene_name: str
     version: int
+    asset_version_id: Optional[str]
     image_url: Optional[str]
     generation_status: str
     review_status: str
@@ -424,6 +426,146 @@ class VideoClipV1Response(BaseModel):
     review_note: Optional[str]
     input_asset_snapshot: Optional[dict[str, Any]]
     created_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 资产中心与结构化导演方案。
+# 资产版本只有 POST 创建，不提供 PATCH，防止覆盖已被 Workflow / VideoClip 冻结的输入。
+# ---------------------------------------------------------------------------
+
+
+class AssetReferenceImageInput(BaseModel):
+    """资产版本中的一张参考图，支持角色多视图和场景多角度图。"""
+
+    view: str = Field(default="generated", min_length=1, max_length=40)
+    url: str = Field(min_length=1, max_length=4000)
+    label: Optional[str] = Field(default=None, max_length=160)
+
+
+class CharacterAssetVersionCreateRequest(BaseModel):
+    """创建角色资产首版或下一版；旧版始终保持只读。"""
+
+    description: str = Field(default="", max_length=10_000)
+    age: Optional[str] = Field(default=None, max_length=120)
+    gender: Optional[str] = Field(default=None, max_length=40)
+    personality: Optional[str] = Field(default=None, max_length=10_000)
+    style: Optional[str] = Field(default=None, max_length=10_000)
+    appearance: Optional[str] = Field(default=None, max_length=10_000)
+    costume: Optional[str] = Field(default=None, max_length=10_000)
+    reference_images: list[AssetReferenceImageInput] = Field(default_factory=list, max_length=16)
+
+
+class CharacterAssetCreateRequest(CharacterAssetVersionCreateRequest):
+    """资产中心手工新建角色与 v1 的输入。"""
+
+    name: str = Field(min_length=1, max_length=160)
+    library_id: Optional[str] = Field(default=None, min_length=1, max_length=36)
+
+
+class CharacterAssetVersionResponse(BaseModel):
+    id: str
+    character_asset_id: str
+    version: int
+    description: str
+    age: Optional[str]
+    gender: Optional[str]
+    personality: Optional[str]
+    style: Optional[str]
+    appearance: Optional[str]
+    costume: Optional[str]
+    reference_images: list[dict[str, Any]]
+    created_at: datetime
+
+
+class CharacterAssetResponse(BaseModel):
+    """角色资产主体和所有不可变版本，供资产中心卡片展示。"""
+
+    id: str
+    library_id: str
+    name: str
+    description: str
+    status: str
+    versions: list[CharacterAssetVersionResponse]
+    created_at: datetime
+    updated_at: datetime
+
+
+class SceneAssetVersionCreateRequest(BaseModel):
+    """创建场景资产首版或下一版；天气和时段独立于风格，便于商业复用。"""
+
+    description: str = Field(default="", max_length=10_000)
+    style: Optional[str] = Field(default=None, max_length=10_000)
+    weather: Optional[str] = Field(default=None, max_length=120)
+    time_of_day: Optional[str] = Field(default=None, max_length=120)
+    location: Optional[str] = Field(default=None, max_length=10_000)
+    environment: Optional[str] = Field(default=None, max_length=10_000)
+    mood: Optional[str] = Field(default=None, max_length=10_000)
+    reference_images: list[AssetReferenceImageInput] = Field(default_factory=list, max_length=16)
+
+
+class SceneAssetCreateRequest(SceneAssetVersionCreateRequest):
+    name: str = Field(min_length=1, max_length=160)
+    library_id: Optional[str] = Field(default=None, min_length=1, max_length=36)
+
+
+class SceneAssetVersionResponse(BaseModel):
+    id: str
+    scene_asset_id: str
+    version: int
+    description: str
+    style: Optional[str]
+    weather: Optional[str]
+    time_of_day: Optional[str]
+    location: Optional[str]
+    environment: Optional[str]
+    mood: Optional[str]
+    reference_images: list[dict[str, Any]]
+    created_at: datetime
+
+
+class SceneAssetResponse(BaseModel):
+    id: str
+    library_id: str
+    name: str
+    description: str
+    status: str
+    versions: list[SceneAssetVersionResponse]
+    created_at: datetime
+    updated_at: datetime
+
+
+class DirectorShotResponse(BaseModel):
+    """图片、视频、声音生产直接使用的结构化导演镜头。"""
+
+    id: str
+    shot_number: int
+    duration: float
+    character_ids: list[str]
+    character_asset_version_ids: list[str]
+    scene_id: str
+    scene_asset_version_id: Optional[str]
+    action: str
+    emotion: str
+    camera_type: str
+    camera_move: str
+    lighting: str
+    image_prompt: str
+    video_prompt: str
+    sound_prompt: str
+    locked_keyframe_id: Optional[str]
+    created_at: datetime
+
+
+class DirectorPlanV1Response(BaseModel):
+    id: str
+    project_id: str
+    story_proposal_id: str
+    workflow_run_id: str
+    visual_bible: dict[str, Any]
+    status: str
+    shots: list[DirectorShotResponse]
+    created_at: datetime
+    updated_at: datetime
 
 
 class ModelInvocationTraceResponse(BaseModel):

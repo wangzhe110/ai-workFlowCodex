@@ -10,7 +10,8 @@
 - `V1QualityReportView.vue`：只汇总已有调用/审核的质量与成本数据，不自动切换模型。
 - `V1PromptTemplatesView.vue`：Prompt 草稿、版本、启用和归档。
 - `V1ProductionTraceView.vue`：定位项目冻结的 Workflow、模型、Prompt、调用和脱敏供应商任务号。
+- `AssetLibraryView.vue`：角色和场景资产中心。制作人只能新建资产或追加新版本；历史版本不可编辑。项目采用资产后仍须返回生产台锁图。
 
 `ProjectWorkbenchView.vue`、`ProjectTopicsView.vue`、`ProjectStoryView.vue`、`ProjectStoryboardView.vue`、`ProjectImagesView.vue`、`ProjectVideosView.vue`、`ModelProfilesView.vue` 和 `CreativeLibraryView.vue` 为历史兼容或辅助工具；它们不得阻挡 V1 生产台。
 
-页面可停止前端等待，但不能把等待超时写为后台失败。视频区需逐镜显示状态、版本和脱敏任务号；用户驳回后只能重做该镜头的新版本。
+页面可停止前端等待，但不能把等待超时写为后台失败。视频区需逐镜显示状态、版本和脱敏任务号；用户驳回后只能重做该镜头的新版本。生产台会展示结构化导演方案，并允许在角色/场景锁图阶段将资产中心版本加入为待审核候选。

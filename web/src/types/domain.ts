@@ -291,6 +291,7 @@ export interface CharacterReferenceImageV1 {
   character_code: string
   character_name: string
   version: number
+  asset_version_id: string | null
   image_url: string | null
   generation_status: 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED'
   review_status: 'PENDING_REVIEW' | 'LOCKED' | 'REJECTED'
@@ -304,6 +305,7 @@ export interface SceneReferenceImageV1 {
   scene_code: string
   scene_name: string
   version: number
+  asset_version_id: string | null
   image_url: string | null
   generation_status: 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED'
   review_status: 'PENDING_REVIEW' | 'LOCKED' | 'REJECTED'
@@ -338,6 +340,98 @@ export interface VideoClipV1 {
   review_note: string | null
   input_asset_snapshot: Record<string, unknown> | null
   created_at: string
+}
+
+/** Phase 4 资产中心：资产主体跨项目复用，版本内容只追加、从不覆盖。 */
+export interface AssetReferenceImage {
+  view: 'front' | 'side' | 'full_body' | 'expression' | 'wide' | 'detail' | 'generated'
+  url: string
+  label?: string
+}
+
+export interface CharacterAssetVersion {
+  id: string
+  character_asset_id: string
+  version: number
+  description: string
+  age: string | null
+  gender: string | null
+  personality: string | null
+  style: string | null
+  appearance: string | null
+  costume: string | null
+  reference_images: AssetReferenceImage[]
+  created_at: string
+}
+
+export interface CharacterAsset {
+  id: string
+  library_id: string
+  name: string
+  description: string
+  status: string
+  versions: CharacterAssetVersion[]
+  created_at: string
+  updated_at: string
+}
+
+export interface SceneAssetVersion {
+  id: string
+  scene_asset_id: string
+  version: number
+  description: string
+  style: string | null
+  weather: string | null
+  time_of_day: string | null
+  location: string | null
+  environment: string | null
+  mood: string | null
+  reference_images: AssetReferenceImage[]
+  created_at: string
+}
+
+export interface SceneAsset {
+  id: string
+  library_id: string
+  name: string
+  description: string
+  status: string
+  versions: SceneAssetVersion[]
+  created_at: string
+  updated_at: string
+}
+
+/** AI 导演镜头是图片、视频和声音步骤的统一生产输入，而非自由文本。 */
+export interface DirectorShot {
+  id: string
+  shot_number: number
+  duration: number
+  character_ids: string[]
+  character_asset_version_ids: string[]
+  scene_id: string
+  scene_asset_version_id: string | null
+  action: string
+  emotion: string
+  camera_type: string
+  camera_move: string
+  lighting: string
+  image_prompt: string
+  video_prompt: string
+  sound_prompt: string
+  locked_keyframe_id: string | null
+  created_at: string
+}
+
+export interface DirectorPlanV1 {
+  id: string
+  project_id: string
+  story_proposal_id: string
+  workflow_run_id: string
+  visual_bible: Record<string, unknown>
+  status: string
+  shots: DirectorShot[]
+  created_at: string
+  updated_at: string
 }
 
 /** 模型槽位只描述要完成的能力，业务页面不依赖具体供应商名称。 */

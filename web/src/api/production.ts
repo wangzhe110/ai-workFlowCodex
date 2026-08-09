@@ -2,6 +2,7 @@
 import { request } from './http'
 import type {
   CharacterReferenceImageV1,
+  DirectorPlanV1,
   ModelSlot,
   ModelInvocationTrace,
   ModelQualityEvaluation,
@@ -28,6 +29,11 @@ const jsonPost = <T>(path: string, payload: object = {}): Promise<T> => request<
 /** 读取唯一 V1 工作流的当前阶段和冻结对象指针。 */
 export function getProductionState(projectId: string): Promise<ProductionState> {
   return request<ProductionState>(`/production/projects/${projectId}/state`)
+}
+
+/** 已冻结的结构化导演方案；只读，防止页面绕开模型/审核直接改分镜。 */
+export function getCurrentDirectorPlan(projectId: string): Promise<DirectorPlanV1 | null> {
+  return request<DirectorPlanV1 | null>(`/production/projects/${projectId}/director-plan`)
 }
 
 /** 查询该项目每次生成冻结的 Workflow、模型和 Prompt 版本，便于人工追溯问题。 */
@@ -76,12 +82,33 @@ export function lockCharacterReferenceImage(id: string, payload: ReviewActionPay
   return jsonPost<CharacterReferenceImageV1>(`/production/character-reference-images/${id}/lock`, payload)
 }
 
+/** 资产中心版本进入项目后仍是待锁定候选，不会跳过现有人工审核闸门。 */
+export function adoptCharacterAssetVersion(
+  projectId: string,
+  characterId: string,
+  assetVersionId: string,
+): Promise<CharacterReferenceImageV1> {
+  return jsonPost<CharacterReferenceImageV1>(
+    `/production/projects/${projectId}/characters/${characterId}/asset-versions/${assetVersionId}/adopt`,
+  )
+}
+
 export function getSceneReferenceImages(projectId: string): Promise<SceneReferenceImageV1[]> {
   return request<SceneReferenceImageV1[]>(`/production/projects/${projectId}/scene-reference-images`)
 }
 
 export function lockSceneReferenceImage(id: string, payload: ReviewActionPayload): Promise<SceneReferenceImageV1> {
   return jsonPost<SceneReferenceImageV1>(`/production/scene-reference-images/${id}/lock`, payload)
+}
+
+export function adoptSceneAssetVersion(
+  projectId: string,
+  sceneId: string,
+  assetVersionId: string,
+): Promise<SceneReferenceImageV1> {
+  return jsonPost<SceneReferenceImageV1>(
+    `/production/projects/${projectId}/scenes/${sceneId}/asset-versions/${assetVersionId}/adopt`,
+  )
 }
 
 export function getShotKeyframes(projectId: string): Promise<ShotKeyframeV1[]> {

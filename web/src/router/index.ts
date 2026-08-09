@@ -47,6 +47,8 @@ const router = createRouter({
       name: 'creative-library',
       component: () => import('@/views/CreativeLibraryView.vue'),
     },
+    // Phase 4：跨项目角色、场景资产库。项目采用仍会回到生产台走原有锁图审核。
+    { path: '/asset-library', name: 'asset-library', component: () => import('@/views/AssetLibraryView.vue') },
   ],
 })
 

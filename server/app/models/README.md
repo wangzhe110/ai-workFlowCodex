@@ -24,8 +24,10 @@ Commerce 与 LemonFlow V1 同库并存，**不读取也不改写** `ProjectProdu
 - `ScriptAsset` / `ScriptAnalysisVersion`：上传 `MediaAsset` 对应的脚本逻辑资产，以及
   时间轴转写、节拍、冲突、情绪曲线、章节和植入候选等不可覆盖分析版本。
 - `ProductAsset` / `ProductAnalysisVersion` / `ProductAssetVersion`：共享产品主体、原始
-  分析版本与人工确认的生产版本。生产版本只追加，包含外观、卖点、痛点、使用场景、
-  OCR 和多角度参考图；它不属于项目，项目删除不会影响共享产品。
+  分析版本与人工确认的生产版本。`ProductAnalysisVersion` 显式保存产品识别、包装 OCR、
+  候选多角度参考图、外观/卖点/痛点/使用场景候选，`raw_analysis` 只保留完整原始结果。
+  生产版本只追加，包含外观、卖点、痛点、使用场景、OCR 和多角度参考图；它不属于项目，
+  项目删除不会影响共享产品。来源媒体删除时，分析版本的来源外键会置空。
 - `ProjectProductSelection` / `StoryRun` / `StoryRunState`：项目选择具体产品版本；每个
   StoryRun 冻结该版本，并以 `run_number` 区分同一选题的重跑，维护自己的阶段与状态机。
 - `StoryOutlineVersion` / `ChapterPlan` / `SceneMappingVersion`：追加式大纲、章节顺序和
@@ -44,3 +46,7 @@ Commerce 与 LemonFlow V1 同库并存，**不读取也不改写** `ProjectProdu
 
 Commerce 的产品、脚本分析和大纲版本同样遵循追加原则：需要修订时创建下一版本，不
 覆盖已被项目、StoryRun 或批次快照引用的内容。
+
+数据库负责版本号/计划序号从 1 开始、片段和对白的绝对时长、植入目标三选一、批次
+成本和任务计数等单表规则。跨项目、跨 StoryRun、冻结版本和相对时长关系由
+`commerce_domain_service.py` 统一校验，不能在未来路由中各自实现。

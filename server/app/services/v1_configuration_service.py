@@ -556,6 +556,10 @@ def delete_v1_model_profile(db: Session, profile_id: str) -> None:
     ).all()
     for binding in bindings:
         db.delete(binding)
+    # ``ModelSlotProfileBinding`` 与 ``ModelProfile`` 没有 ORM 级 relationship，
+    # 因此不能依赖 Unit of Work 猜测两类 DELETE 的先后顺序。先落库解绑，才能在
+    # SQLite（已开启外键）和 PostgreSQL 上安全删除未产生历史的模型版本。
+    db.flush()
     db.delete(profile)
     db.commit()
 

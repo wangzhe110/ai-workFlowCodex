@@ -22,6 +22,8 @@ DATABASE_SCHEMA_MODE=migrate alembic upgrade head
 - `0009_phase4_asset_center_and_structured_shots`：跨项目角色/场景资产中心、项目采用引用与结构化导演分镜字段。
 - `0010_commerce_domain_foundation`：带货短剧的脚本/产品版本、独立 StoryRun、章节、
   片段/子镜头/对白、结构化植入和批量渲染聚合记录。
+- `0011_commerce_domain_integrity_fixes`：产品分析结构化候选字段、来源媒体 `SET NULL`
+  删除策略、Commerce 数值/定位 CHECK 约束与批次计数完整性。
 
 ## 新增迁移规则
 
@@ -34,3 +36,6 @@ DATABASE_SCHEMA_MODE=migrate alembic upgrade head
 
 `0010` 的回退只删除本次新增的 Commerce 表，可安全回到 `0009` 后再次升级；它不会
 触碰 `0009` 的资产中心表或任何历史项目数据。
+
+`0011` 可单独在 `0010 → 0011 → 0010 → 0011` 间往返：它只撤销自己的新增列、来源
+外键语义和约束，不会删除 0010 创建的任何表。

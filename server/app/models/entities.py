@@ -378,6 +378,11 @@ class MediaAsset(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     project: Mapped[Project] = relationship(back_populates="assets")
+    # 产品分析是共享产品资产的审计来源，不应阻止原项目清理媒体。来源视频删除时由
+    # 数据库 ``ON DELETE SET NULL`` 保留分析记录，ORM 不主动级联或删除它们。
+    product_analysis_versions: Mapped[list["ProductAnalysisVersion"]] = relationship(
+        back_populates="source_media_asset", passive_deletes=True
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +425,7 @@ class ScriptAnalysisVersion(Base):
     __tablename__ = "script_analysis_versions"
     __table_args__ = (
         UniqueConstraint("script_asset_id", "version", name="uq_script_analysis_version"),
+        CheckConstraint("version >= 1", name="ck_script_analysis_version_positive"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -477,6 +483,7 @@ class ProductAnalysisVersion(Base):
     __tablename__ = "product_analysis_versions"
     __table_args__ = (
         UniqueConstraint("product_asset_id", "version", name="uq_product_analysis_version"),
+        CheckConstraint("version >= 1", name="ck_product_analysis_version_positive"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -484,9 +491,20 @@ class ProductAnalysisVersion(Base):
         ForeignKey("product_assets.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     source_media_asset_id: Mapped[Optional[str]] = mapped_column(
-        ForeignKey("media_assets.id", ondelete="RESTRICT"), nullable=True, index=True
+        ForeignKey("media_assets.id", ondelete="SET NULL"), nullable=True, index=True
     )
     version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 这些字段保存可直接用于人工确认/生成版本的结构化候选；``raw_analysis`` 保留
+    # 供应商原始输出，便于后续解析器升级或人工追溯。
+    product_identification: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    package_ocr: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    candidate_reference_images: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    appearance_description_candidates: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
+    selling_point_candidates: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    user_pain_point_candidates: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    usage_scenario_candidates: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
     raw_analysis: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     analysis_status: Mapped[ProductAnalysisStatus] = mapped_column(
         SqlEnum(ProductAnalysisStatus, native_enum=False, create_constraint=True),
@@ -499,6 +517,9 @@ class ProductAnalysisVersion(Base):
     )
 
     product_asset: Mapped[ProductAsset] = relationship(back_populates="analyses")
+    source_media_asset: Mapped[Optional[MediaAsset]] = relationship(
+        back_populates="product_analysis_versions", foreign_keys=[source_media_asset_id]
+    )
 
 
 class ProductAssetVersion(Base):
@@ -507,6 +528,7 @@ class ProductAssetVersion(Base):
     __tablename__ = "product_asset_versions"
     __table_args__ = (
         UniqueConstraint("product_asset_id", "version", name="uq_product_asset_version"),
+        CheckConstraint("version >= 1", name="ck_product_asset_version_positive"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -565,6 +587,7 @@ class StoryRun(Base):
     __tablename__ = "story_runs"
     __table_args__ = (
         UniqueConstraint("project_id", "topic_candidate_id", "run_number", name="uq_story_run_topic_number"),
+        CheckConstraint("run_number >= 1", name="ck_story_run_number_positive"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -649,6 +672,7 @@ class StoryOutlineVersion(Base):
     __tablename__ = "story_outline_versions"
     __table_args__ = (
         UniqueConstraint("story_run_id", "version", name="uq_story_outline_version"),
+        CheckConstraint("version >= 1", name="ck_story_outline_version_positive"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -676,6 +700,7 @@ class ChapterPlan(Base):
     __tablename__ = "chapter_plans"
     __table_args__ = (
         UniqueConstraint("story_run_id", "chapter_number", name="uq_chapter_plan_number"),
+        CheckConstraint("chapter_number >= 1", name="ck_chapter_plan_number_positive"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -712,6 +737,7 @@ class SceneMappingVersion(Base):
     __tablename__ = "scene_mapping_versions"
     __table_args__ = (
         UniqueConstraint("story_run_id", "version", name="uq_scene_mapping_version"),
+        CheckConstraint("version >= 1", name="ck_scene_mapping_version_positive"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -739,6 +765,7 @@ class VideoSegmentPlan(Base):
             "target_duration_ms >= 4000 AND target_duration_ms <= 15000",
             name="ck_video_segment_duration_range",
         ),
+        CheckConstraint("segment_number >= 1", name="ck_video_segment_number_positive"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -782,6 +809,7 @@ class SubShotPlan(Base):
         CheckConstraint("start_ms >= 0", name="ck_sub_shot_start_nonnegative"),
         CheckConstraint("end_ms > start_ms", name="ck_sub_shot_end_after_start"),
         CheckConstraint("end_ms <= 15000", name="ck_sub_shot_end_maximum"),
+        CheckConstraint("shot_number >= 1", name="ck_sub_shot_number_positive"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -821,6 +849,7 @@ class DialogueLine(Base):
         ),
         CheckConstraint("start_ms >= 0", name="ck_dialogue_line_start_nonnegative"),
         CheckConstraint("end_ms > start_ms", name="ck_dialogue_line_end_after_start"),
+        CheckConstraint("end_ms <= 15000", name="ck_dialogue_line_end_maximum"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -846,8 +875,10 @@ class ProductPlacementPlan(Base):
     __tablename__ = "product_placement_plans"
     __table_args__ = (
         CheckConstraint(
-            "chapter_id IS NOT NULL OR video_segment_id IS NOT NULL OR sub_shot_id IS NOT NULL",
-            name="ck_product_placement_has_location",
+            "(chapter_id IS NOT NULL AND video_segment_id IS NULL AND sub_shot_id IS NULL) OR "
+            "(chapter_id IS NULL AND video_segment_id IS NOT NULL AND sub_shot_id IS NULL) OR "
+            "(chapter_id IS NULL AND video_segment_id IS NULL AND sub_shot_id IS NOT NULL)",
+            name="ck_product_placement_single_location",
         ),
         CheckConstraint("planned_duration_ms >= 0", name="ck_product_placement_duration_nonnegative"),
     )
@@ -893,10 +924,16 @@ class RenderBatch(Base):
     __tablename__ = "render_batches"
     __table_args__ = (
         UniqueConstraint("story_run_id", "batch_number", name="uq_render_batch_number"),
+        CheckConstraint("batch_number >= 1", name="ck_render_batch_number_positive"),
         CheckConstraint("total_tasks >= 0", name="ck_render_batch_total_nonnegative"),
         CheckConstraint("completed_tasks >= 0", name="ck_render_batch_completed_nonnegative"),
         CheckConstraint("failed_tasks >= 0", name="ck_render_batch_failed_nonnegative"),
         CheckConstraint("running_tasks >= 0", name="ck_render_batch_running_nonnegative"),
+        CheckConstraint("estimated_cost IS NULL OR estimated_cost >= 0", name="ck_render_batch_cost_nonnegative"),
+        CheckConstraint(
+            "completed_tasks + failed_tasks + running_tasks <= total_tasks",
+            name="ck_render_batch_task_counts_within_total",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)

@@ -505,7 +505,7 @@ def test_render_batch_reuses_existing_workflow_run(commerce_db) -> None:
 
 
 def test_alembic_commerce_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
-    """从空库升级、仅回退 0010、再升级后保持单一 Commerce schema。"""
+    """验证 0010 → 0011 → 0010 → 0011，且最终迁移链只有一个 head。"""
 
     server_root = Path(__file__).resolve().parents[1]
     database_path = tmp_path / "commerce-migration.db"
@@ -524,8 +524,9 @@ def test_alembic_commerce_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
 
     config = Config(str(server_root / "alembic.ini"))
     config.set_main_option("script_location", str(server_root / "migrations"))
-    assert ScriptDirectory.from_config(config).get_heads() == ["0010_commerce_domain_foundation"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["0011_commerce_domain_integrity_fixes"]
 
+    run_revision("upgrade", "0010_commerce_domain_foundation")
     run_revision("upgrade", "head")
     migration_engine = create_engine(migration_url)
     try:
@@ -535,10 +536,13 @@ def test_alembic_commerce_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
     finally:
         migration_engine.dispose()
 
-    run_revision("downgrade", "0009_phase4_asset_center_and_structured_shots")
+    run_revision("downgrade", "0010_commerce_domain_foundation")
     migration_engine = create_engine(migration_url)
     try:
-        assert "story_runs" not in inspect(migration_engine).get_table_names()
+        assert "story_runs" in inspect(migration_engine).get_table_names()
+        assert "product_identification" not in {
+            column["name"] for column in inspect(migration_engine).get_columns("product_analysis_versions")
+        }
     finally:
         migration_engine.dispose()
 
@@ -546,5 +550,8 @@ def test_alembic_commerce_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
     migration_engine = create_engine(migration_url)
     try:
         assert "render_batches" in inspect(migration_engine).get_table_names()
+        assert "product_identification" in {
+            column["name"] for column in inspect(migration_engine).get_columns("product_analysis_versions")
+        }
     finally:
         migration_engine.dispose()

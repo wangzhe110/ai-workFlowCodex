@@ -3,7 +3,7 @@
 from collections.abc import Generator
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -20,6 +20,20 @@ if settings.database_url.startswith("sqlite"):
     engine_options["connect_args"] = {"check_same_thread": False}
 
 engine = create_engine(settings.database_url, **engine_options)
+
+# SQLite 默认关闭外键，导致本地测试无法验证生产依赖的 CASCADE / SET NULL 语义。
+# 连接级启用后，开发 SQLite 与 PostgreSQL 的 Commerce 删除策略保持一致。
+if settings.database_url.startswith("sqlite"):
+    @event.listens_for(engine, "connect")
+    def _enable_sqlite_foreign_keys(dbapi_connection, _) -> None:
+        """让 SQLite 对每条新连接实际执行外键删除策略。"""
+
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA foreign_keys=ON")
+        finally:
+            cursor.close()
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 
 
@@ -56,7 +70,13 @@ def init_database() -> None:
 
     # 默认模型配置同样是可审计数据：本地建表或生产迁移完成后首次启动写入模拟
     # 配置，后续由配置中心新增版本并切换，历史工作流仍保留原来的快照。
+    from app.services.commerce_configuration_service import ensure_commerce_foundation
     from app.services.model_profile_service import ensure_default_profiles
+    from app.services.v1_configuration_service import ensure_v1_foundation
 
     with SessionLocal() as db:
         ensure_default_profiles(db)
+        # 两份工作流定义均以自身唯一业务键幂等创建。它们只补齐缺失的定义和配置，
+        # 不为旧项目创建 StoryRun，也不会切换任何项目的既有工作流。
+        ensure_v1_foundation(db)
+        ensure_commerce_foundation(db)

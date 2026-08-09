@@ -16,9 +16,10 @@
 - `asset_library_service.py`：资产中心的角色/场景版本、项目采用关系和旧锁图惰性补齐。它不调用模型、不改变生产阶段；采用资产仍必须回到现有锁图审核。
 - `commerce_configuration_service.py`：单独、幂等发布 `LEMONFLOW_COMMERCE` /
   `LemonFlow_Commerce_V1` 七节点定义；不会初始化或覆盖 V1 工作流、模型配置和项目状态。
-- `commerce_domain_service.py`：带货短剧的跨表领域校验。目前负责验证 `SubShotPlan` 的
-  时间不超过 `VideoSegmentPlan.target_duration_ms`；后续创建 Commerce 分镜的服务必须
-  经过该边界。
+- `commerce_domain_service.py`：带货短剧唯一的领域边界。它提供脚本/产品选择/
+  StoryRun/章节/场景映射/片段/对白/植入/渲染批次的创建与跨表归属校验，验证冻结产品
+  版本、同项目/同 StoryRun、相对时长和植入定位。它还提供脚本分析、产品生产版本和
+  故事大纲的“创建下一版本、状态转换、不可覆盖内容”规则；未来 API 不得绕过它。
 
 ## 任务与模型规则
 
@@ -30,3 +31,7 @@ Phase 4 的导演任务会把资产中心版本一并冻结。关键帧和视频
 
 Commerce 第一阶段仅建设数据库领域和工作流定义，不提供路由、前端、ASR/OCR 或模型
 调用。后续批量渲染仍必须复用本目录现有的 WorkflowRun/WorkflowStep 异步调度边界。
+
+应用启动会依次初始化旧模型默认配置、`LEMONFLOW_PRODUCTION` 和
+`LEMONFLOW_COMMERCE` 工作流定义。每一步都使用业务唯一键幂等补齐，初始化失败会直接
+向上抛出，绝不会静默跳过。

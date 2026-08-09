@@ -15,6 +15,32 @@
 - `VideoClip` / `FinalVideo`：独立镜头视频版本与冻结片段列表的成片版本。
 - `ModelSlot` / `ModelProfile` / `PromptTemplate` / `ModelInvocation` / `ModelQualityEvaluation`：可替换模型、Prompt、调用审计和人工质量统计。`ModelProfile` 的 `DRAFT` / `ACTIVE` / `HISTORICAL` 只描述版本生命周期；是否可编辑以“是否已存在 `ModelInvocation`”为准。
 
+## 带货短剧（Commerce）领域基础
+
+Commerce 与 LemonFlow V1 同库并存，**不读取也不改写** `ProjectProductionState`。它的
+核心单位是一个选题的一次独立 `StoryRun`，因此同一项目的不同选题、同一选题的重跑
+和不同产品版本都互不影响。
+
+- `ScriptAsset` / `ScriptAnalysisVersion`：上传 `MediaAsset` 对应的脚本逻辑资产，以及
+  时间轴转写、节拍、冲突、情绪曲线、章节和植入候选等不可覆盖分析版本。
+- `ProductAsset` / `ProductAnalysisVersion` / `ProductAssetVersion`：共享产品主体、原始
+  分析版本与人工确认的生产版本。生产版本只追加，包含外观、卖点、痛点、使用场景、
+  OCR 和多角度参考图；它不属于项目，项目删除不会影响共享产品。
+- `ProjectProductSelection` / `StoryRun` / `StoryRunState`：项目选择具体产品版本；每个
+  StoryRun 冻结该版本，并以 `run_number` 区分同一选题的重跑，维护自己的阶段与状态机。
+- `StoryOutlineVersion` / `ChapterPlan` / `SceneMappingVersion`：追加式大纲、章节顺序和
+  章节/片段/既有场景资产版本的映射快照。
+- `VideoSegmentPlan` / `SubShotPlan` / `DialogueLine`：最终 MP4 片段（4,000–15,000ms）、
+  片段内子镜头和可逐条查询的对白。子镜头的基础时间由数据库约束校验，跨表的父片段
+  时长由 `commerce_domain_service` 校验。
+- `ProductPlacementPlan`：绑定 StoryRun 和冻结的 `ProductAssetVersion`，用枚举保存植入
+  方式与强度，并定位章节、片段或子镜头。
+- `RenderBatch`：批量渲染的进度、成本与参数快照；只关联并复用既有 `WorkflowRun` /
+  `WorkflowStep`，不创建第二套任务调度系统。
+
 ## 不可覆盖规则
 
 锁定、选择或审核不是“修改原记录”，而是创建审核事件并更新父对象当前指针。每个镜头只有 `selected_video_clip_id` 指向当前采用版本；被驳回或过期的片段保留历史，但不会阻挡最终闸门或成片合成。
+
+Commerce 的产品、脚本分析和大纲版本同样遵循追加原则：需要修订时创建下一版本，不
+覆盖已被项目、StoryRun 或批次快照引用的内容。

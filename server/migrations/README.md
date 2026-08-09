@@ -19,6 +19,9 @@ DATABASE_SCHEMA_MODE=migrate alembic upgrade head
 - `0006_v1_quality_review_metrics`：模型质量人工评分、采用率等指标。
 - `0007_v1_production_integrity`：视频当前采用指针、冻结快照补全、任务/调用幂等键、镜头子任务供应商任务号和数据库唯一约束。
 - `0008_v1_model_profile_editing`：模型配置版本的 `DRAFT` / `ACTIVE` / `HISTORICAL` 生命周期状态，支持安全编辑与复制新版本。
+- `0009_phase4_asset_center_and_structured_shots`：跨项目角色/场景资产中心、项目采用引用与结构化导演分镜字段。
+- `0010_commerce_domain_foundation`：带货短剧的脚本/产品版本、独立 StoryRun、章节、
+  片段/子镜头/对白、结构化植入和批量渲染聚合记录。
 
 ## 新增迁移规则
 
@@ -28,3 +31,6 @@ DATABASE_SCHEMA_MODE=migrate alembic upgrade head
 4. 审查索引、唯一约束、默认值和旧数据回填；任何不可逆数据变更先备份。
 
 早期迁移对已有列采用兼容检查，支持空数据库和已升级旧版本继续到 `head`。结构以实际迁移文件为准。
+
+`0010` 的回退只删除本次新增的 Commerce 表，可安全回到 `0009` 后再次升级；它不会
+触碰 `0009` 的资产中心表或任何历史项目数据。

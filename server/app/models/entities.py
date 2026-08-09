@@ -212,6 +212,117 @@ class PromptTemplateStatus(str, Enum):
     ARCHIVED = "ARCHIVED"
 
 
+# ---------------------------------------------------------------------------
+# 带货短剧（Commerce）工作流的领域枚举。
+#
+# 它们不复用 V1 的 ``ProductionStage``：V1 仍服务于参考视频二创主流程，而
+# Commerce 是一个可与 V1 并存、以选题独立运行和产品版本冻结为核心的新工作流。
+# ---------------------------------------------------------------------------
+
+
+class ScriptAnalysisStatus(str, Enum):
+    """脚本分析版本的执行状态；分析结果只追加新版本，绝不原地覆盖。"""
+
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+
+
+class ProductAnalysisStatus(str, Enum):
+    """产品原始素材分析版本的执行状态。"""
+
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+
+
+class ProductAssetVersionStatus(str, Enum):
+    """产品生产版本的人工可用状态。"""
+
+    DRAFT = "DRAFT"
+    CONFIRMED = "CONFIRMED"
+    ARCHIVED = "ARCHIVED"
+
+
+class StoryRunMode(str, Enum):
+    """带货短剧运行的推进方式。"""
+
+    STEPWISE = "STEPWISE"
+    AUTO = "AUTO"
+
+
+class StoryRunStage(str, Enum):
+    """Commerce 工作流专用阶段，独立于项目级 V1 生产状态。"""
+
+    TOPIC = "TOPIC"
+    OUTLINE = "OUTLINE"
+    CHAPTERS = "CHAPTERS"
+    STORYBOARD = "STORYBOARD"
+    VISUAL_ASSETS = "VISUAL_ASSETS"
+    VIDEO_PROMPTS = "VIDEO_PROMPTS"
+    SEGMENT_RENDER = "SEGMENT_RENDER"
+    COMPLETED = "COMPLETED"
+
+
+class StoryRunStatus(str, Enum):
+    """一个选题的独立带货短剧运行状态。"""
+
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    PAUSED = "PAUSED"
+    FAILED = "FAILED"
+    COMPLETED = "COMPLETED"
+    CANCELLED = "CANCELLED"
+
+
+class OutlineVersionStatus(str, Enum):
+    """大纲版本的人工确认状态。"""
+
+    DRAFT = "DRAFT"
+    LOCKED = "LOCKED"
+    SUPERSEDED = "SUPERSEDED"
+
+
+class SegmentPlanStatus(str, Enum):
+    """视频片段规划状态；实际任务仍由 WorkflowRun/WorkflowStep 调度。"""
+
+    DRAFT = "DRAFT"
+    READY = "READY"
+    RENDERING = "RENDERING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
+class ProductPlacementMethod(str, Enum):
+    """结构化产品植入方式，避免只用不可检索的自由文本。"""
+
+    SOFT_PROP = "SOFT_PROP"
+    EXPERIENCE_DEMO = "EXPERIENCE_DEMO"
+    VOICEOVER = "VOICEOVER"
+    HYBRID = "HYBRID"
+
+
+class ProductPlacementStrength(str, Enum):
+    """产品植入强度。"""
+
+    LIGHT = "LIGHT"
+    MEDIUM = "MEDIUM"
+    STRONG = "STRONG"
+
+
+class RenderBatchStatus(str, Enum):
+    """批量片段生成的聚合状态，而非另一套任务调度系统。"""
+
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    PARTIAL_FAILED = "PARTIAL_FAILED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
 class Project(Base):
     """一个从参考素材到原创产物的工作空间。"""
 
@@ -239,6 +350,17 @@ class Project(Base):
     storyboard_images: Mapped[list["StoryboardImage"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     video_clips: Mapped[list["VideoClip"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     final_videos: Mapped[list["FinalVideo"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+    # Commerce 运行与项目同生命周期；其产品资产版本仍是共享资产，绝不会被这条
+    # 级联关系删除。
+    script_assets: Mapped[list["ScriptAsset"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    project_product_selections: Mapped[list["ProjectProductSelection"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    story_runs: Mapped[list["StoryRun"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
 
 
 class MediaAsset(Base):
@@ -256,6 +378,553 @@ class MediaAsset(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     project: Mapped[Project] = relationship(back_populates="assets")
+
+
+# ---------------------------------------------------------------------------
+# 带货短剧领域基础。
+#
+# 以下表只表达新的 Commerce 工作流事实，不会修改 V1 的 ProjectProductionState、
+# StoryProposal、ShotPlan 或旧项目数据。产品主体没有 project_id，因此是共享资产；
+# 项目和 StoryRun 只保存“采用哪个冻结版本”的引用。
+# ---------------------------------------------------------------------------
+
+
+class ScriptAsset(Base):
+    """一个可分析、可版本化的脚本逻辑资产，来源于上传的 ``MediaAsset``。"""
+
+    __tablename__ = "script_assets"
+    __table_args__ = (UniqueConstraint("media_asset_id", name="uq_script_asset_media_asset"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    media_asset_id: Mapped[str] = mapped_column(
+        ForeignKey("media_assets.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(180), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="script_assets")
+    analyses: Mapped[list["ScriptAnalysisVersion"]] = relationship(
+        back_populates="script_asset", cascade="all, delete-orphan", order_by="ScriptAnalysisVersion.version"
+    )
+
+
+class ScriptAnalysisVersion(Base):
+    """脚本分析的不可覆盖快照；真实视频分析将在后续阶段填充这些字段。"""
+
+    __tablename__ = "script_analysis_versions"
+    __table_args__ = (
+        UniqueConstraint("script_asset_id", "version", name="uq_script_analysis_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    script_asset_id: Mapped[str] = mapped_column(
+        ForeignKey("script_assets.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    timeline_transcript: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    story_beats: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    role_archetypes: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    conflicts: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    turning_points: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    emotional_curve: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    chapter_candidates: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    product_slot_candidates: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    narrative_function_sequence: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    raw_analysis: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    analysis_status: Mapped[ScriptAnalysisStatus] = mapped_column(
+        SqlEnum(ScriptAnalysisStatus, native_enum=False, create_constraint=True),
+        default=ScriptAnalysisStatus.PENDING,
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    script_asset: Mapped[ScriptAsset] = relationship(back_populates="analyses")
+
+
+class ProductAsset(Base):
+    """跨项目共享的产品逻辑主体；任何可生产内容都必须引用其冻结版本。"""
+
+    __tablename__ = "product_assets"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(String(180), nullable=False, index=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    analyses: Mapped[list["ProductAnalysisVersion"]] = relationship(
+        back_populates="product_asset", cascade="all, delete-orphan", order_by="ProductAnalysisVersion.version"
+    )
+    versions: Mapped[list["ProductAssetVersion"]] = relationship(
+        back_populates="product_asset", cascade="all, delete-orphan", order_by="ProductAssetVersion.version"
+    )
+
+
+class ProductAnalysisVersion(Base):
+    """产品原始视频/素材的分析版本，供人工整理为生产版本。"""
+
+    __tablename__ = "product_analysis_versions"
+    __table_args__ = (
+        UniqueConstraint("product_asset_id", "version", name="uq_product_analysis_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    product_asset_id: Mapped[str] = mapped_column(
+        ForeignKey("product_assets.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    source_media_asset_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("media_assets.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    raw_analysis: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    analysis_status: Mapped[ProductAnalysisStatus] = mapped_column(
+        SqlEnum(ProductAnalysisStatus, native_enum=False, create_constraint=True),
+        default=ProductAnalysisStatus.PENDING,
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    product_asset: Mapped[ProductAsset] = relationship(back_populates="analyses")
+
+
+class ProductAssetVersion(Base):
+    """人工确认后可冻结给 StoryRun 使用的产品生产版本。"""
+
+    __tablename__ = "product_asset_versions"
+    __table_args__ = (
+        UniqueConstraint("product_asset_id", "version", name="uq_product_asset_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    product_asset_id: Mapped[str] = mapped_column(
+        ForeignKey("product_assets.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    source_analysis_version_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("product_analysis_versions.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    product_name: Mapped[str] = mapped_column(String(180), nullable=False)
+    appearance_description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    selling_points: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    user_pain_points: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    usage_scenarios: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    package_ocr: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    reference_images: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    status: Mapped[ProductAssetVersionStatus] = mapped_column(
+        SqlEnum(ProductAssetVersionStatus, native_enum=False, create_constraint=True),
+        default=ProductAssetVersionStatus.DRAFT,
+        nullable=False,
+    )
+    frozen_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    product_asset: Mapped[ProductAsset] = relationship(back_populates="versions")
+
+
+class ProjectProductSelection(Base):
+    """项目采用的具体产品版本；删除项目只删除该引用，不会删除共享产品。"""
+
+    __tablename__ = "project_product_selections"
+    __table_args__ = (
+        UniqueConstraint("project_id", "product_asset_version_id", name="uq_project_product_version_selection"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    product_asset_id: Mapped[str] = mapped_column(
+        ForeignKey("product_assets.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    product_asset_version_id: Mapped[str] = mapped_column(
+        ForeignKey("product_asset_versions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    selected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    project: Mapped[Project] = relationship(back_populates="project_product_selections")
+
+
+class StoryRun(Base):
+    """一个选题的一次独立带货短剧运行，冻结其采用的产品版本。"""
+
+    __tablename__ = "story_runs"
+    __table_args__ = (
+        UniqueConstraint("project_id", "topic_candidate_id", "run_number", name="uq_story_run_topic_number"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    topic_candidate_id: Mapped[str] = mapped_column(
+        ForeignKey("topic_candidates.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_product_selection_id: Mapped[str] = mapped_column(
+        ForeignKey("project_product_selections.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # 此列是运行创建时的冻结指针，不能靠项目当前产品选择倒推。
+    product_asset_version_id: Mapped[str] = mapped_column(
+        ForeignKey("product_asset_versions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    run_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    mode: Mapped[StoryRunMode] = mapped_column(
+        SqlEnum(StoryRunMode, native_enum=False, create_constraint=True),
+        default=StoryRunMode.STEPWISE,
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="story_runs")
+    state: Mapped["StoryRunState"] = relationship(
+        back_populates="story_run", cascade="all, delete-orphan", uselist=False
+    )
+    outlines: Mapped[list["StoryOutlineVersion"]] = relationship(
+        back_populates="story_run", cascade="all, delete-orphan", order_by="StoryOutlineVersion.version"
+    )
+    chapters: Mapped[list["ChapterPlan"]] = relationship(
+        back_populates="story_run", cascade="all, delete-orphan", order_by="ChapterPlan.chapter_number"
+    )
+    scene_mappings: Mapped[list["SceneMappingVersion"]] = relationship(
+        back_populates="story_run", cascade="all, delete-orphan", order_by="SceneMappingVersion.version"
+    )
+    segments: Mapped[list["VideoSegmentPlan"]] = relationship(
+        back_populates="story_run", cascade="all, delete-orphan", order_by="VideoSegmentPlan.segment_number"
+    )
+    placements: Mapped[list["ProductPlacementPlan"]] = relationship(
+        back_populates="story_run", cascade="all, delete-orphan"
+    )
+    render_batches: Mapped[list["RenderBatch"]] = relationship(
+        back_populates="story_run", cascade="all, delete-orphan", order_by="RenderBatch.batch_number"
+    )
+
+
+class StoryRunState(Base):
+    """Commerce 运行自己的状态机；不读写 ``ProjectProductionState``。"""
+
+    __tablename__ = "story_run_states"
+
+    story_run_id: Mapped[str] = mapped_column(
+        ForeignKey("story_runs.id", ondelete="CASCADE"), primary_key=True
+    )
+    current_stage: Mapped[StoryRunStage] = mapped_column(
+        SqlEnum(StoryRunStage, native_enum=False, create_constraint=True),
+        default=StoryRunStage.TOPIC,
+        nullable=False,
+    )
+    status: Mapped[StoryRunStatus] = mapped_column(
+        SqlEnum(StoryRunStatus, native_enum=False, create_constraint=True),
+        default=StoryRunStatus.PENDING,
+        nullable=False,
+    )
+    stage_data: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    story_run: Mapped[StoryRun] = relationship(back_populates="state")
+
+
+class StoryOutlineVersion(Base):
+    """按 StoryRun 追加保存的故事大纲版本。"""
+
+    __tablename__ = "story_outline_versions"
+    __table_args__ = (
+        UniqueConstraint("story_run_id", "version", name="uq_story_outline_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    story_run_id: Mapped[str] = mapped_column(
+        ForeignKey("story_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str] = mapped_column(String(180), nullable=False)
+    premise: Mapped[str] = mapped_column(Text, nullable=False)
+    story_beats: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    product_placement_strategy: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[OutlineVersionStatus] = mapped_column(
+        SqlEnum(OutlineVersionStatus, native_enum=False, create_constraint=True),
+        default=OutlineVersionStatus.DRAFT,
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    story_run: Mapped[StoryRun] = relationship(back_populates="outlines")
+
+
+class ChapterPlan(Base):
+    """一个 StoryRun 的章节规划；章节顺序在同一运行内唯一。"""
+
+    __tablename__ = "chapter_plans"
+    __table_args__ = (
+        UniqueConstraint("story_run_id", "chapter_number", name="uq_chapter_plan_number"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    story_run_id: Mapped[str] = mapped_column(
+        ForeignKey("story_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    outline_version_id: Mapped[str] = mapped_column(
+        ForeignKey("story_outline_versions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    chapter_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str] = mapped_column(String(180), nullable=False)
+    narrative_purpose: Mapped[str] = mapped_column(Text, nullable=False)
+    content_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    product_plan: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    story_run: Mapped[StoryRun] = relationship(back_populates="chapters")
+    segments: Mapped[list["VideoSegmentPlan"]] = relationship(
+        back_populates="chapter", cascade="all, delete-orphan", order_by="VideoSegmentPlan.segment_number"
+    )
+
+
+class SceneMappingVersion(Base):
+    """章节、片段与已存在场景资产版本之间的版本化映射快照。
+
+    ``mapping_snapshot`` 的每项可保存 ``chapter_id``、``video_segment_id``、
+    ``scene_asset_id``、``scene_asset_version_id`` 等 ID。使用 JSON 快照是为了在本
+    阶段不复制 Phase 4 的 ``SceneAssetVersion`` 表，同时冻结未来实际渲染要用的映射。
+    """
+
+    __tablename__ = "scene_mapping_versions"
+    __table_args__ = (
+        UniqueConstraint("story_run_id", "version", name="uq_scene_mapping_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    story_run_id: Mapped[str] = mapped_column(
+        ForeignKey("story_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    outline_version_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("story_outline_versions.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    mapping_snapshot: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="DRAFT")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    story_run: Mapped[StoryRun] = relationship(back_populates="scene_mappings")
+
+
+class VideoSegmentPlan(Base):
+    """最终渲染为一个独立 MP4 的 4 至 15 秒视频片段规划。"""
+
+    __tablename__ = "video_segment_plans"
+    __table_args__ = (
+        UniqueConstraint("story_run_id", "segment_number", name="uq_video_segment_plan_number"),
+        CheckConstraint(
+            "target_duration_ms >= 4000 AND target_duration_ms <= 15000",
+            name="ck_video_segment_duration_range",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    story_run_id: Mapped[str] = mapped_column(
+        ForeignKey("story_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    chapter_id: Mapped[str] = mapped_column(
+        ForeignKey("chapter_plans.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    segment_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    target_duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    narrative_target: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[SegmentPlanStatus] = mapped_column(
+        SqlEnum(SegmentPlanStatus, native_enum=False, create_constraint=True),
+        default=SegmentPlanStatus.DRAFT,
+        nullable=False,
+    )
+    video_prompt_version: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    video_prompt_trace: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    story_run: Mapped[StoryRun] = relationship(back_populates="segments")
+    chapter: Mapped[ChapterPlan] = relationship(back_populates="segments")
+    sub_shots: Mapped[list["SubShotPlan"]] = relationship(
+        back_populates="video_segment", cascade="all, delete-orphan", order_by="SubShotPlan.shot_number"
+    )
+    dialogue_lines: Mapped[list["DialogueLine"]] = relationship(
+        back_populates="video_segment", cascade="all, delete-orphan"
+    )
+
+
+class SubShotPlan(Base):
+    """片段内部子镜头，时间以片段起点为零的毫秒相对时间保存。"""
+
+    __tablename__ = "sub_shot_plans"
+    __table_args__ = (
+        UniqueConstraint("video_segment_id", "shot_number", name="uq_sub_shot_plan_number"),
+        CheckConstraint("start_ms >= 0", name="ck_sub_shot_start_nonnegative"),
+        CheckConstraint("end_ms > start_ms", name="ck_sub_shot_end_after_start"),
+        CheckConstraint("end_ms <= 15000", name="ck_sub_shot_end_maximum"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    video_segment_id: Mapped[str] = mapped_column(
+        ForeignKey("video_segment_plans.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    shot_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    character_refs: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    emotion: Mapped[str] = mapped_column(Text, nullable=False)
+    shot_scale: Mapped[str] = mapped_column(String(80), nullable=False)
+    camera_move: Mapped[str] = mapped_column(Text, nullable=False)
+    lighting: Mapped[str] = mapped_column(Text, nullable=False)
+    visual_description: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    video_segment: Mapped[VideoSegmentPlan] = relationship(back_populates="sub_shots")
+    dialogue_lines: Mapped[list["DialogueLine"]] = relationship(
+        back_populates="sub_shot", cascade="all, delete-orphan"
+    )
+
+
+class DialogueLine(Base):
+    """可单独查询和计时的对白；必须归属片段或具体子镜头中的一个。"""
+
+    __tablename__ = "dialogue_lines"
+    __table_args__ = (
+        CheckConstraint(
+            "(video_segment_id IS NOT NULL AND sub_shot_id IS NULL) OR "
+            "(video_segment_id IS NULL AND sub_shot_id IS NOT NULL)",
+            name="ck_dialogue_line_single_owner",
+        ),
+        CheckConstraint("start_ms >= 0", name="ck_dialogue_line_start_nonnegative"),
+        CheckConstraint("end_ms > start_ms", name="ck_dialogue_line_end_after_start"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    video_segment_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("video_segment_plans.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    sub_shot_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("sub_shot_plans.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    speaker: Mapped[str] = mapped_column(String(160), nullable=False)
+    dialogue: Mapped[str] = mapped_column(Text, nullable=False)
+    start_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    video_segment: Mapped[Optional[VideoSegmentPlan]] = relationship(back_populates="dialogue_lines")
+    sub_shot: Mapped[Optional[SubShotPlan]] = relationship(back_populates="dialogue_lines")
+
+
+class ProductPlacementPlan(Base):
+    """StoryRun 中对冻结产品版本的结构化植入计划。"""
+
+    __tablename__ = "product_placement_plans"
+    __table_args__ = (
+        CheckConstraint(
+            "chapter_id IS NOT NULL OR video_segment_id IS NOT NULL OR sub_shot_id IS NOT NULL",
+            name="ck_product_placement_has_location",
+        ),
+        CheckConstraint("planned_duration_ms >= 0", name="ck_product_placement_duration_nonnegative"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    story_run_id: Mapped[str] = mapped_column(
+        ForeignKey("story_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    product_asset_version_id: Mapped[str] = mapped_column(
+        ForeignKey("product_asset_versions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    chapter_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("chapter_plans.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    video_segment_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("video_segment_plans.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    sub_shot_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("sub_shot_plans.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    placement_method: Mapped[ProductPlacementMethod] = mapped_column(
+        SqlEnum(ProductPlacementMethod, native_enum=False, create_constraint=True), nullable=False
+    )
+    placement_strength: Mapped[ProductPlacementStrength] = mapped_column(
+        SqlEnum(ProductPlacementStrength, native_enum=False, create_constraint=True), nullable=False
+    )
+    pain_point_trigger: Mapped[str] = mapped_column(Text, nullable=False)
+    product_action: Mapped[str] = mapped_column(Text, nullable=False)
+    ad_entry_point: Mapped[str] = mapped_column(Text, nullable=False)
+    story_recovery_point: Mapped[str] = mapped_column(Text, nullable=False)
+    planned_duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    story_run: Mapped[StoryRun] = relationship(back_populates="placements")
+
+
+class RenderBatch(Base):
+    """一次批量视频片段生成的聚合记录，实际子任务仍复用既有 WorkflowRun/Step。"""
+
+    __tablename__ = "render_batches"
+    __table_args__ = (
+        UniqueConstraint("story_run_id", "batch_number", name="uq_render_batch_number"),
+        CheckConstraint("total_tasks >= 0", name="ck_render_batch_total_nonnegative"),
+        CheckConstraint("completed_tasks >= 0", name="ck_render_batch_completed_nonnegative"),
+        CheckConstraint("failed_tasks >= 0", name="ck_render_batch_failed_nonnegative"),
+        CheckConstraint("running_tasks >= 0", name="ck_render_batch_running_nonnegative"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    story_run_id: Mapped[str] = mapped_column(
+        ForeignKey("story_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    workflow_run_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("workflow_runs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    batch_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[RenderBatchStatus] = mapped_column(
+        SqlEnum(RenderBatchStatus, native_enum=False, create_constraint=True),
+        default=RenderBatchStatus.PENDING,
+        nullable=False,
+    )
+    total_tasks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completed_tasks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_tasks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    running_tasks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    model_config_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    generation_parameters_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    estimated_cost: Mapped[Optional[float]] = mapped_column(Numeric(14, 6), nullable=True)
+    currency: Mapped[str] = mapped_column(String(12), nullable=False, default="CNY")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    story_run: Mapped[StoryRun] = relationship(back_populates="render_batches")
 
 
 # ---------------------------------------------------------------------------

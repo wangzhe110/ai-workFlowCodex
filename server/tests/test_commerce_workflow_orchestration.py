@@ -2,6 +2,7 @@
 
 import ast
 import inspect
+import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -1413,6 +1414,143 @@ def test_retry_rejects_stale_failed_attempt_and_accepts_latest(commerce_db):
     assert created and _stage_steps(parent, StoryRunStage.OUTLINE)[-1].attempt == 3
 
 
+def test_auto_mode_locks_prompts_and_reaches_completed_after_required_review_gates(commerce_db):
+    """回归 1：AUTO 不伪造提示词审核，但必须能采用 LOCKED attempt 完成渲染。"""
+
+    project, topic, selection, _ = _context(commerce_db, mode=StoryRunMode.AUTO)
+    story_run = create_next_story_run(
+        commerce_db, project_id=project.id, topic_candidate_id=topic.id,
+        project_product_selection_id=selection.id, mode=StoryRunMode.AUTO,
+    )
+    _, parent, _ = start_story_run(commerce_db, story_run.id)
+    _execute(parent)  # OUTLINE -> PAUSED
+    _confirm(commerce_db, story_run, StoryRunStage.OUTLINE)
+    _, parent, _ = continue_story_run(commerce_db, story_run.id)
+    _execute(parent)  # CHAPTERS -> 自动创建 STORYBOARD
+    _execute(parent)  # STORYBOARD -> PAUSED
+    assert story_run.state.current_stage == StoryRunStage.STORYBOARD
+    _confirm(commerce_db, story_run, StoryRunStage.STORYBOARD)
+    _, parent, _ = continue_story_run(commerce_db, story_run.id)
+    _execute(parent)  # VISUAL_ASSETS -> PAUSED
+    _confirm(commerce_db, story_run, StoryRunStage.VISUAL_ASSETS)
+    _, parent, _ = continue_story_run(commerce_db, story_run.id)
+    _execute(parent)  # VIDEO_PROMPTS -> 自动锁定并创建 SEGMENT_RENDER
+
+    commerce_db.expire_all()
+    parent = commerce_db.get(WorkflowRun, parent.id)
+    prompt_step = _stage_steps(parent, StoryRunStage.VIDEO_PROMPTS)[-1]
+    prompt_ids = prompt_step.output_payload["artifact_references"]["video_prompt_version_ids"]
+    prompts = [commerce_db.get(VideoPromptVersion, item_id) for item_id in prompt_ids]
+    assert all(item.status == "LOCKED" and item.locked_at is not None for item in prompts)
+    assert commerce_db.scalar(
+        select(func.count()).select_from(ReviewDecision).where(
+            ReviewDecision.target_type == "COMMERCE_STAGE_VIDEO_PROMPTS",
+            ReviewDecision.target_id == prompt_step.id,
+        )
+    ) == 0
+
+    _execute(parent)  # SEGMENT_RENDER reads the AUTO-adopted locked prompt attempt.
+    commerce_db.expire_all()
+    assert commerce_db.get(StoryRun, story_run.id).state.current_stage == StoryRunStage.SEGMENT_RENDER
+    assert commerce_db.get(StoryRun, story_run.id).state.status == StoryRunStatus.PAUSED
+    _confirm(commerce_db, story_run, StoryRunStage.SEGMENT_RENDER)
+    commerce_db.expire_all()
+    finished = commerce_db.get(StoryRun, story_run.id)
+    assert finished.state.current_stage == StoryRunStage.COMPLETED
+    assert finished.state.status == StoryRunStatus.COMPLETED
+
+
+def test_retry_rejects_old_failed_step_when_attempt_three_is_active_and_nonfailed_step(commerce_db):
+    """回归 7/8：仅失败的最新 predecessor 可复用紧邻的活动 retry。"""
+
+    project, topic, selection, mode = _context(commerce_db)
+    story_run = create_next_story_run(
+        commerce_db, project_id=project.id, topic_candidate_id=topic.id,
+        project_product_selection_id=selection.id, mode=mode,
+    )
+    _, parent, _ = start_story_run(commerce_db, story_run.id)
+    first = _stage_steps(parent, StoryRunStage.OUTLINE)[0]
+    first.model_profile_snapshot["model_bindings"]["STORY_GENERATE"][0]["profile_snapshot"]["adapter_key"] = "unsupported"
+    flag_modified(first, "model_profile_snapshot")
+    commerce_db.commit()
+    _execute(parent)
+    _, parent, _ = retry_step(commerce_db, story_run.id, first.id)
+    second = _stage_steps(parent, StoryRunStage.OUTLINE)[-1]
+    second.model_profile_snapshot["model_bindings"]["STORY_GENERATE"][0]["profile_snapshot"]["adapter_key"] = "unsupported"
+    flag_modified(second, "model_profile_snapshot")
+    commerce_db.commit()
+    _execute(parent)
+    _, parent, _ = retry_step(commerce_db, story_run.id, second.id)  # attempt 3 is active.
+    third = _stage_steps(parent, StoryRunStage.OUTLINE)[-1]
+    assert third.attempt == 3 and third.status == RunStatus.PENDING
+
+    with pytest.raises(HTTPException) as stale_attempt_one:
+        retry_step(commerce_db, story_run.id, first.id)
+    assert stale_attempt_one.value.status_code == 409
+
+    # A successfully completed attempt cannot be retried even if the caller has
+    # a valid StoryRun ID; it must not be mistaken for an idempotent retry.
+    completed = create_next_story_run(
+        commerce_db, project_id=project.id, topic_candidate_id=topic.id,
+        project_product_selection_id=selection.id, mode=mode,
+    )
+    _, completed_parent, _ = start_story_run(commerce_db, completed.id)
+    _execute(completed_parent)
+    succeeded_outline = _stage_steps(completed_parent, StoryRunStage.OUTLINE)[0]
+    with pytest.raises(HTTPException) as non_failed:
+        retry_step(commerce_db, completed.id, succeeded_outline.id)
+    assert non_failed.value.status_code == 409
+
+
+def test_storyboard_retry_does_not_adopt_rejected_chapter_level_placement(commerce_db):
+    """回归 9：显式 product_placement_ids 隔离同章的历史被驳回植入。"""
+
+    project, topic, selection, mode = _context(commerce_db)
+    story_run = create_next_story_run(
+        commerce_db, project_id=project.id, topic_candidate_id=topic.id,
+        project_product_selection_id=selection.id, mode=mode,
+    )
+    parent = _run_to_storyboard_pause(commerce_db, story_run)
+    first_board = _stage_steps(parent, StoryRunStage.STORYBOARD)[0]
+    first_refs = first_board.output_payload["artifact_references"]
+    old_placement = create_product_placement_plan(
+        commerce_db,
+        story_run_id=story_run.id,
+        product_asset_version_id=story_run.product_asset_version_id,
+        chapter_id=first_refs["chapter_ids"][0],
+        video_segment_id=None,
+        sub_shot_id=None,
+        placement_method=ProductPlacementMethod.SOFT_PROP,
+        placement_strength=ProductPlacementStrength.LIGHT,
+        pain_point_trigger="旧 attempt 的章节级痛点",
+        product_action="旧植入动作",
+        ad_entry_point="旧进入点",
+        story_recovery_point="旧恢复点",
+        planned_duration_ms=800,
+    )
+    first_board.output_payload = {
+        **first_board.output_payload,
+        "artifact_references": {
+            **first_refs,
+            "product_placement_ids": [*first_refs["product_placement_ids"], old_placement.id],
+        },
+    }
+    flag_modified(first_board, "output_payload")
+    commerce_db.commit()
+    review_stage(
+        commerce_db, story_run_id=story_run.id, stage=StoryRunStage.STORYBOARD,
+        decision="REJECTED", reviewer_label="分镜审核", note="重做", quality_score=3,
+    )
+    _, parent, _ = continue_story_run(commerce_db, story_run.id)
+    _execute(parent)
+    commerce_db.expire_all()
+    second_board = _stage_steps(commerce_db.get(WorkflowRun, parent.id), StoryRunStage.STORYBOARD)[-1]
+    second_refs = second_board.output_payload["artifact_references"]
+    assert old_placement.id not in second_refs["product_placement_ids"]
+    _confirm(commerce_db, story_run, StoryRunStage.STORYBOARD)
+    assert story_run.state.current_stage == StoryRunStage.VISUAL_ASSETS
+
+
 def test_0012_nonempty_round_trip_preserves_existing_workflow_runs(tmp_path):
     """0012 不回填历史，也必须在非空 0011 数据上安全往返。"""
 
@@ -1698,6 +1836,270 @@ def test_0013_sqlite_integrity_triggers_and_nonempty_round_trip(tmp_path):
         "uq_commerce_workflow_step_attempt",
         "uq_active_commerce_workflow_step",
     }.issubset(indexes_up_again)
+
+
+def test_0014_backfills_published_phase2_data_and_rejects_unrepairable_sidecars(tmp_path):
+    """0014 为非空 0012/0013 数据补齐 attempt 与审核语义，且拒绝坏 sidecar。"""
+
+    database_url = f"sqlite:///{tmp_path / 'commerce-0014-compatibility.db'}"
+    server_root = Path(__file__).resolve().parents[1]
+    now = datetime.now(timezone.utc)
+    ids = {name: str(uuid4()) for name in (
+        "project", "legacy_run", "legacy_step", "topic", "product", "analysis", "product_version", "selection",
+        "story_run", "outline", "chapter", "segment", "commerce_run", "chapters_step",
+        "storyboard_step", "segment_placement",
+        "prompt_draft_step", "prompt_approved_step", "prompt_rejected_step",
+        "prompt_draft", "prompt_approved", "prompt_rejected", "approved_review", "rejected_review",
+        "auto_topic", "auto_story_run", "auto_commerce_run", "auto_prompt_step", "auto_prompt",
+    )}
+
+    def migrate(revision: str, *, downgrade: bool = False) -> None:
+        config = Config(str(server_root / "alembic.ini"))
+        config.set_main_option("script_location", str(server_root / "migrations"))
+        migration_engine = create_engine(database_url)
+        try:
+            with migration_engine.connect() as connection:
+                connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+                connection.commit()
+                config.attributes["connection"] = connection
+                (command.downgrade if downgrade else command.upgrade)(config, revision)
+                config.attributes.pop("connection", None)
+        finally:
+            migration_engine.dispose()
+
+    migrate("0012_commerce_workflow_orchestration")
+    migration_engine = create_engine(database_url)
+    try:
+        with migration_engine.begin() as connection:
+            metadata = MetaData()
+            metadata.reflect(bind=connection)
+            table = metadata.tables
+            connection.execute(table["projects"].insert(), {
+                "id": ids["project"], "title": "0014 兼容项目", "description": None,
+                "created_at": now, "updated_at": now,
+            })
+            connection.execute(table["workflow_runs"].insert(), {
+                "id": ids["legacy_run"], "project_id": ids["project"], "workflow_key": "legacy-seed",
+                "workflow_definition_id": None, "workflow_version": None, "idempotency_key": None,
+                "input_snapshot": {}, "status": "SUCCEEDED", "created_at": now,
+                "started_at": now, "finished_at": now,
+            })
+            connection.execute(table["workflow_steps"].insert(), {
+                "id": ids["legacy_step"], "workflow_run_id": ids["legacy_run"], "step_key": "LEGACY",
+                "position": 1, "status": "SUCCEEDED", "progress": 100, "attempt": 1,
+                "input_payload": {}, "output_payload": {}, "error_message": None,
+                "model_profile_snapshot": None, "idempotency_key": None, "shot_plan_id": None,
+                "video_clip_id": None, "provider_task_id": None, "created_at": now,
+                "started_at": now, "finished_at": now,
+            })
+            connection.execute(table["topic_candidates"].insert(), {
+                "id": ids["topic"], "project_id": ids["project"], "generation_run_id": ids["legacy_run"],
+                "position": 1, "title": "选题", "opening_hook": "开头", "synopsis": "摘要",
+                "score": None, "scoring_notes": None, "status": "DRAFT", "created_at": now, "updated_at": now,
+            })
+            connection.execute(table["product_assets"].insert(), {
+                "id": ids["product"], "name": "产品", "description": None, "created_at": now, "updated_at": now,
+            })
+            connection.execute(table["product_analysis_versions"].insert(), {
+                "id": ids["analysis"], "product_asset_id": ids["product"], "source_media_asset_id": None,
+                "version": 1, "raw_analysis": {}, "analysis_status": "SUCCEEDED", "created_at": now,
+                "updated_at": now, "product_identification": {}, "package_ocr": {},
+                "candidate_reference_images": [], "appearance_description_candidates": [],
+                "selling_point_candidates": [], "user_pain_point_candidates": [], "usage_scenario_candidates": [],
+            })
+            connection.execute(table["product_asset_versions"].insert(), {
+                "id": ids["product_version"], "product_asset_id": ids["product"],
+                "source_analysis_version_id": ids["analysis"], "version": 1, "product_name": "产品 v1",
+                "appearance_description": "包装", "selling_points": [], "user_pain_points": [],
+                "usage_scenarios": [], "package_ocr": {}, "reference_images": [], "status": "CONFIRMED",
+                "frozen_at": now, "created_at": now,
+            })
+            connection.execute(table["project_product_selections"].insert(), {
+                "id": ids["selection"], "project_id": ids["project"], "product_asset_id": ids["product"],
+                "product_asset_version_id": ids["product_version"], "selected_at": now, "created_at": now,
+            })
+            connection.execute(table["story_runs"].insert(), {
+                "id": ids["story_run"], "project_id": ids["project"], "topic_candidate_id": ids["topic"],
+                "project_product_selection_id": ids["selection"], "product_asset_version_id": ids["product_version"],
+                "run_number": 1, "mode": "STEPWISE", "created_at": now, "updated_at": now,
+            })
+            connection.execute(table["story_run_states"].insert(), {
+                "story_run_id": ids["story_run"], "current_stage": "VIDEO_PROMPTS", "status": "PAUSED",
+                "stage_data": {}, "created_at": now, "updated_at": now,
+            })
+            connection.execute(table["topic_candidates"].insert(), {
+                "id": ids["auto_topic"], "project_id": ids["project"], "generation_run_id": ids["legacy_run"],
+                "position": 2, "title": "AUTO 选题", "opening_hook": "开头", "synopsis": "摘要",
+                "score": None, "scoring_notes": None, "status": "DRAFT", "created_at": now, "updated_at": now,
+            })
+            connection.execute(table["story_runs"].insert(), {
+                "id": ids["auto_story_run"], "project_id": ids["project"], "topic_candidate_id": ids["auto_topic"],
+                "project_product_selection_id": ids["selection"], "product_asset_version_id": ids["product_version"],
+                "run_number": 1, "mode": "AUTO", "created_at": now, "updated_at": now,
+            })
+            connection.execute(table["story_run_states"].insert(), {
+                "story_run_id": ids["auto_story_run"], "current_stage": "SEGMENT_RENDER", "status": "PENDING",
+                "stage_data": {}, "created_at": now, "updated_at": now,
+            })
+            connection.execute(table["story_outline_versions"].insert(), {
+                "id": ids["outline"], "story_run_id": ids["story_run"], "version": 1, "title": "大纲",
+                "premise": "前提", "story_beats": [], "product_placement_strategy": {}, "status": "LOCKED", "created_at": now,
+            })
+            connection.execute(table["chapter_plans"].insert(), {
+                "id": ids["chapter"], "story_run_id": ids["story_run"], "outline_version_id": ids["outline"],
+                "chapter_number": 1, "title": "章节", "narrative_purpose": "目的", "content_summary": "内容",
+                "product_plan": {}, "created_at": now, "updated_at": now,
+            })
+            connection.execute(table["video_segment_plans"].insert(), {
+                "id": ids["segment"], "story_run_id": ids["story_run"], "chapter_id": ids["chapter"],
+                "segment_number": 1, "target_duration_ms": 4000, "narrative_target": "片段", "status": "DRAFT",
+                "video_prompt_version": None, "video_prompt_trace": {}, "created_at": now, "updated_at": now,
+            })
+            connection.execute(table["workflow_runs"].insert(), {
+                "id": ids["commerce_run"], "project_id": ids["project"], "workflow_key": "commerce_story_run",
+                "workflow_definition_id": None, "workflow_version": "LemonFlow_Commerce_V1", "idempotency_key": "0014-compat",
+                "input_snapshot": {}, "status": "PENDING", "created_at": now, "started_at": None, "finished_at": None,
+            })
+            connection.execute(table["commerce_workflow_links"].insert(), {
+                "workflow_run_id": ids["commerce_run"], "story_run_id": ids["story_run"], "created_at": now,
+            })
+            connection.execute(table["workflow_runs"].insert(), {
+                "id": ids["auto_commerce_run"], "project_id": ids["project"], "workflow_key": "commerce_story_run",
+                "workflow_definition_id": None, "workflow_version": "LemonFlow_Commerce_V1", "idempotency_key": "0014-auto",
+                "input_snapshot": {}, "status": "PENDING", "created_at": now, "started_at": None, "finished_at": None,
+            })
+            connection.execute(table["commerce_workflow_links"].insert(), {
+                "workflow_run_id": ids["auto_commerce_run"], "story_run_id": ids["auto_story_run"], "created_at": now,
+            })
+            for step_id, stage, position, attempt, output in (
+                (
+                    ids["chapters_step"], "CHAPTERS", 3, 1,
+                    {"artifact_references": {"chapter_ids": [ids["chapter"]], "outline_id": ids["outline"]}},
+                ),
+                (
+                    ids["storyboard_step"], "STORYBOARD", 4, 1,
+                    {"artifact_references": {"video_segment_ids": [ids["segment"]]}},
+                ),
+                (ids["prompt_draft_step"], "VIDEO_PROMPTS", 6, 1, {"artifact_references": {}}),
+                (ids["prompt_approved_step"], "VIDEO_PROMPTS", 6, 2, {"artifact_references": {}}),
+                (ids["prompt_rejected_step"], "VIDEO_PROMPTS", 6, 3, {"artifact_references": {}}),
+            ):
+                connection.execute(table["workflow_steps"].insert(), {
+                    "id": step_id, "workflow_run_id": ids["commerce_run"], "step_key": stage,
+                    "position": position, "status": "SUCCEEDED", "progress": 100, "attempt": attempt,
+                    "input_payload": {}, "output_payload": output, "error_message": None,
+                    "model_profile_snapshot": {}, "idempotency_key": f"{step_id}-key", "shot_plan_id": None,
+                    "video_clip_id": None, "provider_task_id": None, "created_at": now,
+                    "started_at": now, "finished_at": now,
+                })
+                connection.execute(table["commerce_workflow_steps"].insert(), {
+                    "workflow_step_id": step_id, "workflow_run_id": ids["commerce_run"],
+                    "story_run_id": ids["story_run"], "stage": stage, "attempt": attempt,
+                    "status": "SUCCEEDED", "created_at": now,
+                })
+            connection.execute(table["workflow_steps"].insert(), {
+                "id": ids["auto_prompt_step"], "workflow_run_id": ids["auto_commerce_run"],
+                "step_key": "VIDEO_PROMPTS", "position": 6, "status": "SUCCEEDED", "progress": 100,
+                "attempt": 1, "input_payload": {}, "output_payload": {"artifact_references": {}},
+                "error_message": None, "model_profile_snapshot": {}, "idempotency_key": "0014-auto-step",
+                "shot_plan_id": None, "video_clip_id": None, "provider_task_id": None,
+                "created_at": now, "started_at": now, "finished_at": now,
+            })
+            connection.execute(table["commerce_workflow_steps"].insert(), {
+                "workflow_step_id": ids["auto_prompt_step"], "workflow_run_id": ids["auto_commerce_run"],
+                "story_run_id": ids["auto_story_run"], "stage": "VIDEO_PROMPTS", "attempt": 1,
+                "status": "SUCCEEDED", "created_at": now,
+            })
+            connection.execute(table["product_placement_plans"].insert(), {
+                "id": ids["segment_placement"], "story_run_id": ids["story_run"],
+                "product_asset_version_id": ids["product_version"], "chapter_id": None,
+                "video_segment_id": ids["segment"], "sub_shot_id": None,
+                "placement_method": "SOFT_PROP", "placement_strength": "LIGHT",
+                "pain_point_trigger": "痛点", "product_action": "动作", "ad_entry_point": "进入",
+                "story_recovery_point": "恢复", "planned_duration_ms": 1000,
+                "created_at": now, "updated_at": now,
+            })
+            for prompt_id, step_id, version in (
+                (ids["prompt_draft"], ids["prompt_draft_step"], 1),
+                (ids["prompt_approved"], ids["prompt_approved_step"], 2),
+                (ids["prompt_rejected"], ids["prompt_rejected_step"], 3),
+            ):
+                connection.execute(table["video_prompt_versions"].insert(), {
+                    "id": prompt_id, "video_segment_id": ids["segment"], "workflow_step_id": step_id,
+                    "version": version, "prompt": f"提示词 {version}", "trace": {}, "status": "LOCKED",
+                    "created_at": now, "locked_at": now,
+                })
+            for review_id, step_id, decision in (
+                (ids["approved_review"], ids["prompt_approved_step"], "APPROVED"),
+                (ids["rejected_review"], ids["prompt_rejected_step"], "REJECTED"),
+            ):
+                connection.execute(table["review_decisions"].insert(), {
+                    "id": review_id, "project_id": ids["project"], "target_type": "COMMERCE_STAGE_VIDEO_PROMPTS",
+                    "target_id": step_id, "decision": decision, "reviewer_label": "兼容审核", "note": None,
+                    "quality_score": 8, "created_at": now,
+                })
+            connection.execute(table["video_prompt_versions"].insert(), {
+                "id": ids["auto_prompt"], "video_segment_id": ids["segment"],
+                "workflow_step_id": ids["auto_prompt_step"], "version": 4, "prompt": "AUTO 锁定提示词",
+                "trace": {}, "status": "LOCKED", "created_at": now, "locked_at": now,
+            })
+    finally:
+        migration_engine.dispose()
+
+    migrate("0013_commerce_phase2_integrity_fixes")
+    migrate("0014_commerce_phase2_legacy_compatibility")
+    migration_engine = create_engine(database_url)
+    try:
+        with migration_engine.connect() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT workflow_step_id, chapter_plan_id, position FROM commerce_chapter_attempt_chapters"
+            ).one() == (ids["chapters_step"], ids["chapter"], 1)
+            prompt_statuses = dict(connection.exec_driver_sql(
+                "SELECT id, status FROM video_prompt_versions"
+            ).fetchall())
+            assert prompt_statuses == {
+                ids["prompt_draft"]: "DRAFT",
+                ids["prompt_approved"]: "LOCKED",
+                ids["prompt_rejected"]: "REJECTED",
+                ids["auto_prompt"]: "LOCKED",
+            }
+            legacy_board = connection.exec_driver_sql(
+                "SELECT output_payload FROM workflow_steps WHERE id = ?", (ids["storyboard_step"],)
+            ).scalar_one()
+            if isinstance(legacy_board, str):
+                legacy_board = json.loads(legacy_board)
+            assert legacy_board["artifact_references"]["chapter_ids"] == [ids["chapter"]]
+            assert legacy_board["artifact_references"]["product_placement_ids"] == [ids["segment_placement"]]
+            assert connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        migration_engine.dispose()
+
+    # 0014 -> 0013 keeps the exact schema, then 0013 -> 0012 drops only the
+    # association metadata.  Upgrading head again deterministically rebuilds it.
+    migrate("0013_commerce_phase2_integrity_fixes", downgrade=True)
+    migrate("0014_commerce_phase2_legacy_compatibility")
+    migrate("0012_commerce_workflow_orchestration", downgrade=True)
+    migrate("0014_commerce_phase2_legacy_compatibility")
+    migration_engine = create_engine(database_url)
+    try:
+        with migration_engine.connect() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT COUNT(*) FROM commerce_chapter_attempt_chapters WHERE workflow_step_id = ?",
+                (ids["chapters_step"],),
+            ).scalar_one() == 1
+            # Simulate an old 0012/0013 database whose historical DML bypassed
+            # SQLite triggers.  0014 must fail rather than blessing the bad row.
+            connection.exec_driver_sql("DROP TRIGGER trg_commerce_workflow_step_scope_update")
+            connection.exec_driver_sql(
+                "UPDATE commerce_workflow_steps SET attempt = 99 WHERE workflow_step_id = ?",
+                (ids["prompt_draft_step"],),
+            )
+            connection.commit()
+    finally:
+        migration_engine.dispose()
+    migrate("0013_commerce_phase2_integrity_fixes", downgrade=True)
+    with pytest.raises(RuntimeError, match="sidecar parent/stage/attempt/status scope"):
+        migrate("0014_commerce_phase2_legacy_compatibility")
 
 
 def _sqlite_schema_fingerprint(database_url: str) -> tuple[tuple, ...]:

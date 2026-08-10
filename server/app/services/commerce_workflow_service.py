@@ -14,7 +14,7 @@ from hashlib import sha256
 from typing import Any, Protocol
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -796,22 +796,10 @@ def _validate_storyboard(db: Session, story_run: StoryRun, step: WorkflowStep) -
         if placement.sub_shot_id is not None and placement.sub_shot_id not in set(sub_shot_ids):
             _error("子镜头级产品植入不属于当前审核分镜结果", status.HTTP_422_UNPROCESSABLE_CONTENT)
 
-    # 当前章节、片段和子镜头范围内的所有植入都必须被本次 Storyboard 显式声明；否则
-    # 一个旧 attempt 的隐藏植入可能在审核后被渲染器意外采用。
-    scoped_placement_ids = {
-        item.id
-        for item in db.scalars(
-            select(ProductPlacementPlan).where(
-                or_(
-                    ProductPlacementPlan.chapter_id.in_(chapter_ids),
-                    ProductPlacementPlan.video_segment_id.in_(segment_ids),
-                    ProductPlacementPlan.sub_shot_id.in_(sub_shot_ids),
-                )
-            )
-        ).all()
-    }
-    if scoped_placement_ids != set(placement_ids):
-        _error("产品植入清单未完整覆盖当前审核分镜结果", status.HTTP_422_UNPROCESSABLE_CONTENT)
+    # ``product_placement_ids`` 是本次 Storyboard attempt 的明确采用集合。不能反向
+    # 扫描同章节的全部历史植入：CHAPTERS/Storyboard 被驳回后，旧 attempt 的章节级
+    # 植入仍应永久留档，但绝不能强迫新 attempt 再次采用它。后续阶段只从当前已确认
+    # Storyboard 输出的这组 ID 读取植入，不会隐式混入历史记录。
 
     # 对白是可独立查询的生产数据，不能只因数据库中存在就被默认视为本次分镜的
     # 输出。节点必须显式列出本次采用的对白 ID；这样审核能够拒绝跨 StoryRun、跨
@@ -900,6 +888,26 @@ def _lock_video_prompts(db: Session, story_run: StoryRun, step: WorkflowStep) ->
         item.status = "LOCKED"
         item.locked_at = now
     return versions
+
+
+def _adopted_video_prompt_step(db: Session, story_run: StoryRun) -> WorkflowStep:
+    """返回可用于渲染的当前提示词 attempt。
+
+    STEPWISE 的采用事实必须来自人工 ``APPROVED`` 审核；AUTO 没有伪造人工审核，
+    因此只采用最新成功且已通过完整性校验并锁定的 attempt。两种模式都由
+    ``_validate_video_prompts`` 复核完整覆盖，避免把历史 DRAFT/REJECTED 版本带入
+    渲染。
+    """
+
+    step = (
+        _latest_successful_step(db, story_run.id, StoryRunStage.VIDEO_PROMPTS)
+        if story_run.mode == StoryRunMode.AUTO
+        else _latest_approved_step(db, story_run.id, StoryRunStage.VIDEO_PROMPTS)
+    )
+    versions = _validate_video_prompts(db, story_run, step)
+    if any(item.status != "LOCKED" or item.locked_at is None for item in versions):
+        _error("批量渲染缺少当前已锁定的视频提示词", status.HTTP_409_CONFLICT)
+    return step
 
 
 def _validate_render(db: Session, story_run: StoryRun, step: WorkflowStep) -> RenderBatch:
@@ -1035,6 +1043,13 @@ def retry_step(db: Session, story_run_id: str, step_id: str) -> tuple[StoryRun, 
     # identity-map 中的旧 PENDING/RUNNING 值判断目标。
     db.refresh(step)
     stage = StoryRunStage(step.step_key)
+
+    # 幂等返回之前必须先证明调用方传入的是“当前阶段的失败 attempt”。否则旧的
+    # SUCCEEDED/REJECTED step，或 attempt 1 之后已出现 attempt 3 的 stale step，
+    # 都可能被错误视为成功的重复请求。
+    if step.status != RunStatus.FAILED or story_run.state.current_stage != stage:
+        _error("只有当前失败节点可以重试", status.HTTP_409_CONFLICT)
+
     parent = _active_run(db, story_run.id)
     active_attempt = _active_step(db, parent.id) if parent is not None else None
     # 并发 retry 中第一个请求已经追加了同阶段的新 attempt 时，第二个请求必须复用
@@ -1042,9 +1057,13 @@ def retry_step(db: Session, story_run_id: str, step_id: str) -> tuple[StoryRun, 
     if (
         active_attempt is not None
         and active_attempt.step_key == step.step_key
-        and active_attempt.attempt > step.attempt
+        and active_attempt.attempt == step.attempt + 1
     ):
         return story_run, parent, False
+    if active_attempt is not None:
+        _error("当前阶段已存在更新的活动 attempt", status.HTTP_409_CONFLICT)
+    if story_run.state.status != StoryRunStatus.FAILED:
+        _error("当前 StoryRun 并非可重试的失败状态", status.HTTP_409_CONFLICT)
     latest_attempt = int(
         db.scalar(
             select(func.max(CommerceWorkflowStep.attempt)).where(
@@ -1056,8 +1075,6 @@ def retry_step(db: Session, story_run_id: str, step_id: str) -> tuple[StoryRun, 
     )
     if step.attempt != latest_attempt:
         _error("只能重试当前阶段最新失败 attempt", status.HTTP_409_CONFLICT)
-    if step.status != RunStatus.FAILED or story_run.state.status != StoryRunStatus.FAILED or story_run.state.current_stage != stage:
-        _error("只有当前失败节点可以重试")
     story_run, concurrent_parent = _claim_story_run_state(
         db, story_run, expected_status=StoryRunStatus.FAILED, expected_stage=stage
     )
@@ -1213,7 +1230,7 @@ class MockCommerceNodeExecutor:
         return self._result({"video_prompt_version_ids": created}, {"prompt_count": len(created)})
 
     def _execute_segment_render(self, context: CommerceNodeContext) -> CommerceNodeResult:
-        prompts = _latest_approved_step(context.db, context.story_run.id, StoryRunStage.VIDEO_PROMPTS)
+        prompts = _adopted_video_prompt_step(context.db, context.story_run)
         versions = _validate_video_prompts(context.db, context.story_run, prompts)
         if any(item.status != "LOCKED" or item.locked_at is None for item in versions):
             raise RuntimeError("批量渲染缺少锁定的视频提示词")

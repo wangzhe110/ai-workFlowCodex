@@ -740,5 +740,124 @@ class PromptTemplateResponse(BaseModel):
     updated_at: datetime
 
 
+# ---------------------------------------------------------------------------
+# Commerce Phase 2：带货短剧工作流控制面。
+# ---------------------------------------------------------------------------
+
+
+class CommerceStoryRunCreateRequest(BaseModel):
+    topic_candidate_id: str = Field(min_length=1, max_length=36)
+    project_product_selection_id: str = Field(min_length=1, max_length=36)
+    mode: str = Field(default="STEPWISE", pattern="^(STEPWISE|AUTO)$")
+
+
+class CommerceReviewRequest(BaseModel):
+    reviewer_label: str = Field(default="人工审核", min_length=1, max_length=120)
+    note: Optional[str] = Field(default=None, max_length=4000)
+    quality_score: Optional[int] = Field(default=None, ge=1, le=10)
+    # OUTLINE 可明确选择一个当前运行中的草稿版本；其余阶段由当前成功 Step 的结果决定。
+    outline_id: Optional[str] = Field(default=None, min_length=1, max_length=36)
+
+
+class CommerceOutlineCreateRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=180)
+    premise: str = Field(min_length=1, max_length=20_000)
+    story_beats: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+    product_placement_strategy: dict[str, Any] = Field(default_factory=dict)
+
+
+class CommerceOutlinePatchRequest(BaseModel):
+    title: Optional[str] = Field(default=None, min_length=1, max_length=180)
+    premise: Optional[str] = Field(default=None, min_length=1, max_length=20_000)
+    story_beats: Optional[list[dict[str, Any]]] = Field(default=None, max_length=100)
+    product_placement_strategy: Optional[dict[str, Any]] = Field(default=None)
+
+
+class CommerceWorkflowStepResponse(BaseModel):
+    id: str
+    step_key: str
+    position: int
+    status: str
+    attempt: int
+    progress: int
+    output_payload: Optional[dict[str, Any]]
+    error_message: Optional[str]
+    provider_task_id: Optional[str]
+    created_at: datetime
+    started_at: Optional[datetime]
+    finished_at: Optional[datetime]
+
+
+class CommerceWorkflowRunResponse(BaseModel):
+    id: str
+    story_run_id: Optional[str]
+    project_id: str
+    workflow_key: str
+    workflow_definition_id: Optional[str]
+    workflow_version: Optional[str]
+    status: str
+    idempotency_key: Optional[str]
+    input_snapshot: Optional[dict[str, Any]]
+    created_at: datetime
+    started_at: Optional[datetime]
+    finished_at: Optional[datetime]
+    steps: list[CommerceWorkflowStepResponse]
+
+
+class CommerceOutlineResponse(BaseModel):
+    id: str
+    story_run_id: str
+    version: int
+    title: str
+    premise: str
+    story_beats: list[dict[str, Any]]
+    product_placement_strategy: dict[str, Any]
+    status: str
+    created_at: datetime
+
+
+class CommerceReviewResponse(BaseModel):
+    id: str
+    project_id: str
+    target_type: str
+    target_id: str
+    decision: str
+    reviewer_label: str
+    note: Optional[str]
+    quality_score: Optional[int]
+    created_at: datetime
+
+
+class CommerceStoryRunResponse(BaseModel):
+    id: str
+    project_id: str
+    topic_candidate_id: str
+    project_product_selection_id: str
+    product_asset_version_id: str
+    run_number: int
+    mode: str
+    current_stage: str
+    current_status: str
+    blocked_reason: Optional[str]
+    can_start: bool
+    can_continue: bool
+    can_confirm: bool
+    current_workflow_run: Optional[CommerceWorkflowRunResponse]
+    current_workflow_step: Optional[CommerceWorkflowStepResponse]
+    latest_error: Optional[str]
+    stage_result_references: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+
+class CommerceWorkflowDefinitionResponse(BaseModel):
+    id: str
+    workflow_code: str
+    version: str
+    definition_json: dict[str, Any]
+    status: str
+    published_at: Optional[datetime]
+
+
 # Pydantic 需要在全部类型声明后解析前向引用。
 ProjectDetailResponse.model_rebuild()

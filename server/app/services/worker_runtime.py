@@ -9,11 +9,12 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from fastapi import BackgroundTasks
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import SessionLocal
-from app.models import RunStatus, WorkflowRun, WorkflowStep
+from app.models import CommerceWorkflowLink, CommerceWorkflowStep, RunStatus, StoryRun, StoryRunStatus, WorkflowRun, WorkflowStep
 from app.services.image_service import execute as execute_images
 from app.services.final_video_service import execute_final_video_export
 from app.services.story_service import execute_story_generation
@@ -21,6 +22,7 @@ from app.services.storyboard_service import execute as execute_storyboard
 from app.services.topic_service import execute_topic_generation
 from app.services.video_service import execute_video_generation
 from app.services.v1_execution_service import execute_v1_video_child, execute_v1_workflow
+from app.services.commerce_workflow_service import execute_commerce_workflow
 from app.services.workflow_service import execute_video_analysis
 
 
@@ -44,6 +46,9 @@ _WORKFLOW_EXECUTORS: dict[str, WorkflowExecutor] = {
     "v1_shot_keyframes": execute_v1_workflow,
     "v1_video_generation": execute_v1_workflow,
     "v1_final_compose": execute_v1_workflow,
+    # Commerce 使用一个 StoryRun 父运行；节点与 retry 是其 WorkflowStep attempt，
+    # 因而队列只需要投递这一种工作流键。
+    "commerce_story_run": execute_commerce_workflow,
 }
 
 
@@ -188,8 +193,27 @@ def _mark_dispatch_failure(run_id: str, message: str) -> None:
         for step in run.steps:
             if step.status == RunStatus.PENDING:
                 step.status = RunStatus.FAILED
+                # 先刷新真实 WorkflowStep，再同步 Commerce sidecar。0012 的数据库
+                # 触发器和 Base.metadata 测试库都因此观察同一个事务内的同一状态。
+                db.flush()
+                db.execute(
+                    update(CommerceWorkflowStep)
+                    .where(CommerceWorkflowStep.workflow_step_id == step.id)
+                    .values(status=RunStatus.FAILED.value)
+                )
                 step.error_message = message[:2000]
                 step.finished_at = now
+        # Commerce 运行拥有独立状态机；队列投递失败不能只让 WorkflowRun 失败而把
+        # StoryRun 留在 RUNNING，从而失去明确的 retry 入口。
+        link = db.get(CommerceWorkflowLink, run.id)
+        if link is not None:
+            story_run = db.get(StoryRun, link.story_run_id)
+            if story_run is not None and story_run.state.status != StoryRunStatus.CANCELLED:
+                story_run.state.status = StoryRunStatus.FAILED
+                story_run.state.stage_data = {
+                    "blocked_reason": "dispatch_failed",
+                    "failed_workflow_run_id": run.id,
+                }
         db.commit()
     finally:
         db.close()

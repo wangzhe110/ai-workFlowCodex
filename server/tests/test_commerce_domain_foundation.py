@@ -506,7 +506,7 @@ def test_render_batch_reuses_existing_workflow_run(commerce_db) -> None:
 
 
 def test_alembic_commerce_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
-    """验证 0010 → 0011 → 0010 → 0011，且最终迁移链只有一个 head。"""
+    """验证 0011 → 0012 → 0011 → 0012，且最终迁移链只有一个 head。"""
 
     server_root = Path(__file__).resolve().parents[1]
     database_path = tmp_path / "commerce-migration.db"
@@ -528,22 +528,36 @@ def test_alembic_commerce_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
 
     config = Config(str(server_root / "alembic.ini"))
     config.set_main_option("script_location", str(server_root / "migrations"))
-    assert ScriptDirectory.from_config(config).get_heads() == ["0011_commerce_domain_integrity_fixes"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["0012_commerce_workflow_orchestration"]
 
     run_revision("upgrade", "0010_commerce_domain_foundation")
     run_revision("upgrade", "head")
     migration_engine = create_engine(migration_url)
     try:
-        assert {"script_assets", "story_runs", "video_segment_plans", "render_batches"}.issubset(
+        assert {
+            "script_assets", "story_runs", "video_segment_plans", "render_batches",
+            "commerce_workflow_links", "commerce_workflow_steps", "video_prompt_versions",
+        }.issubset(
             inspect(migration_engine).get_table_names()
         )
+        assert "story_run_id" not in {column["name"] for column in inspect(migration_engine).get_columns("workflow_runs")}
+    finally:
+        migration_engine.dispose()
+
+    run_revision("downgrade", "0011_commerce_domain_integrity_fixes")
+    migration_engine = create_engine(migration_url)
+    try:
+        assert "story_runs" in inspect(migration_engine).get_table_names()
+        assert "video_prompt_versions" not in inspect(migration_engine).get_table_names()
+        assert "commerce_workflow_links" not in inspect(migration_engine).get_table_names()
+        assert "commerce_workflow_steps" not in inspect(migration_engine).get_table_names()
+        assert "story_run_id" not in {column["name"] for column in inspect(migration_engine).get_columns("workflow_runs")}
     finally:
         migration_engine.dispose()
 
     run_revision("downgrade", "0010_commerce_domain_foundation")
     migration_engine = create_engine(migration_url)
     try:
-        assert "story_runs" in inspect(migration_engine).get_table_names()
         assert "product_identification" not in {
             column["name"] for column in inspect(migration_engine).get_columns("product_analysis_versions")
         }

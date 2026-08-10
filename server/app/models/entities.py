@@ -637,6 +637,11 @@ class StoryRun(Base):
     render_batches: Mapped[list["RenderBatch"]] = relationship(
         back_populates="story_run", cascade="all, delete-orphan", order_by="RenderBatch.batch_number"
     )
+    commerce_workflow_links: Mapped[list["CommerceWorkflowLink"]] = relationship(
+        back_populates="story_run",
+        cascade="all, delete-orphan",
+        order_by="CommerceWorkflowLink.created_at",
+    )
 
 
 class StoryRunState(Base):
@@ -798,6 +803,39 @@ class VideoSegmentPlan(Base):
     dialogue_lines: Mapped[list["DialogueLine"]] = relationship(
         back_populates="video_segment", cascade="all, delete-orphan"
     )
+    video_prompt_versions: Mapped[list["VideoPromptVersion"]] = relationship(
+        back_populates="video_segment", cascade="all, delete-orphan", order_by="VideoPromptVersion.version"
+    )
+
+
+class VideoPromptVersion(Base):
+    """片段视频提示词的追加式版本记录。
+
+    ``VideoSegmentPlan`` 上的旧字段保留给 Phase 1 兼容；Commerce 只读取本表，确保
+    已被审核采用的提示词不会被下一次生成覆盖。
+    """
+
+    __tablename__ = "video_prompt_versions"
+    __table_args__ = (
+        UniqueConstraint("video_segment_id", "version", name="uq_video_prompt_version"),
+        CheckConstraint("version >= 1", name="ck_video_prompt_version_positive"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    video_segment_id: Mapped[str] = mapped_column(
+        ForeignKey("video_segment_plans.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    workflow_step_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("workflow_steps.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    trace: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="DRAFT")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    locked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    video_segment: Mapped[VideoSegmentPlan] = relationship(back_populates="video_prompt_versions")
 
 
 class SubShotPlan(Base):
@@ -1175,8 +1213,14 @@ class WorkflowRun(Base):
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     project: Mapped[Project] = relationship(back_populates="workflow_runs")
+    commerce_link: Mapped[Optional["CommerceWorkflowLink"]] = relationship(
+        back_populates="workflow_run", cascade="all, delete-orphan", uselist=False
+    )
     steps: Mapped[list["WorkflowStep"]] = relationship(
-        back_populates="workflow_run", cascade="all, delete-orphan", order_by="WorkflowStep.position"
+        back_populates="workflow_run",
+        cascade="all, delete-orphan",
+        # 同一阶段允许多个 attempt，查询和 API 必须稳定地保留时间线。
+        order_by=lambda: (WorkflowStep.position, WorkflowStep.attempt, WorkflowStep.created_at),
     )
 
 
@@ -1216,6 +1260,72 @@ class WorkflowStep(Base):
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     workflow_run: Mapped[WorkflowRun] = relationship(back_populates="steps")
+    commerce_step: Mapped[Optional["CommerceWorkflowStep"]] = relationship(
+        back_populates="workflow_step", cascade="all, delete-orphan", uselist=False
+    )
+
+
+class CommerceWorkflowLink(Base):
+    """0012 新表：将 Commerce 父运行与 StoryRun 显式一对一关联。
+
+    关联放在独立新表，而不是向历史 ``workflow_runs`` 加列，确保把 0012 降级到
+    0011 后能获得与全新 0011 完全一致的历史表结构。
+    """
+
+    __tablename__ = "commerce_workflow_links"
+
+    workflow_run_id: Mapped[str] = mapped_column(
+        ForeignKey("workflow_runs.id", ondelete="CASCADE"), primary_key=True
+    )
+    story_run_id: Mapped[str] = mapped_column(
+        ForeignKey("story_runs.id", ondelete="CASCADE"), nullable=False, unique=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    workflow_run: Mapped[WorkflowRun] = relationship(back_populates="commerce_link")
+    story_run: Mapped[StoryRun] = relationship(back_populates="commerce_workflow_links")
+
+
+class CommerceWorkflowStep(Base):
+    """0012 新表：Commerce attempt 的专属作用域与数据库唯一性。
+
+    V1 不会在此表创建行，故 V1 并行 VIDEO_SHOT 的原有 attempt、状态和数量不受
+    Commerce 索引影响。状态由 0012 数据库触发器与 ``workflow_steps`` 同步。
+    """
+
+    __tablename__ = "commerce_workflow_steps"
+    __table_args__ = (
+        Index(
+            "uq_commerce_workflow_step_attempt",
+            "workflow_run_id",
+            "stage",
+            "attempt",
+            unique=True,
+        ),
+        Index(
+            "uq_active_commerce_workflow_step",
+            "workflow_run_id",
+            unique=True,
+            postgresql_where=text("status IN ('PENDING', 'RUNNING')"),
+            sqlite_where=text("status IN ('PENDING', 'RUNNING')"),
+        ),
+    )
+
+    workflow_step_id: Mapped[str] = mapped_column(
+        ForeignKey("workflow_steps.id", ondelete="CASCADE"), primary_key=True
+    )
+    workflow_run_id: Mapped[str] = mapped_column(
+        ForeignKey("workflow_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    story_run_id: Mapped[str] = mapped_column(
+        ForeignKey("story_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    stage: Mapped[str] = mapped_column(String(80), nullable=False)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    workflow_step: Mapped[WorkflowStep] = relationship(back_populates="commerce_step")
 
 
 class TopicCandidate(Base):

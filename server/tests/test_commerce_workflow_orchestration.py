@@ -31,24 +31,32 @@ from app.models import (
     ProductAssetVersionStatus,
     CommerceWorkflowLink,
     CommerceWorkflowStep,
+    CommerceChapterAttemptChapter,
     DialogueLine,
     ModelInvocation,
     Project,
     ProjectProductSelection,
     RunStatus,
     ReviewDecision,
+    ProductPlacementPlan,
+    ProductPlacementMethod,
+    ProductPlacementStrength,
+    RenderBatchStatus,
+    SegmentPlanStatus,
     StoryRunMode,
     StoryRun,
     StoryRunStage,
     StoryRunStatus,
     TopicCandidate,
     VideoSegmentPlan,
+    VideoPromptVersion,
     WorkflowRun,
     WorkflowStep,
 )
 from app.services.commerce_domain_service import (
     add_sub_shot_plan,
     create_dialogue_line,
+    create_product_placement_plan,
     create_project_product_selection,
     create_video_segment_plan,
     freeze_product_asset_version,
@@ -1124,6 +1132,287 @@ def test_existing_provider_task_is_never_resubmitted(commerce_db, monkeypatch):
     assert calls == [] and step.status == RunStatus.RUNNING and step.provider_task_id == "provider-task-redacted"
 
 
+def _run_to_video_prompts_pause(db, story_run: StoryRun) -> WorkflowRun:
+    """推进 STEPWISE Mock 闭环至待审核的视频提示词阶段。"""
+
+    run = _run_to_storyboard_pause(db, story_run)
+    _confirm(db, story_run, StoryRunStage.STORYBOARD)
+    _, run, _ = continue_story_run(db, story_run.id)
+    _execute(run)
+    _confirm(db, story_run, StoryRunStage.VISUAL_ASSETS)
+    _, run, _ = continue_story_run(db, story_run.id)
+    _execute(run)
+    return run
+
+
+def test_chapters_rejected_attempt_is_preserved_and_storyboard_uses_only_replacement(commerce_db):
+    """回归 1：CHAPTERS 重做永不覆盖旧章节，后续只引用新 attempt 的结果组。"""
+
+    project, topic, selection, mode = _context(commerce_db)
+    story_run = create_next_story_run(
+        commerce_db, project_id=project.id, topic_candidate_id=topic.id,
+        project_product_selection_id=selection.id, mode=mode,
+    )
+    _, parent, _ = start_story_run(commerce_db, story_run.id)
+    _execute(parent)
+    _confirm(commerce_db, story_run, StoryRunStage.OUTLINE)
+    _, parent, _ = continue_story_run(commerce_db, story_run.id)
+    _execute(parent)
+    first_step = _stage_steps(parent, StoryRunStage.CHAPTERS)[0]
+    first_chapter_id = first_step.output_payload["artifact_references"]["chapter_ids"][0]
+    review_stage(
+        commerce_db, story_run_id=story_run.id, stage=StoryRunStage.CHAPTERS,
+        decision="REJECTED", reviewer_label="章节审核", note="重做章节", quality_score=3,
+    )
+    _, parent, created = continue_story_run(commerce_db, story_run.id)
+    assert created
+    _execute(parent)
+    commerce_db.expire_all()
+    parent = commerce_db.get(WorkflowRun, parent.id)
+    second_step = _stage_steps(parent, StoryRunStage.CHAPTERS)[-1]
+    assert second_step.output_payload is not None, (second_step.status, second_step.error_message)
+    second_chapter_id = second_step.output_payload["artifact_references"]["chapter_ids"][0]
+    assert second_step.attempt == 2 and second_chapter_id != first_chapter_id
+    links = list(commerce_db.scalars(select(CommerceChapterAttemptChapter).where(
+        CommerceChapterAttemptChapter.workflow_step_id.in_([first_step.id, second_step.id])
+    )).all())
+    assert {(item.workflow_step_id, item.chapter_plan_id) for item in links} == {
+        (first_step.id, first_chapter_id), (second_step.id, second_chapter_id)
+    }
+    assert commerce_db.get(__import__("app.models", fromlist=["ChapterPlan"]).ChapterPlan, first_chapter_id) is not None
+    _confirm(commerce_db, story_run, StoryRunStage.CHAPTERS)
+    _, parent, _ = continue_story_run(commerce_db, story_run.id)
+    _execute(parent)
+    commerce_db.expire_all()
+    parent = commerce_db.get(WorkflowRun, parent.id)
+    storyboard = _stage_steps(parent, StoryRunStage.STORYBOARD)[0]
+    assert storyboard.output_payload["artifact_references"]["chapter_ids"] == [second_chapter_id]
+    assert first_chapter_id not in storyboard.output_payload["artifact_references"]["chapter_ids"]
+
+
+def test_auto_incomplete_chapters_attempt_does_not_advance(commerce_db, monkeypatch):
+    """回归 2：AUTO 必须校验当前 CHAPTERS attempt，不得读取旧章节后继续。"""
+
+    project, topic, selection, _ = _context(commerce_db, mode=StoryRunMode.AUTO)
+    story_run = create_next_story_run(
+        commerce_db, project_id=project.id, topic_candidate_id=topic.id,
+        project_product_selection_id=selection.id, mode=StoryRunMode.AUTO,
+    )
+    original = CommerceNodeRegistry._executor
+
+    class IncompleteChapters:
+        def execute(self, context):
+            if context.stage != StoryRunStage.CHAPTERS:
+                return original.execute(context)
+            outline = commerce_db.scalars(select(__import__("app.models", fromlist=["StoryOutlineVersion"]).StoryOutlineVersion).where(
+                __import__("app.models", fromlist=["StoryOutlineVersion"]).StoryOutlineVersion.story_run_id == context.story_run.id,
+            )).first()
+            return CommerceNodeResult(
+                artifact_references={"chapter_ids": [], "outline_id": outline.id},
+                structured_output={}, usage={}, cost={},
+            )
+
+    monkeypatch.setattr(CommerceNodeRegistry, "_executor", IncompleteChapters())
+    _, parent, _ = start_story_run(commerce_db, story_run.id)
+    _execute(parent)
+    _confirm(commerce_db, story_run, StoryRunStage.OUTLINE)
+    _, parent, _ = continue_story_run(commerce_db, story_run.id)
+    _execute(parent)
+    commerce_db.expire_all()
+    stored = commerce_db.get(StoryRun, story_run.id)
+    failed = _stage_steps(commerce_db.get(WorkflowRun, parent.id), StoryRunStage.CHAPTERS)[0]
+    assert stored.state.current_stage == StoryRunStage.CHAPTERS
+    assert stored.state.status == StoryRunStatus.FAILED
+    assert failed.status == RunStatus.FAILED
+    assert not _stage_steps(commerce_db.get(WorkflowRun, parent.id), StoryRunStage.STORYBOARD)
+
+
+def test_storyboard_product_placement_validation_rejects_wrong_version_and_foreign_subshot(commerce_db):
+    """回归 5：章节、片段、子镜头植入都必须属于当前结果并使用冻结产品版本。"""
+
+    project, topic, selection, mode = _context(commerce_db)
+    story_run = create_next_story_run(commerce_db, project_id=project.id, topic_candidate_id=topic.id, project_product_selection_id=selection.id, mode=mode)
+    parent = _run_to_storyboard_pause(commerce_db, story_run)
+    board = _stage_steps(parent, StoryRunStage.STORYBOARD)[0]
+    refs = board.output_payload["artifact_references"]
+    current_segment = commerce_db.get(VideoSegmentPlan, refs["video_segment_ids"][0])
+    wrong_project, _, wrong_selection, _ = _context(commerce_db)
+    wrong = ProductPlacementPlan(
+        story_run_id=story_run.id, product_asset_version_id=wrong_selection.product_asset_version_id,
+        chapter_id=None, video_segment_id=None, sub_shot_id=current_segment.sub_shots[0].id,
+        placement_method=ProductPlacementMethod.SOFT_PROP, placement_strength=ProductPlacementStrength.LIGHT,
+        pain_point_trigger="错误产品", product_action="错误", ad_entry_point="错误", story_recovery_point="错误", planned_duration_ms=1,
+    )
+    commerce_db.add(wrong)
+    commerce_db.flush()
+    board.output_payload = {**board.output_payload, "artifact_references": {**refs, "product_placement_ids": [wrong.id]}}
+    flag_modified(board, "output_payload")
+    commerce_db.commit()
+    before = commerce_db.scalar(
+        select(func.count()).select_from(ReviewDecision).where(ReviewDecision.target_id == board.id)
+    )
+    with pytest.raises(HTTPException) as wrong_version:
+        _confirm(commerce_db, story_run, StoryRunStage.STORYBOARD)
+    assert wrong_version.value.status_code == 422
+    assert commerce_db.scalar(
+        select(func.count()).select_from(ReviewDecision).where(ReviewDecision.target_id == board.id)
+    ) == before
+
+    # 新建一个同项目 StoryRun 的子镜头，直接伪造跨运行引用；审核仍必须拒绝且不落审核事实。
+    other = create_next_story_run(commerce_db, project_id=project.id, topic_candidate_id=topic.id, project_product_selection_id=selection.id, mode=mode)
+    other_parent = _run_to_storyboard_pause(commerce_db, other)
+    other_shot_id = commerce_db.get(VideoSegmentPlan, _stage_steps(other_parent, StoryRunStage.STORYBOARD)[0].output_payload["artifact_references"]["video_segment_ids"][0]).sub_shots[0].id
+    foreign = ProductPlacementPlan(
+        story_run_id=story_run.id, product_asset_version_id=story_run.product_asset_version_id,
+        chapter_id=None, video_segment_id=None, sub_shot_id=other_shot_id,
+        placement_method=ProductPlacementMethod.SOFT_PROP, placement_strength=ProductPlacementStrength.LIGHT,
+        pain_point_trigger="跨运行", product_action="错误", ad_entry_point="错误", story_recovery_point="错误", planned_duration_ms=1,
+    )
+    commerce_db.add(foreign)
+    commerce_db.flush()
+    board.output_payload = {**board.output_payload, "artifact_references": {**refs, "product_placement_ids": [foreign.id]}}
+    flag_modified(board, "output_payload")
+    commerce_db.commit()
+    with pytest.raises(HTTPException) as foreign_target:
+        _confirm(commerce_db, story_run, StoryRunStage.STORYBOARD)
+    assert foreign_target.value.status_code == 422
+    assert commerce_db.scalar(
+        select(func.count()).select_from(ReviewDecision).where(ReviewDecision.target_id == board.id)
+    ) == before
+
+
+def test_stepwise_prompt_rejects_versions_without_locking_them(commerce_db):
+    """回归 8：STEPWISE 成功仅生成 DRAFT，驳回后保留版本且不再被采用。"""
+
+    project, topic, selection, mode = _context(commerce_db)
+    story_run = create_next_story_run(commerce_db, project_id=project.id, topic_candidate_id=topic.id, project_product_selection_id=selection.id, mode=mode)
+    parent = _run_to_video_prompts_pause(commerce_db, story_run)
+    step = _stage_steps(parent, StoryRunStage.VIDEO_PROMPTS)[0]
+    prompt_ids = step.output_payload["artifact_references"]["video_prompt_version_ids"]
+    prompts = [commerce_db.get(VideoPromptVersion, item_id) for item_id in prompt_ids]
+    assert all(item.status == "DRAFT" and item.locked_at is None for item in prompts)
+    review_stage(commerce_db, story_run_id=story_run.id, stage=StoryRunStage.VIDEO_PROMPTS,
+                 decision="REJECTED", reviewer_label="提示词审核", note="重做", quality_score=4)
+    assert all(item.status == "REJECTED" and item.locked_at is None for item in prompts)
+
+
+def test_video_prompt_review_requires_complete_accepted_storyboard_coverage(commerce_db):
+    """回归 6：视频提示词不能只引用已确认 Storyboard 的非空子集。"""
+
+    project, topic, selection, mode = _context(commerce_db)
+    story_run = create_next_story_run(commerce_db, project_id=project.id, topic_candidate_id=topic.id, project_product_selection_id=selection.id, mode=mode)
+    parent = _run_to_storyboard_pause(commerce_db, story_run)
+    board = _stage_steps(parent, StoryRunStage.STORYBOARD)[0]
+    refs = board.output_payload["artifact_references"]
+    first_segment = commerce_db.get(VideoSegmentPlan, refs["video_segment_ids"][0])
+    second_segment = create_video_segment_plan(
+        commerce_db, story_run_id=story_run.id, chapter_id=first_segment.chapter_id,
+        segment_number=first_segment.segment_number + 1, target_duration_ms=4000,
+        narrative_target="第二个必须覆盖的已确认片段",
+    )
+    second_shot = add_sub_shot_plan(
+        commerce_db, second_segment, shot_number=1, start_ms=0, end_ms=4000,
+        action="继续体验产品", emotion="安心", shot_scale="中景", camera_move="固定",
+        lighting="柔光", visual_description="第二段连续画面",
+    )
+    second_placement = create_product_placement_plan(
+        commerce_db, story_run_id=story_run.id, product_asset_version_id=story_run.product_asset_version_id,
+        chapter_id=None, video_segment_id=None, sub_shot_id=second_shot.id,
+        placement_method=ProductPlacementMethod.SOFT_PROP, placement_strength=ProductPlacementStrength.LIGHT,
+        pain_point_trigger="继续展示", product_action="继续使用", ad_entry_point="第二段", story_recovery_point="收束", planned_duration_ms=1000,
+    )
+    board.output_payload = {
+        **board.output_payload,
+        "artifact_references": {
+            **refs,
+            "video_segment_ids": [*refs["video_segment_ids"], second_segment.id],
+            "product_placement_ids": [*refs["product_placement_ids"], second_placement.id],
+        },
+    }
+    flag_modified(board, "output_payload")
+    commerce_db.commit()
+    _confirm(commerce_db, story_run, StoryRunStage.STORYBOARD)
+    _, parent, _ = continue_story_run(commerce_db, story_run.id)
+    _execute(parent)
+    _confirm(commerce_db, story_run, StoryRunStage.VISUAL_ASSETS)
+    _, parent, _ = continue_story_run(commerce_db, story_run.id)
+    _execute(parent)
+    commerce_db.expire_all()
+    parent = commerce_db.get(WorkflowRun, parent.id)
+    prompt_step = _stage_steps(parent, StoryRunStage.VIDEO_PROMPTS)[0]
+    prompt_ids = prompt_step.output_payload["artifact_references"]["video_prompt_version_ids"]
+    assert len(prompt_ids) == 2
+    prompt_step.output_payload = {
+        **prompt_step.output_payload,
+        "artifact_references": {"video_prompt_version_ids": [prompt_ids[0]]},
+    }
+    flag_modified(prompt_step, "output_payload")
+    commerce_db.commit()
+    before = commerce_db.scalar(
+        select(func.count()).select_from(ReviewDecision).where(ReviewDecision.target_id == prompt_step.id)
+    )
+    with pytest.raises(HTTPException) as partial:
+        _confirm(commerce_db, story_run, StoryRunStage.VIDEO_PROMPTS)
+    assert partial.value.status_code == 422
+    assert story_run.state.status == StoryRunStatus.PAUSED
+    assert commerce_db.scalar(
+        select(func.count()).select_from(ReviewDecision).where(ReviewDecision.target_id == prompt_step.id)
+    ) == before
+
+
+def test_render_review_requires_completed_batch_and_every_accepted_segment(commerce_db):
+    """回归 7：批次计数与状态都不能替代全部已采用片段的成功结果。"""
+
+    project, topic, selection, mode = _context(commerce_db)
+    story_run = create_next_story_run(commerce_db, project_id=project.id, topic_candidate_id=topic.id, project_product_selection_id=selection.id, mode=mode)
+    parent = _run_to_video_prompts_pause(commerce_db, story_run)
+    _confirm(commerce_db, story_run, StoryRunStage.VIDEO_PROMPTS)
+    _, parent, _ = continue_story_run(commerce_db, story_run.id)
+    _execute(parent)
+    step = _stage_steps(parent, StoryRunStage.SEGMENT_RENDER)[0]
+    batch = commerce_db.get(__import__("app.models", fromlist=["RenderBatch"]).RenderBatch, step.output_payload["artifact_references"]["render_batch_id"])
+    accepted = commerce_db.get(VideoPromptVersion, step.workflow_run.steps[-2].output_payload["artifact_references"]["video_prompt_version_ids"][0]).video_segment
+    before = commerce_db.scalar(select(func.count()).select_from(ReviewDecision))
+    for batch_status, total, completed, failed, running, segment_status in (
+        (RenderBatchStatus.PENDING, 1, 1, 0, 0, SegmentPlanStatus.COMPLETED),
+        (RenderBatchStatus.FAILED, 1, 1, 0, 0, SegmentPlanStatus.COMPLETED),
+        (RenderBatchStatus.COMPLETED, 0, 0, 0, 0, SegmentPlanStatus.COMPLETED),
+        (RenderBatchStatus.COMPLETED, 1, 0, 1, 0, SegmentPlanStatus.COMPLETED),
+        (RenderBatchStatus.COMPLETED, 1, 1, 0, 0, SegmentPlanStatus.FAILED),
+    ):
+        batch.status, batch.total_tasks, batch.completed_tasks = batch_status, total, completed
+        batch.failed_tasks, batch.running_tasks, accepted.status = failed, running, segment_status
+        commerce_db.commit()
+        with pytest.raises(HTTPException) as incomplete:
+            _confirm(commerce_db, story_run, StoryRunStage.SEGMENT_RENDER)
+        assert incomplete.value.status_code == 409
+        assert commerce_db.scalar(select(func.count()).select_from(ReviewDecision)) == before
+
+
+def test_retry_rejects_stale_failed_attempt_and_accepts_latest(commerce_db):
+    """回归 9：retry 只能从当前阶段最后一个 FAILED attempt 产生下一版。"""
+
+    project, topic, selection, mode = _context(commerce_db)
+    story_run = create_next_story_run(commerce_db, project_id=project.id, topic_candidate_id=topic.id, project_product_selection_id=selection.id, mode=mode)
+    _, parent, _ = start_story_run(commerce_db, story_run.id)
+    first = _stage_steps(parent, StoryRunStage.OUTLINE)[0]
+    first.model_profile_snapshot["model_bindings"]["STORY_GENERATE"][0]["profile_snapshot"]["adapter_key"] = "unsupported"
+    flag_modified(first, "model_profile_snapshot")
+    commerce_db.commit()
+    _execute(parent)
+    _, parent, _ = retry_step(commerce_db, story_run.id, first.id)
+    second = _stage_steps(parent, StoryRunStage.OUTLINE)[-1]
+    second.model_profile_snapshot["model_bindings"]["STORY_GENERATE"][0]["profile_snapshot"]["adapter_key"] = "unsupported"
+    flag_modified(second, "model_profile_snapshot")
+    commerce_db.commit()
+    _execute(parent)
+    with pytest.raises(HTTPException) as stale:
+        retry_step(commerce_db, story_run.id, first.id)
+    assert stale.value.status_code == 409
+    _, parent, created = retry_step(commerce_db, story_run.id, second.id)
+    assert created and _stage_steps(parent, StoryRunStage.OUTLINE)[-1].attempt == 3
+
+
 def test_0012_nonempty_round_trip_preserves_existing_workflow_runs(tmp_path):
     """0012 不回填历史，也必须在非空 0011 数据上安全往返。"""
 
@@ -1179,8 +1468,8 @@ def test_0012_nonempty_round_trip_preserves_existing_workflow_runs(tmp_path):
     migrate("upgrade", "0012_commerce_workflow_orchestration")
 
 
-def test_0012_sqlite_integrity_triggers_and_nonempty_round_trip(tmp_path):
-    """非空 0011 → 0012 → 0011 → 0012 保留 Commerce 核心引用并验证全部触发器语义。"""
+def test_0013_sqlite_integrity_triggers_and_nonempty_round_trip(tmp_path):
+    """非空 0012 → 0013 → 0012 → 0013 保留引用并加固跨表 sidecar 语义。"""
 
     database_url = f"sqlite:///{tmp_path / 'commerce-0012-integrity.db'}"
     server_root = Path(__file__).resolve().parents[1]
@@ -1248,7 +1537,9 @@ def test_0012_sqlite_integrity_triggers_and_nonempty_round_trip(tmp_path):
     counts_0011, triggers_0011, _ = sqlite_state(False)
     assert counts_0011["story_runs"] == 1 and not any(name.startswith("trg_commerce_") for name in triggers_0011)
 
+    # 明确从已发布 0012 的非空 Commerce 数据升级到 0013，而非直接跳过中间 schema。
     migrate("0012_commerce_workflow_orchestration")
+    migrate("0013_commerce_phase2_integrity_fixes")
     commerce_run, commerce_step, prompt = str(uuid4()), str(uuid4()), str(uuid4())
     migration_engine = create_engine(database_url)
     try:
@@ -1272,6 +1563,24 @@ def test_0012_sqlite_integrity_triggers_and_nonempty_round_trip(tmp_path):
             with pytest.raises(IntegrityError):
                 connection.exec_driver_sql("UPDATE commerce_workflow_steps SET story_run_id = ? WHERE workflow_step_id = ?", ("missing-story", commerce_step))
             connection.rollback()
+            # 已建立 link 的父运行既不能改成 V1/其他 workflow_key，也不能改到其他
+            # 项目；这两条约束不能只依赖应用服务的创建路径。
+            foreign_project = str(uuid4())
+            with connection.begin():
+                connection.exec_driver_sql(
+                    "INSERT INTO projects (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                    (foreign_project, "错误项目", now, now),
+                )
+            with pytest.raises(IntegrityError):
+                connection.exec_driver_sql(
+                    "UPDATE workflow_runs SET workflow_key = 'v1_video_generation' WHERE id = ?", (commerce_run,)
+                )
+            connection.rollback()
+            with pytest.raises(IntegrityError):
+                connection.exec_driver_sql(
+                    "UPDATE workflow_runs SET project_id = ? WHERE id = ?", (foreign_project, commerce_run)
+                )
+            connection.rollback()
             # 不同阶段也不能在同一 Commerce 父运行下同时处于活动状态；否则当前
             # 步骤、retry 目标和队列消息都会产生歧义。
             connection.exec_driver_sql("UPDATE workflow_steps SET status = 'PENDING' WHERE id = ?", (commerce_step,))
@@ -1292,6 +1601,19 @@ def test_0012_sqlite_integrity_triggers_and_nonempty_round_trip(tmp_path):
                 "JOIN workflow_steps w ON w.id = c.workflow_step_id WHERE c.workflow_step_id = ?",
                 (commerce_step,),
             ).one() == ("PENDING", "PENDING")
+            # 0013 除状态外还冻结 stage 与 attempt；sidecar 不能伪装为另一个真实节点。
+            with pytest.raises(IntegrityError):
+                connection.exec_driver_sql(
+                    "UPDATE commerce_workflow_steps SET stage = 'CHAPTERS' WHERE workflow_step_id = ?",
+                    (commerce_step,),
+                )
+            connection.rollback()
+            with pytest.raises(IntegrityError):
+                connection.exec_driver_sql(
+                    "UPDATE commerce_workflow_steps SET attempt = 2 WHERE workflow_step_id = ?",
+                    (commerce_step,),
+                )
+            connection.rollback()
             competing_step = str(uuid4())
             connection.exec_driver_sql(
                 "INSERT INTO workflow_steps (id, workflow_run_id, step_key, position, status, progress, attempt, input_payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1319,6 +1641,9 @@ def test_0012_sqlite_integrity_triggers_and_nonempty_round_trip(tmp_path):
         "trg_commerce_workflow_step_scope_update",
         "trg_workflow_steps_sync_commerce_status",
         "trg_commerce_workflow_link_delete",
+        "trg_commerce_workflow_link_scope_insert",
+        "trg_workflow_runs_commerce_link_scope",
+        "trg_workflow_steps_commerce_identity_guard",
     }.issubset(triggers_0012)
     assert {
         "ix_commerce_workflow_links_story_run_id",
@@ -1347,13 +1672,25 @@ def test_0012_sqlite_integrity_triggers_and_nonempty_round_trip(tmp_path):
     finally:
         migration_engine.dispose()
 
+    migrate("0012_commerce_workflow_orchestration", downgrade=True)
+    migration_engine = create_engine(database_url)
+    try:
+        with migration_engine.connect() as connection:
+            triggers_down_to_0012 = {row[0] for row in connection.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='trigger'")}
+            tables_down_to_0012 = {row[0] for row in connection.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table'")}
+            assert "commerce_chapter_attempt_chapters" not in tables_down_to_0012
+            assert "trg_commerce_workflow_link_scope_insert" not in triggers_down_to_0012
+            assert "trg_commerce_workflow_step_scope_insert" in triggers_down_to_0012
+    finally:
+        migration_engine.dispose()
+    migrate("0013_commerce_phase2_integrity_fixes")
     migrate("0011_commerce_domain_integrity_fixes", downgrade=True)
     counts_down, triggers_down, indexes_down = sqlite_state(False)
     assert counts_down["story_runs"] == 1 and not triggers_down.intersection(triggers_0012)
     assert "uq_commerce_workflow_step_attempt" not in indexes_down
     assert counts_down["workflow_runs"] == 1 and counts_down["workflow_steps"] == 1
 
-    migrate("0012_commerce_workflow_orchestration")
+    migrate("0013_commerce_phase2_integrity_fixes")
     counts_up_again, triggers_up_again, indexes_up_again = sqlite_state(True)
     assert counts_up_again["story_runs"] == 1 and counts_up_again["workflow_runs"] == 1
     assert triggers_0012 == triggers_up_again
@@ -1411,6 +1748,45 @@ def _sqlite_schema_fingerprint(database_url: str) -> tuple[tuple, ...]:
                 connection.exec_driver_sql("SELECT name FROM sqlite_master WHERE name LIKE '_alembic_tmp_%'").fetchall()
             )
             return tuple(table_entries) + (("__triggers__", triggers), ("__temporary__", temporary))
+    finally:
+        migration_engine.dispose()
+
+
+def test_0013_downgrade_schema_matches_fresh_0012_and_reupgrades(tmp_path):
+    """0013 downgrade 必须精确恢复已发布 0012 的表、索引、外键和 trigger。"""
+
+    server_root = Path(__file__).resolve().parents[1]
+    fresh_url = f"sqlite:///{tmp_path / 'fresh-0012.db'}"
+    round_trip_url = f"sqlite:///{tmp_path / 'round-trip-0012.db'}"
+
+    def migrate(database_url: str, revision: str, *, downgrade: bool = False) -> None:
+        config = Config(str(server_root / "alembic.ini"))
+        config.set_main_option("script_location", str(server_root / "migrations"))
+        migration_engine = create_engine(database_url)
+        try:
+            with migration_engine.connect() as connection:
+                connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+                connection.commit()
+                config.attributes["connection"] = connection
+                (command.downgrade if downgrade else command.upgrade)(config, revision)
+                config.attributes.pop("connection", None)
+        finally:
+            migration_engine.dispose()
+
+    migrate(fresh_url, "0012_commerce_workflow_orchestration")
+    migrate(round_trip_url, "0012_commerce_workflow_orchestration")
+    fingerprint_0012 = _sqlite_schema_fingerprint(fresh_url)
+    migrate(round_trip_url, "0013_commerce_phase2_integrity_fixes")
+    migrate(round_trip_url, "0012_commerce_workflow_orchestration", downgrade=True)
+    assert _sqlite_schema_fingerprint(round_trip_url) == fingerprint_0012
+    migrate(round_trip_url, "0013_commerce_phase2_integrity_fixes")
+    migration_engine = create_engine(round_trip_url)
+    try:
+        with migration_engine.connect() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='commerce_chapter_attempt_chapters'"
+            ).scalar_one() == 1
+            assert connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
     finally:
         migration_engine.dispose()
 

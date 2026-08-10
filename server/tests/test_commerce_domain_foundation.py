@@ -506,7 +506,7 @@ def test_render_batch_reuses_existing_workflow_run(commerce_db) -> None:
 
 
 def test_alembic_commerce_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
-    """验证 0011 → 0012 → 0011 → 0012，且最终迁移链只有一个 head。"""
+    """验证 Commerce 迁移链可往返，且最终只有 0013 这一个 head。"""
 
     server_root = Path(__file__).resolve().parents[1]
     database_path = tmp_path / "commerce-migration.db"
@@ -528,7 +528,7 @@ def test_alembic_commerce_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
 
     config = Config(str(server_root / "alembic.ini"))
     config.set_main_option("script_location", str(server_root / "migrations"))
-    assert ScriptDirectory.from_config(config).get_heads() == ["0012_commerce_workflow_orchestration"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["0013_commerce_phase2_integrity_fixes"]
 
     run_revision("upgrade", "0010_commerce_domain_foundation")
     run_revision("upgrade", "head")
@@ -537,6 +537,7 @@ def test_alembic_commerce_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
         assert {
             "script_assets", "story_runs", "video_segment_plans", "render_batches",
             "commerce_workflow_links", "commerce_workflow_steps", "video_prompt_versions",
+            "commerce_chapter_attempt_chapters",
         }.issubset(
             inspect(migration_engine).get_table_names()
         )

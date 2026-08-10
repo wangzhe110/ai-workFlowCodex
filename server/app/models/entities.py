@@ -1328,6 +1328,39 @@ class CommerceWorkflowStep(Base):
     workflow_step: Mapped[WorkflowStep] = relationship(back_populates="commerce_step")
 
 
+class CommerceChapterAttemptChapter(Base):
+    """将章节产物归属到生成它的 Commerce ``CHAPTERS`` attempt。
+
+    ``ChapterPlan`` 是 Phase 1 已发布的通用资产，保留了同一 StoryRun 内的章节号
+    唯一性。这里使用独立的不可变关联表，而不是覆盖或重编号旧章节：一次重做会新建
+    ChapterPlan，并由新的 WorkflowStep 形成新的结果组。后续阶段只能从已审核的
+    ``CHAPTERS`` step 的 artifact references 读取这一组章节。
+    """
+
+    __tablename__ = "commerce_chapter_attempt_chapters"
+    __table_args__ = (
+        UniqueConstraint("chapter_plan_id", name="uq_commerce_chapter_attempt_chapter"),
+        UniqueConstraint("workflow_step_id", "position", name="uq_commerce_chapter_attempt_position"),
+        CheckConstraint("position >= 1", name="ck_commerce_chapter_attempt_position_positive"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    workflow_step_id: Mapped[str] = mapped_column(
+        ForeignKey("commerce_workflow_steps.workflow_step_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    story_run_id: Mapped[str] = mapped_column(
+        ForeignKey("story_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    outline_version_id: Mapped[str] = mapped_column(
+        ForeignKey("story_outline_versions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    chapter_plan_id: Mapped[str] = mapped_column(
+        ForeignKey("chapter_plans.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
 class TopicCandidate(Base):
     """一次选题生成得到的原创候选。
 

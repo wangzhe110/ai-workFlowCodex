@@ -190,6 +190,7 @@ def _mark_dispatch_failure(run_id: str, message: str) -> None:
         now = datetime.now(timezone.utc)
         run.status = RunStatus.FAILED
         run.finished_at = now
+        failed_step_id: str | None = None
         for step in run.steps:
             if step.status == RunStatus.PENDING:
                 step.status = RunStatus.FAILED
@@ -203,6 +204,7 @@ def _mark_dispatch_failure(run_id: str, message: str) -> None:
                 )
                 step.error_message = message[:2000]
                 step.finished_at = now
+                failed_step_id = step.id
         # Commerce 运行拥有独立状态机；队列投递失败不能只让 WorkflowRun 失败而把
         # StoryRun 留在 RUNNING，从而失去明确的 retry 入口。
         link = db.get(CommerceWorkflowLink, run.id)
@@ -213,6 +215,9 @@ def _mark_dispatch_failure(run_id: str, message: str) -> None:
                 story_run.state.stage_data = {
                     "blocked_reason": "dispatch_failed",
                     "failed_workflow_run_id": run.id,
+                    # Retry 必须定位到实际失败的 attempt，而不是靠父 WorkflowRun
+                    # 猜测当前阶段；这对队列投递失败与 Worker 执行失败保持一致。
+                    "failed_step_id": failed_step_id,
                 }
         db.commit()
     finally:

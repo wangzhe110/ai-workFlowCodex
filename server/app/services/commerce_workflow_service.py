@@ -14,13 +14,14 @@ from hashlib import sha256
 from typing import Any, Protocol
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal
 from app.models import (
     ChapterPlan,
+    CommerceChapterAttemptChapter,
     CommerceWorkflowLink,
     CommerceWorkflowStep,
     DialogueLine,
@@ -40,6 +41,7 @@ from app.models import (
     ReviewDecision,
     RunStatus,
     SceneMappingVersion,
+    SegmentPlanStatus,
     StoryOutlineVersion,
     StoryRun,
     StoryRunMode,
@@ -130,9 +132,18 @@ def _stage_name(value: StoryRunStage) -> str:
 
 
 def _locked_story_run(db: Session, story_run_id: str) -> StoryRun:
-    run = db.scalars(select(StoryRun).where(StoryRun.id == story_run_id).with_for_update()).first()
+    # API/Worker 使用不同 Session。显式刷新避免调用方持有的 identity-map 把 Worker
+    # 已落库的 FAILED/PAUSED 状态误判成旧 RUNNING，从而将 retry 或人工审核拒绝掉。
+    run = db.scalars(
+        select(StoryRun)
+        .where(StoryRun.id == story_run_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).first()
     if run is None:
         _error("StoryRun 不存在", status.HTTP_404_NOT_FOUND)
+    db.refresh(run)
+    db.refresh(run.state)
     return run
 
 
@@ -653,31 +664,103 @@ def _artifact_id(step: WorkflowStep, key: str) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def _validate_chapters(db: Session, story_run: StoryRun, outline_id: str) -> None:
-    chapters = list(
+def _chapter_attempt_chapters(
+    db: Session,
+    story_run: StoryRun,
+    step: WorkflowStep,
+    *,
+    outline_id: str | None = None,
+) -> list[ChapterPlan]:
+    """读取一个 ``CHAPTERS`` attempt 专属的章节结果组。
+
+    Phase 1 的 ``ChapterPlan`` 不带 attempt 列，且同一 StoryRun 章节号唯一。新表把
+    追加章节关联到生成它的 ``WorkflowStep``，使被驳回 attempt 的章节永久可追溯、
+    但不会被当前确认或后续分镜混入。``position`` 是当前结果组内的顺序；实体自身的
+    ``chapter_number`` 继续保留 Phase 1 的全局唯一语义。
+    """
+
+    refs = (step.output_payload or {}).get("artifact_references", {})
+    chapter_ids = refs.get("chapter_ids")
+    if (
+        step.step_key != StoryRunStage.CHAPTERS.value
+        or not isinstance(chapter_ids, list)
+        or not chapter_ids
+        or len(set(chapter_ids)) != len(chapter_ids)
+    ):
+        _error("章节结果缺少当前 attempt 的章节引用", status.HTTP_422_UNPROCESSABLE_CONTENT)
+    links = list(
         db.scalars(
-            select(ChapterPlan)
-            .where(ChapterPlan.story_run_id == story_run.id, ChapterPlan.outline_version_id == outline_id)
-            .order_by(ChapterPlan.chapter_number)
+            select(CommerceChapterAttemptChapter)
+            .where(
+                CommerceChapterAttemptChapter.workflow_step_id == step.id,
+                CommerceChapterAttemptChapter.story_run_id == story_run.id,
+            )
+            .order_by(CommerceChapterAttemptChapter.position)
         ).all()
     )
-    if not chapters or [item.chapter_number for item in chapters] != list(range(1, len(chapters) + 1)):
-        _error("章节结果不完整或顺序不连续", status.HTTP_422_UNPROCESSABLE_CONTENT)
+    if (
+        len(links) != len(chapter_ids)
+        or {item.chapter_plan_id for item in links} != set(chapter_ids)
+        or [item.position for item in links] != list(range(1, len(links) + 1))
+    ):
+        _error("章节结果与当前 attempt 的版本组不一致", status.HTTP_422_UNPROCESSABLE_CONTENT)
+    if outline_id is not None and any(item.outline_version_id != outline_id for item in links):
+        _error("章节结果没有全部基于当前锁定大纲", status.HTTP_422_UNPROCESSABLE_CONTENT)
+    chapters = {item.id: item for item in db.scalars(select(ChapterPlan).where(ChapterPlan.id.in_(chapter_ids))).all()}
+    if len(chapters) != len(chapter_ids):
+        _error("章节结果引用了不存在的章节", status.HTTP_422_UNPROCESSABLE_CONTENT)
+    ordered = [chapters[item.chapter_plan_id] for item in links]
+    if any(
+        item.story_run_id != story_run.id
+        or item.outline_version_id != link.outline_version_id
+        for item, link in zip(ordered, links)
+    ):
+        _error("章节结果归属或大纲版本无效", status.HTTP_422_UNPROCESSABLE_CONTENT)
+    return ordered
+
+
+def _validate_chapters(db: Session, story_run: StoryRun, step: WorkflowStep, outline_id: str) -> list[ChapterPlan]:
+    return _chapter_attempt_chapters(db, story_run, step, outline_id=outline_id)
 
 
 def _validate_storyboard(db: Session, story_run: StoryRun, step: WorkflowStep) -> None:
     refs = (step.output_payload or {}).get("artifact_references", {})
     mapping = db.get(SceneMappingVersion, refs.get("scene_mapping_id"))
+    chapter_ids = refs.get("chapter_ids") or []
     segment_ids = refs.get("video_segment_ids") or []
     dialogue_ids = refs.get("dialogue_line_ids") or []
+    placement_ids = refs.get("product_placement_ids") or []
     if (
         mapping is None
         or mapping.story_run_id != story_run.id
+        or not isinstance(chapter_ids, list)
+        or not chapter_ids
         or not isinstance(segment_ids, list)
         or not segment_ids
         or not isinstance(dialogue_ids, list)
+        or not isinstance(placement_ids, list)
+        or not placement_ids
+        or len(set(chapter_ids)) != len(chapter_ids)
+        or len(set(segment_ids)) != len(segment_ids)
+        or len(set(placement_ids)) != len(placement_ids)
     ):
-        _error("分镜结果缺少本 StoryRun 的场景映射或视频片段", status.HTTP_422_UNPROCESSABLE_CONTENT)
+        _error("分镜结果缺少当前章节、场景映射、片段或产品植入引用", status.HTTP_422_UNPROCESSABLE_CONTENT)
+    # AUTO 已在 CHAPTERS 成功时完成同一套完整性校验，但没有伪造人工
+    # ReviewDecision；因此它采用当前成功 attempt。STEPWISE 仍严格只使用人工
+    # 确认的 attempt。
+    accepted_chapter_step = (
+        _latest_successful_step(db, story_run.id, StoryRunStage.CHAPTERS)
+        if story_run.mode == StoryRunMode.AUTO
+        else _latest_approved_step(db, story_run.id, StoryRunStage.CHAPTERS)
+    )
+    current_chapters = _chapter_attempt_chapters(
+        db,
+        story_run,
+        accepted_chapter_step,
+        outline_id=_artifact_id(accepted_chapter_step, "outline_id"),
+    )
+    if set(chapter_ids) != {item.id for item in current_chapters}:
+        _error("分镜只能使用当前已确认章节 attempt 的结果", status.HTTP_422_UNPROCESSABLE_CONTENT)
     segments = list(db.scalars(select(VideoSegmentPlan).where(VideoSegmentPlan.id.in_(segment_ids))).all())
     if len(segments) != len(segment_ids):
         _error("分镜结果引用了不存在的视频片段", status.HTTP_422_UNPROCESSABLE_CONTENT)
@@ -686,16 +769,49 @@ def _validate_storyboard(db: Session, story_run: StoryRun, step: WorkflowStep) -
         if segment.story_run_id != story_run.id or segment.target_duration_ms < 4000 or segment.target_duration_ms > 15000:
             _error("分镜视频片段归属或时长无效", status.HTTP_422_UNPROCESSABLE_CONTENT)
         chapter = db.get(ChapterPlan, segment.chapter_id)
-        if chapter is None or chapter.story_run_id != story_run.id:
+        if chapter is None or chapter.story_run_id != story_run.id or chapter.id not in set(chapter_ids):
             _error("分镜视频片段引用了其他 StoryRun 的章节", status.HTTP_422_UNPROCESSABLE_CONTENT)
         for shot in segment.sub_shots:
             if shot.end_ms > segment.target_duration_ms:
                 _error("子镜头超出所属片段时长", status.HTTP_422_UNPROCESSABLE_CONTENT)
-        for placement in db.scalars(
-            select(ProductPlacementPlan).where(ProductPlacementPlan.video_segment_id == segment.id)
-        ).all():
-            if placement.story_run_id != story_run.id or placement.product_asset_version_id != story_run.product_asset_version_id:
-                _error("分镜产品植入引用了错误的冻结产品版本", status.HTTP_422_UNPROCESSABLE_CONTENT)
+    sub_shot_ids = [shot.id for segment in segments for shot in segment.sub_shots]
+    placements = list(
+        db.scalars(select(ProductPlacementPlan).where(ProductPlacementPlan.id.in_(placement_ids))).all()
+    )
+    if len(placements) != len(placement_ids):
+        _error("分镜结果引用了不存在的产品植入", status.HTTP_422_UNPROCESSABLE_CONTENT)
+    placement_by_id = {item.id: item for item in placements}
+    if set(placement_by_id) != set(placement_ids):
+        _error("分镜产品植入引用重复或不完整", status.HTTP_422_UNPROCESSABLE_CONTENT)
+    for placement in placements:
+        if (
+            placement.story_run_id != story_run.id
+            or placement.product_asset_version_id != story_run.product_asset_version_id
+        ):
+            _error("分镜产品植入引用了错误的冻结产品版本", status.HTTP_422_UNPROCESSABLE_CONTENT)
+        if placement.chapter_id is not None and placement.chapter_id not in set(chapter_ids):
+            _error("章节级产品植入不属于当前审核章节结果", status.HTTP_422_UNPROCESSABLE_CONTENT)
+        if placement.video_segment_id is not None and placement.video_segment_id not in set(segment_ids):
+            _error("片段级产品植入不属于当前审核分镜结果", status.HTTP_422_UNPROCESSABLE_CONTENT)
+        if placement.sub_shot_id is not None and placement.sub_shot_id not in set(sub_shot_ids):
+            _error("子镜头级产品植入不属于当前审核分镜结果", status.HTTP_422_UNPROCESSABLE_CONTENT)
+
+    # 当前章节、片段和子镜头范围内的所有植入都必须被本次 Storyboard 显式声明；否则
+    # 一个旧 attempt 的隐藏植入可能在审核后被渲染器意外采用。
+    scoped_placement_ids = {
+        item.id
+        for item in db.scalars(
+            select(ProductPlacementPlan).where(
+                or_(
+                    ProductPlacementPlan.chapter_id.in_(chapter_ids),
+                    ProductPlacementPlan.video_segment_id.in_(segment_ids),
+                    ProductPlacementPlan.sub_shot_id.in_(sub_shot_ids),
+                )
+            )
+        ).all()
+    }
+    if scoped_placement_ids != set(placement_ids):
+        _error("产品植入清单未完整覆盖当前审核分镜结果", status.HTTP_422_UNPROCESSABLE_CONTENT)
 
     # 对白是可独立查询的生产数据，不能只因数据库中存在就被默认视为本次分镜的
     # 输出。节点必须显式列出本次采用的对白 ID；这样审核能够拒绝跨 StoryRun、跨
@@ -745,13 +861,44 @@ def _validate_visual_references(db: Session, story_run: StoryRun, step: Workflow
             _error("视觉资产必须是本项目已锁定的版本", status.HTTP_422_UNPROCESSABLE_CONTENT)
 
 
-def _validate_video_prompts(db: Session, story_run: StoryRun, step: WorkflowStep) -> list[VideoPromptVersion]:
+def _accepted_storyboard_segments(db: Session, story_run: StoryRun) -> list[VideoSegmentPlan]:
+    """返回已确认 Storyboard 的完整片段集合，而不是任意历史片段。"""
+
+    storyboard = _latest_approved_step(db, story_run.id, StoryRunStage.STORYBOARD)
+    _validate_storyboard(db, story_run, storyboard)
+    ids = (storyboard.output_payload or {}).get("artifact_references", {}).get("video_segment_ids") or []
+    segments = {item.id: item for item in db.scalars(select(VideoSegmentPlan).where(VideoSegmentPlan.id.in_(ids))).all()}
+    return [segments[item_id] for item_id in ids]
+
+
+def _prompt_versions_for_step(db: Session, story_run: StoryRun, step: WorkflowStep) -> list[VideoPromptVersion]:
     ids = (step.output_payload or {}).get("artifact_references", {}).get("video_prompt_version_ids") or []
     versions = list(db.scalars(select(VideoPromptVersion).where(VideoPromptVersion.id.in_(ids))).all()) if isinstance(ids, list) else []
     if not versions or len(versions) != len(ids):
         _error("视频提示词结果不完整", status.HTTP_422_UNPROCESSABLE_CONTENT)
-    if any(item.video_segment.story_run_id != story_run.id for item in versions):
+    if any(item.video_segment.story_run_id != story_run.id or item.workflow_step_id != step.id for item in versions):
         _error("视频提示词不能引用其他 StoryRun 的片段", status.HTTP_422_UNPROCESSABLE_CONTENT)
+    return versions
+
+
+def _validate_video_prompts(db: Session, story_run: StoryRun, step: WorkflowStep) -> list[VideoPromptVersion]:
+    versions = _prompt_versions_for_step(db, story_run, step)
+    segments = _accepted_storyboard_segments(db, story_run)
+    expected_ids = {item.id for item in segments}
+    actual_ids = [item.video_segment_id for item in versions]
+    if len(set(actual_ids)) != len(actual_ids) or set(actual_ids) != expected_ids:
+        _error("视频提示词必须完整覆盖已确认分镜的全部视频片段", status.HTTP_422_UNPROCESSABLE_CONTENT)
+    if any(item.status not in {"DRAFT", "LOCKED"} for item in versions):
+        _error("视频提示词版本已被驳回或替代，不能再次采用", status.HTTP_422_UNPROCESSABLE_CONTENT)
+    return versions
+
+
+def _lock_video_prompts(db: Session, story_run: StoryRun, step: WorkflowStep) -> list[VideoPromptVersion]:
+    versions = _validate_video_prompts(db, story_run, step)
+    now = utcnow()
+    for item in versions:
+        item.status = "LOCKED"
+        item.locked_at = now
     return versions
 
 
@@ -760,8 +907,18 @@ def _validate_render(db: Session, story_run: StoryRun, step: WorkflowStep) -> Re
     batch = db.get(RenderBatch, batch_id) if batch_id else None
     if batch is None or batch.story_run_id != story_run.id:
         _error("批量渲染结果不存在或不属于当前 StoryRun", status.HTTP_422_UNPROCESSABLE_CONTENT)
-    if batch.running_tasks or batch.failed_tasks or batch.completed_tasks != batch.total_tasks:
+    accepted_segments = _accepted_storyboard_segments(db, story_run)
+    if (
+        batch.status != RenderBatchStatus.COMPLETED
+        or batch.total_tasks <= 0
+        or batch.running_tasks
+        or batch.failed_tasks
+        or batch.completed_tasks != batch.total_tasks
+        or batch.total_tasks != len(accepted_segments)
+    ):
         _error("批量渲染尚未全部成功，不能完成 StoryRun", status.HTTP_409_CONFLICT)
+    if any(segment.status != SegmentPlanStatus.COMPLETED for segment in accepted_segments):
+        _error("已接受分镜仍有片段没有成功渲染结果", status.HTTP_409_CONFLICT)
     return batch
 
 
@@ -811,15 +968,15 @@ def review_stage(
             locked = db.scalars(select(StoryOutlineVersion).where(StoryOutlineVersion.story_run_id == story_run.id, StoryOutlineVersion.status == OutlineVersionStatus.LOCKED)).first()
             if locked is None:
                 _error("章节必须基于已锁定大纲", status.HTTP_422_UNPROCESSABLE_CONTENT)
-            _validate_chapters(db, story_run, locked.id)
+            if _artifact_id(step, "outline_id") != locked.id:
+                _error("章节结果没有引用当前锁定大纲", status.HTTP_422_UNPROCESSABLE_CONTENT)
+            _validate_chapters(db, story_run, step, locked.id)
         elif stage == StoryRunStage.STORYBOARD:
             _validate_storyboard(db, story_run, step)
         elif stage == StoryRunStage.VISUAL_ASSETS:
             _validate_visual_references(db, story_run, step)
         elif stage == StoryRunStage.VIDEO_PROMPTS:
-            for prompt in _validate_video_prompts(db, story_run, step):
-                prompt.status = "LOCKED"
-                prompt.locked_at = utcnow()
+            _lock_video_prompts(db, story_run, step)
         elif stage == StoryRunStage.SEGMENT_RENDER:
             _validate_render(db, story_run, step)
     else:
@@ -828,6 +985,12 @@ def review_stage(
             outline = db.get(StoryOutlineVersion, candidate_id) if candidate_id else None
             if outline is not None and outline.story_run_id == story_run.id and outline.status == OutlineVersionStatus.DRAFT:
                 transition_story_outline_version_status(db, story_outline_version_id=outline.id, next_status=OutlineVersionStatus.SUPERSEDED)
+        elif stage == StoryRunStage.VIDEO_PROMPTS:
+            # 驳回不覆盖提示词版本；仅使它退出“当前可采用”集合。下一次 attempt 会
+            # 创建新的版本并由 WorkflowStep 显式追溯。
+            for prompt in _prompt_versions_for_step(db, story_run, step):
+                prompt.status = "REJECTED"
+                prompt.locked_at = None
 
     db.add(ReviewDecision(
         project_id=story_run.project_id,
@@ -868,6 +1031,9 @@ def retry_step(db: Session, story_run_id: str, step_id: str) -> tuple[StoryRun, 
     step = db.get(WorkflowStep, step_id)
     if step is None or step.workflow_run.commerce_link is None or step.workflow_run.commerce_link.story_run_id != story_run.id:
         _error("WorkflowStep 不存在或不属于当前 StoryRun", status.HTTP_404_NOT_FOUND)
+    # Worker 可能已在另一会话把同一 attempt 置为 FAILED。重试绝不能依据调用方
+    # identity-map 中的旧 PENDING/RUNNING 值判断目标。
+    db.refresh(step)
     stage = StoryRunStage(step.step_key)
     parent = _active_run(db, story_run.id)
     active_attempt = _active_step(db, parent.id) if parent is not None else None
@@ -879,6 +1045,17 @@ def retry_step(db: Session, story_run_id: str, step_id: str) -> tuple[StoryRun, 
         and active_attempt.attempt > step.attempt
     ):
         return story_run, parent, False
+    latest_attempt = int(
+        db.scalar(
+            select(func.max(CommerceWorkflowStep.attempt)).where(
+                CommerceWorkflowStep.story_run_id == story_run.id,
+                CommerceWorkflowStep.stage == stage.value,
+            )
+        )
+        or 0
+    )
+    if step.attempt != latest_attempt:
+        _error("只能重试当前阶段最新失败 attempt", status.HTTP_409_CONFLICT)
     if step.status != RunStatus.FAILED or story_run.state.status != StoryRunStatus.FAILED or story_run.state.current_stage != stage:
         _error("只有当前失败节点可以重试")
     story_run, concurrent_parent = _claim_story_run_state(
@@ -959,29 +1136,62 @@ class MockCommerceNodeExecutor:
         outline = context.db.scalars(select(StoryOutlineVersion).where(StoryOutlineVersion.story_run_id == context.story_run.id, StoryOutlineVersion.status == OutlineVersionStatus.LOCKED)).first()
         if outline is None:
             raise RuntimeError("章节规划缺少已锁定大纲")
+        chapter_number = int(
+            context.db.scalar(
+                select(func.max(ChapterPlan.chapter_number)).where(ChapterPlan.story_run_id == context.story_run.id)
+            )
+            or 0
+        ) + 1
         chapter = create_chapter_plan(
-            context.db, story_run_id=context.story_run.id, outline_version_id=outline.id, chapter_number=1,
+            context.db, story_run_id=context.story_run.id, outline_version_id=outline.id, chapter_number=chapter_number,
             title="第一章：痛点出现", narrative_purpose="建立人物需求", content_summary="主角遇到真实问题并寻找解决方式", product_plan={"placement": "soft_prop"},
         )
-        return self._result({"chapter_ids": [chapter.id], "outline_id": outline.id}, {"chapter_count": 1})
+        context.db.add(
+            CommerceChapterAttemptChapter(
+                workflow_step_id=context.workflow_step.id,
+                story_run_id=context.story_run.id,
+                outline_version_id=outline.id,
+                chapter_plan_id=chapter.id,
+                position=1,
+            )
+        )
+        context.db.flush()
+        return self._result(
+            {
+                "chapter_ids": [chapter.id],
+                "outline_id": outline.id,
+                "chapter_attempt_workflow_step_id": context.workflow_step.id,
+            },
+            {"chapter_count": 1, "chapter_attempt": context.workflow_step.attempt},
+        )
 
     def _execute_storyboard(self, context: CommerceNodeContext) -> CommerceNodeResult:
-        chapters = list(context.db.scalars(select(ChapterPlan).where(ChapterPlan.story_run_id == context.story_run.id).order_by(ChapterPlan.chapter_number)).all())
-        if not chapters:
-            raise RuntimeError("分镜规划缺少章节")
+        accepted_chapters = (
+            _latest_successful_step(context.db, context.story_run.id, StoryRunStage.CHAPTERS)
+            if context.story_run.mode == StoryRunMode.AUTO
+            else _latest_approved_step(context.db, context.story_run.id, StoryRunStage.CHAPTERS)
+        )
+        chapters = _chapter_attempt_chapters(
+            context.db,
+            context.story_run,
+            accepted_chapters,
+            outline_id=_artifact_id(accepted_chapters, "outline_id"),
+        )
         outline_id = chapters[0].outline_version_id
         mapping_version = int(context.db.scalar(select(func.max(SceneMappingVersion.version)).where(SceneMappingVersion.story_run_id == context.story_run.id)) or 0) + 1
         number = int(context.db.scalar(select(func.max(VideoSegmentPlan.segment_number)).where(VideoSegmentPlan.story_run_id == context.story_run.id)) or 0) + 1
         segment = create_video_segment_plan(context.db, story_run_id=context.story_run.id, chapter_id=chapters[0].id, segment_number=number, target_duration_ms=4000, narrative_target="用一个连续片段完成痛点与产品体验")
         sub_shot = add_sub_shot_plan(context.db, segment, shot_number=1, start_ms=0, end_ms=4000, action="主角拿起产品并体验", emotion="释然", shot_scale="中景", camera_move="缓慢推进", lighting="自然柔光", visual_description="产品与人物同框，画面连续")
         dialogue = create_dialogue_line(context.db, video_segment_id=None, sub_shot_id=sub_shot.id, speaker="主角", dialogue="这次终于解决了。", start_ms=300, end_ms=1800)
-        create_product_placement_plan(context.db, story_run_id=context.story_run.id, product_asset_version_id=context.story_run.product_asset_version_id, sub_shot_id=sub_shot.id, chapter_id=None, video_segment_id=None, placement_method=ProductPlacementMethod.SOFT_PROP, placement_strength=ProductPlacementStrength.LIGHT, pain_point_trigger="生活不便", product_action="自然拿起并使用", ad_entry_point="冲突解决时", story_recovery_point="体验后回到人物关系", planned_duration_ms=1500)
+        placement = create_product_placement_plan(context.db, story_run_id=context.story_run.id, product_asset_version_id=context.story_run.product_asset_version_id, sub_shot_id=sub_shot.id, chapter_id=None, video_segment_id=None, placement_method=ProductPlacementMethod.SOFT_PROP, placement_strength=ProductPlacementStrength.LIGHT, pain_point_trigger="生活不便", product_action="自然拿起并使用", ad_entry_point="冲突解决时", story_recovery_point="体验后回到人物关系", planned_duration_ms=1500)
         mapping = create_scene_mapping_version(context.db, story_run_id=context.story_run.id, outline_version_id=outline_id, version=mapping_version, mapping_snapshot=[{"chapter_id": chapters[0].id, "video_segment_id": segment.id}], status_value="DRAFT")
         return self._result(
             {
                 "scene_mapping_id": mapping.id,
+                "chapter_ids": [chapter.id for chapter in chapters],
                 "video_segment_ids": [segment.id],
                 "dialogue_line_ids": [dialogue.id],
+                "product_placement_ids": [placement.id],
             },
             {"segment_count": 1, "dialogue_line_count": 1},
         )
@@ -991,10 +1201,8 @@ class MockCommerceNodeExecutor:
         return self._result({"project_character_reference_ids": [], "project_scene_reference_ids": []}, {"generation": "not_requested_in_phase_2"})
 
     def _execute_video_prompts(self, context: CommerceNodeContext) -> CommerceNodeResult:
-        accepted = _latest_approved_step(context.db, context.story_run.id, StoryRunStage.STORYBOARD)
-        ids = (accepted.output_payload or {}).get("artifact_references", {}).get("video_segment_ids") or []
         created: list[str] = []
-        for segment in context.db.scalars(select(VideoSegmentPlan).where(VideoSegmentPlan.id.in_(ids))).all():
+        for segment in _accepted_storyboard_segments(context.db, context.story_run):
             version = int(context.db.scalar(select(func.max(VideoPromptVersion.version)).where(VideoPromptVersion.video_segment_id == segment.id)) or 0) + 1
             prompt = VideoPromptVersion(video_segment_id=segment.id, workflow_step_id=context.workflow_step.id, version=version, prompt="参考已锁定角色与场景，保持动作连续。", trace={"source": "commerce_mock", "stage": "VIDEO_PROMPTS"})
             context.db.add(prompt)
@@ -1005,15 +1213,14 @@ class MockCommerceNodeExecutor:
         return self._result({"video_prompt_version_ids": created}, {"prompt_count": len(created)})
 
     def _execute_segment_render(self, context: CommerceNodeContext) -> CommerceNodeResult:
-        prompts = _latest_successful_step(context.db, context.story_run.id, StoryRunStage.VIDEO_PROMPTS)
-        prompt_ids = (prompts.output_payload or {}).get("artifact_references", {}).get("video_prompt_version_ids") or []
-        versions = list(context.db.scalars(select(VideoPromptVersion).where(VideoPromptVersion.id.in_(prompt_ids))).all())
-        if not versions or any(item.locked_at is None for item in versions):
+        prompts = _latest_approved_step(context.db, context.story_run.id, StoryRunStage.VIDEO_PROMPTS)
+        versions = _validate_video_prompts(context.db, context.story_run, prompts)
+        if any(item.status != "LOCKED" or item.locked_at is None for item in versions):
             raise RuntimeError("批量渲染缺少锁定的视频提示词")
         batch_number = int(context.db.scalar(select(func.max(RenderBatch.batch_number)).where(RenderBatch.story_run_id == context.story_run.id)) or 0) + 1
         batch = create_render_batch(context.db, story_run_id=context.story_run.id, workflow_run_id=context.workflow_run.id, batch_number=batch_number, status=RenderBatchStatus.COMPLETED, total_tasks=len(versions), completed_tasks=len(versions), failed_tasks=0, running_tasks=0, model_config_snapshot=deepcopy((context.workflow_step.model_profile_snapshot or {}).get("model_bindings") or {}), generation_parameters_snapshot={"executor": "mock"}, estimated_cost=0, currency="CNY", started_at=utcnow(), finished_at=utcnow())
         for prompt in versions:
-            prompt.video_segment.status = __import__("app.models", fromlist=["SegmentPlanStatus"]).SegmentPlanStatus.COMPLETED
+            prompt.video_segment.status = SegmentPlanStatus.COMPLETED
         return self._result({"render_batch_id": batch.id}, {"completed_segments": len(versions)})
 
 
@@ -1070,10 +1277,17 @@ def _finish_success(context: CommerceNodeContext, result: CommerceNodeResult) ->
     run.status = RunStatus.PENDING
     run.finished_at = None
     state = context.story_run.state
-    if context.stage == StoryRunStage.VIDEO_PROMPTS:
-        for item in _validate_video_prompts(context.db, context.story_run, step):
-            item.status = "LOCKED"
-            item.locked_at = now
+    # STEPWISE 的视频提示词成功后只能停留在 DRAFT，必须由人工 confirm 才会
+    # LOCKED。AUTO 则在相同完整性校验通过后自动锁定，避免两条路径采用不同产物。
+    if context.stage == StoryRunStage.VIDEO_PROMPTS and context.story_run.mode == StoryRunMode.AUTO:
+        _lock_video_prompts(context.db, context.story_run, step)
+    # AUTO 不经过人工 CHAPTERS 闸门，因此在自动推进前同样校验当前 attempt 的完整
+    # 章节组；不能回读被驳回的旧章节，也不能把不完整结果推进到 STORYBOARD。
+    if context.stage == StoryRunStage.CHAPTERS and context.story_run.mode == StoryRunMode.AUTO:
+        outline_id = _artifact_id(step, "outline_id")
+        if outline_id is None:
+            _error("章节结果缺少大纲引用", status.HTTP_422_UNPROCESSABLE_CONTENT)
+        _validate_chapters(context.db, context.story_run, step, outline_id)
     if context.stage in REVIEW_GATES or context.story_run.mode == StoryRunMode.STEPWISE:
         state.status = StoryRunStatus.PAUSED
         state.stage_data = {"blocked_reason": "awaiting_review" if context.stage in REVIEW_GATES else "awaiting_continue"}

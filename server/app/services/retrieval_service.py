@@ -1,4 +1,4 @@
-"""向量库无关的 RAG 检索边界；默认只注册可注入的内存 Fake Provider。"""
+"""向量库无关的 RAG 检索边界；生产 Provider 必须显式注册。"""
 
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ from app.models import (
     ViralKnowledgeStatus,
     ViralPattern,
 )
+from app.models.entities import utcnow
+from app.services.sensitive_data import redact_sensitive_data, sanitize_error_summary
 
 
 @dataclass(frozen=True)
@@ -98,7 +100,6 @@ class FakeInMemoryRetriever:
 
 
 retriever_registry = RetrieverRegistry()
-retriever_registry.register(FakeInMemoryRetriever())
 retriever_router = RetrieverRouter()
 
 
@@ -150,34 +151,39 @@ def retrieve(
         _error("resource_types 包含不支持的资源类型", status.HTTP_422_UNPROCESSABLE_CONTENT)
     if any(value not in valid_statuses for value in query.filters.statuses):
         _error("statuses 包含不支持的知识状态", status.HTTP_422_UNPROCESSABLE_CONTENT)
-    provider = retriever_router.resolve(provider_key)
-    if provider is None:
-        _error("检索 Provider 未配置", status.HTTP_503_SERVICE_UNAVAILABLE)
     call = RetrievalCall(
         project_id=query.project_id,
         provider_key=provider_key,
         request_id=query.request_id or str(uuid4()),
         query_text=query.query_text.strip(),
-        filter_snapshot={
+        filter_snapshot=redact_sensitive_data({
             "top_k": query.top_k,
             "resource_types": list(query.filters.resource_types),
             "tags": list(query.filters.tags),
             "statuses": list(query.filters.statuses),
-        },
+        }),
         result_references=[],
         status=RunStatus.RUNNING,
     )
     db.add(call)
     db.flush()
     started = perf_counter()
+    provider = retriever_router.resolve(provider_key)
+    if provider is None:
+        call.status = RunStatus.FAILED
+        call.error_code = "RETRIEVER_PROVIDER_UNCONFIGURED"
+        call.error_summary = "检索 Provider 未配置"
+        call.latency_ms = int((perf_counter() - started) * 1000)
+        call.finished_at = utcnow()
+        db.commit()
+        _error("检索 Provider 未配置", status.HTTP_503_SERVICE_UNAVAILABLE)
     try:
         raw_hits = provider.search(query)
     except Exception as exc:
         call.status = RunStatus.FAILED
         call.error_code = "RETRIEVER_PROVIDER_ERROR"
-        call.error_summary = type(exc).__name__[:500]
+        call.error_summary = sanitize_error_summary(exc)
         call.latency_ms = int((perf_counter() - started) * 1000)
-        from app.models.entities import utcnow
         call.finished_at = utcnow()
         db.commit()
         _error("检索 Provider 暂不可用", status.HTTP_503_SERVICE_UNAVAILABLE)
@@ -199,9 +205,14 @@ def retrieve(
             statuses=query.filters.statuses,
         ):
             continue
-        by_id[hit.chunk_id] = hit
+        by_id[hit.chunk_id] = RetrievalHit(
+            chunk_id=hit.chunk_id,
+            resource_type=hit.resource_type,
+            resource_id=hit.resource_id,
+            score=hit.score,
+            metadata=redact_sensitive_data(hit.metadata),
+        )
     hits = sorted(by_id.values(), key=lambda item: (-item.score, item.chunk_id))[: query.top_k]
-    from app.models.entities import utcnow
     call.status = RunStatus.SUCCEEDED
     call.latency_ms = int((perf_counter() - started) * 1000)
     call.finished_at = utcnow()
@@ -212,6 +223,7 @@ def retrieve(
             "resource_type": item.resource_type,
             "resource_id": item.resource_id,
             "score": item.score,
+            "metadata": redact_sensitive_data(item.metadata),
         }
         for rank, item in enumerate(hits, start=1)
     ]

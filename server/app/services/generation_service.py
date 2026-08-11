@@ -20,6 +20,10 @@ from app.models import (
     RunStatus,
 )
 from app.models.entities import utcnow
+from app.services.sensitive_data import redact_sensitive_data, sanitize_error_summary
+
+
+_TERMINAL_STATES = frozenset({RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED})
 
 
 @dataclass(frozen=True)
@@ -142,16 +146,12 @@ def _supports(provider: GenerationProvider, request: GenerationRequest) -> bool:
 
 
 def _safe_snapshot(request: GenerationRequest) -> dict[str, Any]:
-    """拒绝把明显认证信息保存到任务或 invocation 快照。"""
+    """递归清理请求快照，避免嵌套认证字段进入持久化层。"""
 
-    forbidden = ("api_key", "apikey", "authorization", "password", "secret", "token")
-    for key in request.parameters:
-        if any(word in key.lower() for word in forbidden):
-            _error("生成参数不能包含密钥或认证信息", status.HTTP_422_UNPROCESSABLE_CONTENT)
     return {
         "capability": request.capability,
         "model_key": request.model_key,
-        "parameters": dict(request.parameters),
+        "parameters": redact_sensitive_data(request.parameters),
         "preferred_provider": request.preferred_provider,
         "fallback_providers": list(request.fallback_providers),
     }
@@ -175,15 +175,15 @@ def _record_invocation(
         provider_key=provider_key,
         model_key=request.model_key,
         request_snapshot=_safe_snapshot(request),
-        sanitized_response=dict(result.sanitized_response),
+        sanitized_response=redact_sensitive_data(result.sanitized_response),
         provider_task_id=result.provider_task_id,
         usage=dict(result.usage),
         status=result.status,
         error_code=result.error_code,
-        error_message=(result.error_message or None)[:500] if result.error_message else None,
+        error_message=sanitize_error_summary(result.error_message) if result.error_message else None,
         latency_ms=latency_ms,
         created_at=started_at,
-        finished_at=utcnow() if result.status in {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED} else None,
+        finished_at=utcnow() if result.status in _TERMINAL_STATES else None,
     )
     db.add(invocation)
     return invocation
@@ -199,7 +199,7 @@ def _apply_result(
 ) -> None:
     """单向状态机：终态永不被回调或 fallback 失败覆盖。"""
 
-    if task.status in {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED}:
+    if task.status in _TERMINAL_STATES:
         return
     task.provider_key = provider_key
     task.model_key = request.model_key
@@ -207,12 +207,12 @@ def _apply_result(
     task.usage = dict(result.usage)
     task.status = result.status
     task.error_code = result.error_code
-    task.error_message = (result.error_message or None)[:500] if result.error_message else None
+    task.error_message = sanitize_error_summary(result.error_message) if result.error_message else None
     task.latency_ms = latency_ms
     if result.status == RunStatus.SUCCEEDED:
-        task.output_reference = dict(result.output_reference or {})
+        task.output_reference = redact_sensitive_data(result.output_reference or {})
         task.finished_at = utcnow()
-    elif result.status == RunStatus.FAILED:
+    elif result.status in {RunStatus.FAILED, RunStatus.CANCELLED}:
         task.finished_at = utcnow()
 
 
@@ -266,6 +266,7 @@ def submit_generation(db: Session, *, request: GenerationRequest) -> tuple[Gener
     task.started_at = utcnow()
     errors: list[str] = []
     attempted = 0
+    last_result: GenerationResult | None = None
     for provider_key in candidates:
         provider = generation_provider_registry.resolve(provider_key)
         if provider is None or not _supports(provider, request):
@@ -280,7 +281,7 @@ def submit_generation(db: Session, *, request: GenerationRequest) -> tuple[Gener
             result = GenerationResult(
                 status=RunStatus.FAILED,
                 error_code="GENERATION_PROVIDER_EXCEPTION",
-                error_message=type(exc).__name__,
+                error_message=str(exc),
                 sanitized_response={"outcome": "exception"},
             )
         _record_invocation(
@@ -288,6 +289,7 @@ def submit_generation(db: Session, *, request: GenerationRequest) -> tuple[Gener
             request=request, result=result, started_at=started,
             latency_ms=int((perf_counter() - started_monotonic) * 1000),
         )
+        last_result = result
         if result.status in {RunStatus.SUCCEEDED, RunStatus.RUNNING}:
             task.fallback_used = attempted > 1
             _apply_result(
@@ -300,7 +302,10 @@ def submit_generation(db: Session, *, request: GenerationRequest) -> tuple[Gener
         errors.append(f"{provider_key}:{result.error_code or 'failed'}")
     task.status = RunStatus.FAILED
     task.error_code = "GENERATION_ALL_PROVIDERS_FAILED" if attempted else "GENERATION_PROVIDER_UNCONFIGURED"
-    task.error_message = ";".join(errors)[:500] or "没有可用的生成 Provider"
+    task.error_message = sanitize_error_summary(";".join(errors) or "没有可用的生成 Provider")
+    # 即使所有 Provider 都失败，也保留最后一次受控调用报告的正常 usage，
+    # 以便成本/消耗审计不会因为父任务进入 FAILED 而丢失。
+    task.usage = dict(last_result.usage) if last_result is not None else {}
     task.finished_at = utcnow()
     task.fallback_used = attempted > 1
     db.commit()
@@ -312,6 +317,21 @@ def get_generation_task(db: Session, *, project_id: str, task_id: str) -> Genera
     task = db.scalar(select(GenerationTask).where(GenerationTask.id == task_id, GenerationTask.project_id == project_id))
     if task is None:
         _error("生成任务不存在", status.HTTP_404_NOT_FOUND)
+    return task
+
+
+def cancel_generation_task(db: Session, *, project_id: str, task_id: str) -> GenerationTask:
+    """取消尚未终结的生成任务；不覆盖既有调用、错误或 usage 审计。"""
+
+    task = get_generation_task(db, project_id=project_id, task_id=task_id)
+    if task.status in _TERMINAL_STATES:
+        _error("生成任务已进入终态，不能取消", status.HTTP_409_CONFLICT)
+    if task.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
+        _error("生成任务当前状态不能取消", status.HTTP_409_CONFLICT)
+    task.status = RunStatus.CANCELLED
+    task.finished_at = utcnow()
+    db.commit()
+    db.refresh(task)
     return task
 
 
@@ -329,8 +349,10 @@ def apply_generation_callback(
     task = get_generation_task(db, project_id=project_id, task_id=task_id)
     if task.provider_key != provider_key or task.provider_task_id != provider_task_id:
         _error("Provider 回调不属于当前生成任务", status.HTTP_409_CONFLICT)
-    if task.status in {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED}:
-        return task
+    if task.status in _TERMINAL_STATES:
+        if result.status == task.status:
+            return task
+        _error("生成任务已进入终态，拒绝状态回退或覆盖", status.HTTP_409_CONFLICT)
     if result.status not in {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.RUNNING}:
         _error("Provider 回调状态不合法", status.HTTP_422_UNPROCESSABLE_CONTENT)
     request = GenerationRequest(

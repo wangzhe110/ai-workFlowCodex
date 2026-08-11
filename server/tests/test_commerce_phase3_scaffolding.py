@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 from uuid import uuid4
 
@@ -13,8 +14,9 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import MetaData, create_engine, func, inspect, select
+from sqlalchemy import create_engine, func, inspect, select, text
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from app.core.database import Base, SessionLocal, engine
 from app.main import app
@@ -24,12 +26,29 @@ from app.models import (
     GenerationTask,
     KnowledgeChunk,
     KnowledgeResourceType,
+    CommerceWorkflowLink,
+    CommerceWorkflowStep,
+    ProductAnalysisStatus,
+    ProductAnalysisVersion,
+    ProductAsset,
+    ProductAssetVersion,
+    ProductAssetVersionStatus,
     Project,
+    ProjectProductSelection,
     ProjectMemberRole,
     RunStatus,
+    RetrievalCall,
+    StoryRun,
+    StoryRunMode,
+    StoryRunStage,
+    StoryRunState,
+    StoryRunStatus,
+    TopicCandidate,
     UsageEvent,
     UsageEventKind,
     ViralKnowledgeStatus,
+    WorkflowRun,
+    WorkflowStep,
 )
 from app.services.access_billing_service import (
     ProjectPrincipal,
@@ -47,8 +66,8 @@ from app.services.generation_service import (
     GenerationRequest,
     GenerationResult,
     apply_generation_callback,
+    cancel_generation_task,
     generation_provider_registry,
-    get_generation_task,
     submit_generation,
 )
 from app.services.knowledge_service import (
@@ -68,6 +87,7 @@ from app.services.retrieval_service import (
     retrieve,
     retriever_registry,
 )
+from app.services.sensitive_data import REDACTED_VALUE, redact_sensitive_data
 
 
 @pytest.fixture()
@@ -89,11 +109,9 @@ def isolated_provider_registries():
 
     generation_provider_registry._providers.clear()
     retriever_registry._providers.clear()
-    retriever_registry.register(FakeInMemoryRetriever())
     yield
     generation_provider_registry._providers.clear()
     retriever_registry._providers.clear()
-    retriever_registry.register(FakeInMemoryRetriever())
 
 
 def _project(db, label: str = "知识") -> Project:
@@ -237,17 +255,41 @@ def test_retrieval_routes_filters_deduplicates_and_tracks_calls(phase3_db) -> No
 
 
 def test_retrieval_provider_errors_and_unconfigured_are_stable(phase3_db) -> None:
-    """场景 #8/#21：未配置/异常 Provider 返回 503，不降级为假成功或真实网络请求。"""
+    """场景 #8/#21：未配置 Provider 503 会落库，显式 Fake 才能执行。"""
 
     project = _project(phase3_db)
+    assert retriever_registry.resolve("fake_in_memory") is None
     with pytest.raises(HTTPException) as missing:
         retrieve(phase3_db, provider_key="not-configured", query=RetrievalQuery(project_id=project.id, query_text="x"))
     assert missing.value.status_code == 503
+    missing_call = phase3_db.scalar(select(RetrievalCall).where(RetrievalCall.provider_key == "not-configured"))
+    assert missing_call is not None
+    assert missing_call.project_id == project.id
+    assert missing_call.status == RunStatus.FAILED
+    assert missing_call.error_code == "RETRIEVER_PROVIDER_UNCONFIGURED"
+    assert missing_call.filter_snapshot == {"top_k": 5, "resource_types": [], "tags": [], "statuses": ["ACTIVE"]}
+    assert missing_call.created_at is not None and missing_call.finished_at is not None and missing_call.latency_ms is not None
+
+    client = TestClient(app)
+    api_response = client.post(
+        f"/api/v1/commerce/projects/{project.id}/knowledge/retrieval-preview",
+        json={"provider_key": "api-not-configured", "query_text": "x"},
+    )
+    assert api_response.status_code == 503
+    assert phase3_db.scalar(select(RetrievalCall).where(RetrievalCall.provider_key == "api-not-configured")) is not None
+
     retriever_registry.register(FakeInMemoryRetriever(error=RuntimeError("boom")))
     with pytest.raises(HTTPException) as error:
         retrieve(phase3_db, provider_key="fake_in_memory", query=RetrievalQuery(project_id=project.id, query_text="x"))
     assert error.value.status_code == 503
-    assert phase3_db.scalar(select(func.count()).select_from(__import__("app.models", fromlist=["RetrievalCall"]).RetrievalCall).where(__import__("app.models", fromlist=["RetrievalCall"]).RetrievalCall.status == RunStatus.FAILED)) >= 1
+    assert phase3_db.scalar(select(func.count()).select_from(RetrievalCall).where(RetrievalCall.status == RunStatus.FAILED)) >= 3
+
+    retriever_registry.unregister("fake_in_memory")
+    retriever_registry.register(FakeInMemoryRetriever([]))
+    hits, empty_call = retrieve(
+        phase3_db, provider_key="fake_in_memory", query=RetrievalQuery(project_id=project.id, query_text="configured-empty")
+    )
+    assert hits == [] and empty_call.status == RunStatus.SUCCEEDED and empty_call.error_code is None
 
 
 def test_image_video_fake_providers_async_callback_and_terminal_protection(phase3_db) -> None:
@@ -273,11 +315,12 @@ def test_image_video_fake_providers_async_callback_and_terminal_protection(phase
         result=GenerationResult(status=RunStatus.SUCCEEDED, output_reference={"uri": "fake://video"}, usage={"video_seconds": 4, "input_tokens": 8}),
     )
     assert updated.status == RunStatus.SUCCEEDED and updated.usage["video_seconds"] == 4
-    protected = apply_generation_callback(
-        phase3_db, project_id=project.id, task_id=video.id, provider_key="async", provider_task_id=video.provider_task_id,
-        result=GenerationResult(status=RunStatus.FAILED, error_code="late"),
-    )
-    assert protected.status == RunStatus.SUCCEEDED
+    with pytest.raises(HTTPException) as protected:
+        apply_generation_callback(
+            phase3_db, project_id=project.id, task_id=video.id, provider_key="async", provider_task_id=video.provider_task_id,
+            result=GenerationResult(status=RunStatus.FAILED, error_code="late"),
+        )
+    assert protected.value.status_code == 409
     generation_provider_registry.register(FakeGenerationProvider("broken-video", behavior="fail"))
     failed_video, _ = submit_generation(
         phase3_db,
@@ -304,19 +347,145 @@ def test_generation_fallback_idempotency_project_scope_and_callback_binding(phas
     assert wrong_callback.value.status_code == 404
 
 
-def test_generation_rejects_secrets_and_missing_provider_without_external_call(phase3_db) -> None:
-    """场景 #21：未接真实 Adapter 时严格 503；参数中疑似密钥也不能入库。"""
+def test_nested_sensitive_data_is_redacted_before_generation_and_retrieval_persistence(phase3_db) -> None:
+    """场景 #21：嵌套请求、响应与异常的敏感键只以稳定占位符落库。"""
+
+    class SecretProvider(FakeGenerationProvider):
+        def submit(self, request: GenerationRequest) -> GenerationResult:
+            self.requests.append(request)
+            return GenerationResult(
+                status=RunStatus.FAILED,
+                sanitized_response={
+                    "headers": {"Authorization": "Bearer response-secret"},
+                    "items": [{"X-API-Key": "response-api-key"}],
+                    "normal": "保留响应字段",
+                },
+                error_code="SECRET_PROVIDER_FAILED",
+                error_message="provider authorization: Bearer error-secret, client_secret=error-client-secret",
+                usage={"image_count": 1, "input_tokens": 12},
+            )
+
+    assert redact_sensitive_data(({"Refresh_Token": "tuple-secret"}, "普通 token 文本")) == (
+        {"Refresh_Token": REDACTED_VALUE}, "普通 token 文本"
+    )
+
+    project = _project(phase3_db)
+    request_secret = "request-api-secret"
+    response_secret = "response-secret"
+    error_secret = "error-secret"
+    generation_provider_registry.register(SecretProvider("secret-provider"))
+    task, created = submit_generation(
+        phase3_db,
+        request=GenerationRequest(
+            project_id=project.id,
+            modality=GenerationModality.IMAGE,
+            capability="image_generate",
+            model_key="secret-model",
+            parameters={
+                "prompt": "token 是正常提示词文本，不是字段名",
+                "outer": {"api_key": request_secret, "nested": [{"Access-Token": "request-token-secret"}]},
+                "array": [{"client_secret": "request-client-secret"}, {"safe": "保留字段"}],
+            },
+            idempotency_key="nested-secret",
+            preferred_provider="secret-provider",
+        ),
+    )
+    assert created and task.status == RunStatus.FAILED and task.usage == {"image_count": 1, "input_tokens": 12}
+    phase3_db.expire_all()
+    persisted_task = phase3_db.get(GenerationTask, task.id)
+    invocation = phase3_db.scalar(select(GenerationInvocation).where(GenerationInvocation.generation_task_id == task.id))
+    assert persisted_task is not None and invocation is not None
+    persisted = json.dumps(
+        {
+            "task_request": persisted_task.request_snapshot,
+            "task_error": persisted_task.error_message,
+            "invocation_request": invocation.request_snapshot,
+            "invocation_response": invocation.sanitized_response,
+            "invocation_error": invocation.error_message,
+        },
+        ensure_ascii=False,
+    )
+    for secret in (request_secret, "request-token-secret", "request-client-secret", response_secret, "response-api-key", error_secret, "error-client-secret"):
+        assert secret not in persisted
+    assert persisted.count("[REDACTED]") >= 6
+    assert persisted_task.request_snapshot["parameters"]["prompt"] == "token 是正常提示词文本，不是字段名"
+    assert invocation.sanitized_response["normal"] == "保留响应字段"
+
+    case = create_viral_case(phase3_db, project_id=project.id, payload=_case_payload("redaction"))
+    chunk = create_knowledge_chunk(phase3_db, project_id=project.id, payload={"viral_case_id": case.id, "chunk_index": 0, "content": "检索结果"})
+    retriever_registry.register(FakeInMemoryRetriever([
+        RetrievalHit(
+            chunk.id, "VIRAL_CASE", case.id, 0.9,
+            metadata={"nested": [{"proxy-authorization": "rag-header-secret"}], "safe": "保留检索字段"},
+        )
+    ], error=RuntimeError("api-key=rag-error-secret")))
+    with pytest.raises(HTTPException) as provider_error:
+        retrieve(phase3_db, provider_key="fake_in_memory", query=RetrievalQuery(project_id=project.id, query_text="检索"))
+    assert provider_error.value.status_code == 503
+    failed_call = phase3_db.scalar(select(RetrievalCall).where(RetrievalCall.status == RunStatus.FAILED).order_by(RetrievalCall.created_at.desc()))
+    assert failed_call is not None and "rag-error-secret" not in (failed_call.error_summary or "")
+
+    retriever_registry.unregister("fake_in_memory")
+    retriever_registry.register(FakeInMemoryRetriever([
+        RetrievalHit(
+            chunk.id, "VIRAL_CASE", case.id, 0.9,
+            metadata={"nested": [{"proxy-authorization": "rag-header-secret"}], "safe": "保留检索字段"},
+        )
+    ]))
+    hits, retrieval_call = retrieve(phase3_db, provider_key="fake_in_memory", query=RetrievalQuery(project_id=project.id, query_text="检索成功"))
+    retrieved = json.dumps({"hits": [item.metadata for item in hits], "references": retrieval_call.result_references}, ensure_ascii=False)
+    assert "rag-header-secret" not in retrieved and "[REDACTED]" in retrieved and "保留检索字段" in retrieved
+
+
+def test_generation_missing_provider_and_cancelled_terminal_state_machine(phase3_db) -> None:
+    """场景 #21/#22：无 Provider 不伪造任务；取消终态有结束时间且不可逆。"""
 
     project = _project(phase3_db)
     before = phase3_db.scalar(select(func.count()).select_from(GenerationTask))
-    with pytest.raises(HTTPException) as secret:
-        submit_generation(phase3_db, request=GenerationRequest(project_id=project.id, modality=GenerationModality.IMAGE, capability="image_generate", model_key="x", parameters={"api_key": "bait"}, preferred_provider="real"))
-    assert secret.value.status_code == 422
     with pytest.raises(HTTPException) as missing:
         submit_generation(phase3_db, request=GenerationRequest(project_id=project.id, modality=GenerationModality.IMAGE, capability="image_generate", model_key="x", parameters={}, preferred_provider="real"))
     assert missing.value.status_code == 503
-    # 未注册 Provider 不会调用网络或真实适配器，也不会伪造已提交任务。
     assert phase3_db.scalar(select(func.count()).select_from(GenerationTask)) == before
+
+    pending = GenerationTask(
+        project_id=project.id,
+        modality=GenerationModality.IMAGE,
+        capability="image_generate",
+        request_snapshot={"parameters": {}},
+        status=RunStatus.PENDING,
+    )
+    phase3_db.add(pending)
+    phase3_db.commit()
+    cancelled_pending = cancel_generation_task(phase3_db, project_id=project.id, task_id=pending.id)
+    phase3_db.expire_all()
+    assert phase3_db.get(GenerationTask, pending.id).status == RunStatus.CANCELLED
+    assert cancelled_pending.finished_at is not None
+
+    async_provider = FakeGenerationProvider("async", behavior="async")
+    generation_provider_registry.register(async_provider)
+    running, _ = submit_generation(
+        phase3_db,
+        request=GenerationRequest(project_id=project.id, modality=GenerationModality.VIDEO, capability="video_generate", model_key="fake", parameters={}, idempotency_key="cancel-running", preferred_provider="async"),
+    )
+    cancelled_running = cancel_generation_task(phase3_db, project_id=project.id, task_id=running.id)
+    assert cancelled_running.status == RunStatus.CANCELLED and cancelled_running.finished_at is not None
+    invocation_count = phase3_db.scalar(select(func.count()).select_from(GenerationInvocation).where(GenerationInvocation.generation_task_id == running.id))
+    for terminal_result in (RunStatus.RUNNING, RunStatus.SUCCEEDED, RunStatus.FAILED):
+        with pytest.raises(HTTPException) as invalid_transition:
+            apply_generation_callback(
+                phase3_db, project_id=project.id, task_id=running.id, provider_key="async", provider_task_id=running.provider_task_id or "missing",
+                result=GenerationResult(status=terminal_result),
+            )
+        assert invalid_transition.value.status_code == 409
+    assert phase3_db.scalar(select(func.count()).select_from(GenerationInvocation).where(GenerationInvocation.generation_task_id == running.id)) == invocation_count
+
+    generation_provider_registry.unregister("async")
+    generation_provider_registry.register(FakeGenerationProvider("preferred", behavior="success"))
+    succeeded, _ = submit_generation(phase3_db, request=_request(project, key="completed"))
+    assert succeeded.status == RunStatus.SUCCEEDED and succeeded.finished_at is not None
+    with pytest.raises(HTTPException) as already_finished:
+        cancel_generation_task(phase3_db, project_id=project.id, task_id=succeeded.id)
+    assert already_finished.value.status_code == 409
 
 
 def test_phase3_management_api_contracts_delegate_to_services(phase3_db) -> None:
@@ -387,6 +556,60 @@ def test_usage_is_idempotent_immutable_and_reversible(phase3_db) -> None:
     assert immutable.value.status_code == 409
 
 
+def test_0016_usage_event_trigger_blocks_orm_and_core_updates_but_allows_reversal(tmp_path) -> None:
+    """场景 #17/#18：0016 的数据库 trigger 拒绝任意 UPDATE，冲正仍是新行。"""
+
+    database_url = f"sqlite:///{tmp_path / 'usage-event-trigger.db'}"
+    _migration_runner(database_url, "head")
+    migration_engine = create_engine(database_url)
+    try:
+        with Session(migration_engine) as db:
+            db.execute(text("PRAGMA foreign_keys=ON"))
+            project = Project(title="UsageEvent 触发器项目")
+            db.add(project)
+            db.commit()
+            db.refresh(project)
+            plan = create_saas_plan(db, code="trigger-plan", name="Trigger Plan", quota_policy={"image": 10})
+            subscribe_project(db, project_id=project.id, plan_id=plan.id)
+            original, created = record_usage_event(
+                db, project_id=project.id, capability="image_generate", unit="image", quantity=1,
+                idempotency_key="trigger-original", metadata={"image_count": 1},
+            )
+            assert created
+            original_id = original.id
+            original_project_id = original.project_id
+            original_key = original.idempotency_key
+            db.expire_all()
+            persisted = db.get(UsageEvent, original_id)
+            assert persisted is not None
+            persisted.quantity = Decimal("2")
+            with pytest.raises(IntegrityError):
+                db.commit()
+            db.rollback()
+            persisted = db.get(UsageEvent, original_id)
+            assert persisted is not None
+            assert Decimal(str(persisted.quantity)) == Decimal("1")
+            assert persisted.project_id == original_project_id and persisted.idempotency_key == original_key
+            for column, value in (
+                ("unit", "video"),
+                ("project_id", "different-project-id"),
+                ("idempotency_key", "mutated-key"),
+            ):
+                with pytest.raises(IntegrityError):
+                    db.execute(text(f"UPDATE usage_events SET {column} = :value WHERE id = :id"), {"value": value, "id": original_id})
+                    db.commit()
+                db.rollback()
+            reversal = reverse_usage_event(
+                db, project_id=original_project_id, event_id=original_id, idempotency_key="trigger-reversal"
+            )
+            assert reversal.id != original_id
+            assert reversal.correction_of_event_id == original_id
+            assert reversal.idempotency_key == "trigger-reversal"
+            assert Decimal(str(reversal.quantity)) == Decimal("-1")
+    finally:
+        migration_engine.dispose()
+
+
 def _migration_runner(database_url: str, revision: str, *, downgrade: bool = False) -> None:
     server_root = Path(__file__).resolve().parents[1]
     config = Config(str(server_root / "alembic.ini"))
@@ -403,60 +626,225 @@ def _migration_runner(database_url: str, revision: str, *, downgrade: bool = Fal
         migration_engine.dispose()
 
 
-def test_0015_empty_sqlite_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
-    """场景 #23：空库往返仅创建/删除 0015 自己的表，迁移链仍是唯一 head。"""
+def test_0016_empty_sqlite_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
+    """场景 #23：空库升级 head，0016→0015→0016 会准确移除/恢复 trigger。"""
 
-    database_url = f"sqlite:///{tmp_path / 'empty-0015.db'}"
+    database_url = f"sqlite:///{tmp_path / 'empty-0016.db'}"
     server_root = Path(__file__).resolve().parents[1]
     config = Config(str(server_root / "alembic.ini"))
     config.set_main_option("script_location", str(server_root / "migrations"))
-    assert ScriptDirectory.from_config(config).get_heads() == ["0015_commerce_phase3_knowledge_generation_scaffolding"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["0016_commerce_phase3_integrity_hardening"]
     _migration_runner(database_url, "head")
     migration_engine = create_engine(database_url)
     try:
         tables = set(inspect(migration_engine).get_table_names())
         assert {"viral_cases", "viral_patterns", "knowledge_chunks", "retrieval_calls", "generation_tasks", "generation_invocations", "project_members", "saas_plans", "project_subscriptions", "usage_events"}.issubset(tables)
+        with migration_engine.connect() as connection:
+            assert "trg_usage_events_immutable_update_0016" in {
+                row[0] for row in connection.exec_driver_sql("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+            }
     finally:
         migration_engine.dispose()
-    _migration_runner(database_url, "0014_commerce_phase2_legacy_compatibility", downgrade=True)
-    _migration_runner(database_url, "head")
-
-
-def test_0015_nonempty_0014_round_trip_preserves_existing_phase_data_and_foreign_keys(tmp_path) -> None:
-    """场景 #24：非空 Phase 1/2 数据经过 0014→0015→0014→0015 不丢失。"""
-
-    database_url = f"sqlite:///{tmp_path / 'nonempty-0015.db'}"
-    _migration_runner(database_url, "0014_commerce_phase2_legacy_compatibility")
-    migration_engine = create_engine(database_url)
-    project_id = str(uuid4())
-    try:
-        with migration_engine.begin() as connection:
-            projects = MetaData()
-            projects.reflect(bind=connection, only=["projects"])
-            now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-            connection.execute(projects.tables["projects"].insert().values(id=project_id, title="非空 Phase2", description=None, created_at=now, updated_at=now))
-    finally:
-        migration_engine.dispose()
-    _migration_runner(database_url, "0015_commerce_phase3_knowledge_generation_scaffolding")
-    migration_engine = create_engine(database_url)
-    try:
-        with migration_engine.begin() as connection:
-            meta = MetaData()
-            meta.reflect(bind=connection, only=["viral_cases"])
-            connection.execute(meta.tables["viral_cases"].insert().values(
-                id=str(uuid4()), project_id=project_id, source_type="fixture", source_identifier="nonempty", title="迁移案例",
-                raw_analysis={}, structured_analysis={}, tags=[], status="ACTIVE", created_at=now, updated_at=now,
-            ))
-            assert connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
-    finally:
-        migration_engine.dispose()
-    _migration_runner(database_url, "0014_commerce_phase2_legacy_compatibility", downgrade=True)
+    _migration_runner(database_url, "0015_commerce_phase3_knowledge_generation_scaffolding", downgrade=True)
     migration_engine = create_engine(database_url)
     try:
         with migration_engine.connect() as connection:
-            assert connection.exec_driver_sql("SELECT title FROM projects WHERE id = ?", (project_id,)).scalar_one() == "非空 Phase2"
-            assert "viral_cases" not in inspect(connection).get_table_names()
-            assert connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
+            assert "trg_usage_events_immutable_update_0016" not in {
+                row[0] for row in connection.exec_driver_sql("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+            }
     finally:
         migration_engine.dispose()
     _migration_runner(database_url, "head")
+    migration_engine = create_engine(database_url)
+    try:
+        with migration_engine.connect() as connection:
+            assert "trg_usage_events_immutable_update_0016" in {
+                row[0] for row in connection.exec_driver_sql("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+            }
+            assert connection.exec_driver_sql("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%alembic_tmp%'").fetchall() == []
+    finally:
+        migration_engine.dispose()
+
+
+def _insert_nonempty_phase12_graph(database_url: str) -> dict[str, str]:
+    """在真实 0014 schema 写入完整 Commerce Phase 1/2 有效关系图。"""
+
+    migration_engine = create_engine(database_url)
+    try:
+        with Session(migration_engine) as db:
+            db.execute(text("PRAGMA foreign_keys=ON"))
+            project = Project(title="非空 Commerce Phase1/2", description="迁移完整性夹具")
+            db.add(project)
+            db.flush()
+            seed_run = WorkflowRun(project_id=project.id, workflow_key="fixture_seed", status=RunStatus.SUCCEEDED)
+            db.add(seed_run)
+            db.flush()
+            topic = TopicCandidate(
+                project_id=project.id,
+                generation_run_id=seed_run.id,
+                position=1,
+                title="完整关系选题",
+                opening_hook="三秒痛点",
+                synopsis="用于验证带货短剧迁移不丢失已有数据。",
+            )
+            product = ProductAsset(name="迁移产品", description="完整产品主体")
+            db.add_all((topic, product))
+            db.flush()
+            analysis = ProductAnalysisVersion(
+                product_asset_id=product.id,
+                version=1,
+                product_identification={"name": "迁移产品"},
+                package_ocr={"text": "包装 OCR"},
+                raw_analysis={"source": "fixture", "selling_points": ["省时"]},
+                analysis_status=ProductAnalysisStatus.SUCCEEDED,
+            )
+            db.add(analysis)
+            db.flush()
+            product_version = ProductAssetVersion(
+                product_asset_id=product.id,
+                source_analysis_version_id=analysis.id,
+                version=1,
+                product_name="迁移产品生产版",
+                appearance_description="白色瓶身",
+                selling_points=[{"text": "省时"}],
+                user_pain_points=[{"text": "忙碌"}],
+                usage_scenarios=[{"text": "下班回家"}],
+                package_ocr={"text": "包装 OCR"},
+                reference_images=[{"url": "fixture://product"}],
+                status=ProductAssetVersionStatus.CONFIRMED,
+                frozen_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            )
+            db.add(product_version)
+            db.flush()
+            selection = ProjectProductSelection(
+                project_id=project.id,
+                product_asset_id=product.id,
+                product_asset_version_id=product_version.id,
+            )
+            db.add(selection)
+            db.flush()
+            story_run = StoryRun(
+                project_id=project.id,
+                topic_candidate_id=topic.id,
+                project_product_selection_id=selection.id,
+                product_asset_version_id=product_version.id,
+                run_number=1,
+                mode=StoryRunMode.STEPWISE,
+            )
+            db.add(story_run)
+            db.flush()
+            story_state = StoryRunState(
+                story_run_id=story_run.id,
+                current_stage=StoryRunStage.OUTLINE,
+                status=StoryRunStatus.PAUSED,
+                stage_data={"fixture": "phase1-phase2"},
+            )
+            parent_run = WorkflowRun(
+                project_id=project.id,
+                workflow_key="commerce_story_run",
+                status=RunStatus.RUNNING,
+                input_snapshot={"fixture": "commerce-parent"},
+            )
+            db.add_all((story_state, parent_run))
+            db.flush()
+            link = CommerceWorkflowLink(workflow_run_id=parent_run.id, story_run_id=story_run.id)
+            db.add(link)
+            db.flush()
+            step = WorkflowStep(
+                workflow_run_id=parent_run.id,
+                step_key=StoryRunStage.OUTLINE.value,
+                position=2,
+                attempt=1,
+                status=RunStatus.PENDING,
+                input_payload={"fixture": "outline-attempt"},
+                idempotency_key="fixture-commerce-outline-1",
+            )
+            db.add(step)
+            db.flush()
+            sidecar = CommerceWorkflowStep(
+                workflow_step_id=step.id,
+                workflow_run_id=parent_run.id,
+                story_run_id=story_run.id,
+                stage=StoryRunStage.OUTLINE.value,
+                attempt=1,
+                status=RunStatus.PENDING.value,
+            )
+            db.add(sidecar)
+            db.commit()
+            return {
+                "project_id": project.id,
+                "seed_run_id": seed_run.id,
+                "topic_id": topic.id,
+                "product_id": product.id,
+                "analysis_id": analysis.id,
+                "product_version_id": product_version.id,
+                "selection_id": selection.id,
+                "story_run_id": story_run.id,
+                "parent_run_id": parent_run.id,
+                "step_id": step.id,
+            }
+    finally:
+        migration_engine.dispose()
+
+
+def _phase12_snapshot(database_url: str) -> dict[str, list[dict]]:
+    """以核心字段和外键关系生成稳定快照，而非只比较行数。"""
+
+    queries = {
+        "projects": "SELECT id, title, description FROM projects ORDER BY id",
+        "workflow_runs": "SELECT id, project_id, workflow_key, status, input_snapshot FROM workflow_runs ORDER BY id",
+        "topic_candidates": "SELECT id, project_id, generation_run_id, position, title, opening_hook, synopsis, status FROM topic_candidates ORDER BY id",
+        "product_assets": "SELECT id, name, description FROM product_assets ORDER BY id",
+        "product_analysis_versions": "SELECT id, product_asset_id, version, product_identification, package_ocr, raw_analysis, analysis_status FROM product_analysis_versions ORDER BY id",
+        "product_asset_versions": "SELECT id, product_asset_id, source_analysis_version_id, version, product_name, appearance_description, selling_points, user_pain_points, usage_scenarios, package_ocr, reference_images, status, frozen_at FROM product_asset_versions ORDER BY id",
+        "project_product_selections": "SELECT id, project_id, product_asset_id, product_asset_version_id FROM project_product_selections ORDER BY id",
+        "story_runs": "SELECT id, project_id, topic_candidate_id, project_product_selection_id, product_asset_version_id, run_number, mode FROM story_runs ORDER BY id",
+        "story_run_states": "SELECT story_run_id, current_stage, status, stage_data FROM story_run_states ORDER BY story_run_id",
+        "commerce_workflow_links": "SELECT workflow_run_id, story_run_id FROM commerce_workflow_links ORDER BY workflow_run_id",
+        "workflow_steps": "SELECT id, workflow_run_id, step_key, position, status, attempt, input_payload, idempotency_key FROM workflow_steps ORDER BY id",
+        "commerce_workflow_steps": "SELECT workflow_step_id, workflow_run_id, story_run_id, stage, attempt, status FROM commerce_workflow_steps ORDER BY workflow_step_id",
+    }
+    migration_engine = create_engine(database_url)
+    try:
+        with migration_engine.connect() as connection:
+            connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+            snapshot = {
+                name: [dict(row._mapping) for row in connection.exec_driver_sql(sql).fetchall()]
+                for name, sql in queries.items()
+            }
+            assert connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
+            assert connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%alembic_tmp%'"
+            ).fetchall() == []
+            return snapshot
+    finally:
+        migration_engine.dispose()
+
+
+def test_nonempty_0014_0015_0016_round_trips_preserve_real_phase12_graph_and_foreign_keys(tmp_path) -> None:
+    """场景 #24：真实 Project/产品/StoryRun/Commerce workflow 图历经迁移往返不变。"""
+
+    database_url = f"sqlite:///{tmp_path / 'nonempty-commerce-roundtrip.db'}"
+    _migration_runner(database_url, "0014_commerce_phase2_legacy_compatibility")
+    ids = _insert_nonempty_phase12_graph(database_url)
+    baseline = _phase12_snapshot(database_url)
+    assert baseline["projects"] == [{"id": ids["project_id"], "title": "非空 Commerce Phase1/2", "description": "迁移完整性夹具"}]
+    assert baseline["commerce_workflow_links"] == [{"workflow_run_id": ids["parent_run_id"], "story_run_id": ids["story_run_id"]}]
+    assert baseline["commerce_workflow_steps"] == [{
+        "workflow_step_id": ids["step_id"], "workflow_run_id": ids["parent_run_id"],
+        "story_run_id": ids["story_run_id"], "stage": "OUTLINE", "attempt": 1, "status": "PENDING",
+    }]
+
+    _migration_runner(database_url, "0015_commerce_phase3_knowledge_generation_scaffolding")
+    assert _phase12_snapshot(database_url) == baseline
+    _migration_runner(database_url, "0014_commerce_phase2_legacy_compatibility", downgrade=True)
+    assert _phase12_snapshot(database_url) == baseline
+    _migration_runner(database_url, "0015_commerce_phase3_knowledge_generation_scaffolding")
+    assert _phase12_snapshot(database_url) == baseline
+
+    _migration_runner(database_url, "0016_commerce_phase3_integrity_hardening")
+    assert _phase12_snapshot(database_url) == baseline
+    _migration_runner(database_url, "0015_commerce_phase3_knowledge_generation_scaffolding", downgrade=True)
+    assert _phase12_snapshot(database_url) == baseline
+    _migration_runner(database_url, "0016_commerce_phase3_integrity_hardening")
+    assert _phase12_snapshot(database_url) == baseline

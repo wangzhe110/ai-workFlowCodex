@@ -10,6 +10,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.api.routes import (
     creative_library,
     commerce,
+    commerce_phase3,
     asset_library,
     images,
     model_profiles,
@@ -55,6 +56,7 @@ app.include_router(projects.router)
 app.include_router(workflows.router)
 app.include_router(creative_library.router)
 app.include_router(commerce.router)
+app.include_router(commerce_phase3.router)
 app.include_router(asset_library.router)
 app.include_router(topics.router)
 app.include_router(stories.router)

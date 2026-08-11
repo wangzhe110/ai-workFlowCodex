@@ -528,7 +528,7 @@ def test_alembic_commerce_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
 
     config = Config(str(server_root / "alembic.ini"))
     config.set_main_option("script_location", str(server_root / "migrations"))
-    assert ScriptDirectory.from_config(config).get_heads() == ["0014_commerce_phase2_legacy_compatibility"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["0015_commerce_phase3_knowledge_generation_scaffolding"]
 
     run_revision("upgrade", "0010_commerce_domain_foundation")
     run_revision("upgrade", "head")

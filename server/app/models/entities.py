@@ -323,6 +323,71 @@ class RenderBatchStatus(str, Enum):
     CANCELLED = "CANCELLED"
 
 
+# ---------------------------------------------------------------------------
+# Commerce Phase 3：知识库、生成 Provider、权限与计量的可维护领域基础。
+#
+# 这些枚举和实体不会改变 Phase 1/2 已发布工作流的状态机。它们是后续 SaaS
+# 能力的独立边界，当前仅由管理 API 和 Fake Provider 使用。
+# ---------------------------------------------------------------------------
+
+
+class ViralKnowledgeStatus(str, Enum):
+    """爆款案例与模式的显式生命周期。"""
+
+    DRAFT = "DRAFT"
+    ACTIVE = "ACTIVE"
+    ARCHIVED = "ARCHIVED"
+
+
+class ViralPatternType(str, Enum):
+    """可检索且可筛选的爆款机制类型。"""
+
+    OPENING_HOOK = "OPENING_HOOK"
+    CONFLICT = "CONFLICT"
+    RHYTHM = "RHYTHM"
+    TRANSITION = "TRANSITION"
+    CHARACTER_RELATIONSHIP = "CHARACTER_RELATIONSHIP"
+    PRODUCT_PLACEMENT = "PRODUCT_PLACEMENT"
+
+
+class KnowledgeResourceType(str, Enum):
+    """KnowledgeChunk 唯一允许的来源类型。"""
+
+    VIRAL_CASE = "VIRAL_CASE"
+    VIRAL_PATTERN = "VIRAL_PATTERN"
+
+
+class GenerationModality(str, Enum):
+    """统一生成边界当前支持的媒体模态。"""
+
+    IMAGE = "IMAGE"
+    VIDEO = "VIDEO"
+
+
+class ProjectMemberRole(str, Enum):
+    """不依赖登录实现的项目成员角色。"""
+
+    OWNER = "OWNER"
+    ADMIN = "ADMIN"
+    EDITOR = "EDITOR"
+    VIEWER = "VIEWER"
+
+
+class SubscriptionStatus(str, Enum):
+    """项目套餐关联状态；本阶段不涉及支付状态机。"""
+
+    ACTIVE = "ACTIVE"
+    CANCELLED = "CANCELLED"
+    EXPIRED = "EXPIRED"
+
+
+class UsageEventKind(str, Enum):
+    """不可变用量流水类型；冲正不会覆盖原始入账。"""
+
+    NORMAL = "NORMAL"
+    REVERSAL = "REVERSAL"
+
+
 class Project(Base):
     """一个从参考素材到原创产物的工作空间。"""
 
@@ -359,6 +424,27 @@ class Project(Base):
         back_populates="project", cascade="all, delete-orphan"
     )
     story_runs: Mapped[list["StoryRun"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    viral_cases: Mapped[list["ViralCase"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    viral_patterns: Mapped[list["ViralPattern"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    retrieval_calls: Mapped[list["RetrievalCall"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    generation_tasks: Mapped[list["GenerationTask"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    members: Mapped[list["ProjectMember"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    subscriptions: Mapped[list["ProjectSubscription"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    usage_events: Mapped[list["UsageEvent"]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )
 
@@ -2159,3 +2245,342 @@ class VideoClipAssetBinding(Base):
     )
     shot_keyframe_id: Mapped[Optional[str]] = mapped_column(ForeignKey("shot_keyframes.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class ViralCase(Base):
+    """一个项目内可审核、可归档且按来源稳定去重的爆款案例。"""
+
+    __tablename__ = "viral_cases"
+    __table_args__ = (
+        UniqueConstraint("project_id", "source_type", "source_identifier", name="uq_viral_case_project_source"),
+        Index("ix_viral_case_project_status_updated", "project_id", "status", "updated_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_type: Mapped[str] = mapped_column(String(60), nullable=False)
+    source_identifier: Mapped[str] = mapped_column(String(512), nullable=False)
+    source_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    title: Mapped[str] = mapped_column(String(240), nullable=False)
+    summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    raw_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    transcript_reference: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    raw_analysis: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    structured_analysis: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    tags: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    category: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    status: Mapped[ViralKnowledgeStatus] = mapped_column(
+        SqlEnum(ViralKnowledgeStatus, native_enum=False, create_constraint=True),
+        default=ViralKnowledgeStatus.ACTIVE,
+        nullable=False,
+    )
+    created_by: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="viral_cases")
+    patterns: Mapped[list["ViralPattern"]] = relationship(back_populates="source_case", passive_deletes=True)
+    chunks: Mapped[list["KnowledgeChunk"]] = relationship(
+        back_populates="viral_case", cascade="all, delete-orphan"
+    )
+
+
+class ViralPattern(Base):
+    """爆款机制的追加版本记录；同一 ``pattern_key`` 的已发布版本永不覆盖。"""
+
+    __tablename__ = "viral_patterns"
+    __table_args__ = (
+        UniqueConstraint("project_id", "pattern_key", "version", name="uq_viral_pattern_project_version"),
+        Index(
+            "uq_viral_pattern_current",
+            "project_id",
+            "pattern_key",
+            unique=True,
+            postgresql_where=text("is_current = true"),
+            sqlite_where=text("is_current = 1"),
+        ),
+        Index("ix_viral_pattern_project_status_updated", "project_id", "status", "updated_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    pattern_key: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    source_case_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("viral_cases.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    pattern_type: Mapped[ViralPatternType] = mapped_column(
+        SqlEnum(ViralPatternType, native_enum=False, create_constraint=True), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(240), nullable=False)
+    summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    structured_rules: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    applicable_scenarios: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    tags: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    is_current: Mapped[bool] = mapped_column(default=True, nullable=False)
+    status: Mapped[ViralKnowledgeStatus] = mapped_column(
+        SqlEnum(ViralKnowledgeStatus, native_enum=False, create_constraint=True),
+        default=ViralKnowledgeStatus.DRAFT,
+        nullable=False,
+    )
+    created_by: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="viral_patterns")
+    source_case: Mapped[Optional[ViralCase]] = relationship(back_populates="patterns")
+    chunks: Mapped[list["KnowledgeChunk"]] = relationship(
+        back_populates="viral_pattern", cascade="all, delete-orphan"
+    )
+
+
+class KnowledgeChunk(Base):
+    """可追溯文本切片；Phase 3 只保存向量定位元数据，不保存伪造 embedding。"""
+
+    __tablename__ = "knowledge_chunks"
+    __table_args__ = (
+        UniqueConstraint("resource_type", "resource_id", "chunk_index", name="uq_knowledge_chunk_resource_position"),
+        CheckConstraint(
+            "(viral_case_id IS NOT NULL AND viral_pattern_id IS NULL) OR "
+            "(viral_case_id IS NULL AND viral_pattern_id IS NOT NULL)",
+            name="ck_knowledge_chunk_exactly_one_source",
+        ),
+        CheckConstraint("chunk_index >= 0", name="ck_knowledge_chunk_index_nonnegative"),
+        Index("ix_knowledge_chunk_resource", "resource_type", "resource_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    viral_case_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("viral_cases.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    viral_pattern_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("viral_patterns.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    resource_type: Mapped[KnowledgeResourceType] = mapped_column(
+        SqlEnum(KnowledgeResourceType, native_enum=False, create_constraint=True), nullable=False
+    )
+    resource_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    embedding_provider: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    embedding_model: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)
+    embedding_dimension: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    external_vector_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    viral_case: Mapped[Optional[ViralCase]] = relationship(back_populates="chunks")
+    viral_pattern: Mapped[Optional[ViralPattern]] = relationship(back_populates="chunks")
+
+
+class RetrievalCall(Base):
+    """一次 RAG 查询的脱敏、可审计追踪，不依赖任何真实向量库。"""
+
+    __tablename__ = "retrieval_calls"
+    __table_args__ = (Index("ix_retrieval_call_project_created", "project_id", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    provider_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    request_id: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    query_text: Mapped[str] = mapped_column(Text, nullable=False)
+    filter_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    result_references: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    status: Mapped[RunStatus] = mapped_column(SqlEnum(RunStatus, native_enum=False, create_constraint=True), nullable=False)
+    error_code: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    error_summary: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    latency_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    project: Mapped[Project] = relationship(back_populates="retrieval_calls")
+
+
+class GenerationTask(Base):
+    """统一图片/视频生成请求追踪，不替代现有 V1 或 Commerce 实际产物表。"""
+
+    __tablename__ = "generation_tasks"
+    __table_args__ = (
+        Index(
+            "uq_generation_task_project_idempotency",
+            "project_id",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL"),
+            sqlite_where=text("idempotency_key IS NOT NULL"),
+        ),
+        Index("ix_generation_task_project_created", "project_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    modality: Mapped[GenerationModality] = mapped_column(
+        SqlEnum(GenerationModality, native_enum=False, create_constraint=True), nullable=False
+    )
+    capability: Mapped[str] = mapped_column(String(80), nullable=False)
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)
+    request_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    provider_key: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    model_key: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)
+    provider_task_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    output_reference: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    usage: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    fallback_used: Mapped[bool] = mapped_column(default=False, nullable=False)
+    status: Mapped[RunStatus] = mapped_column(
+        SqlEnum(RunStatus, native_enum=False, create_constraint=True), default=RunStatus.PENDING, nullable=False
+    )
+    error_code: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    latency_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    project: Mapped[Project] = relationship(back_populates="generation_tasks")
+    invocations: Mapped[list["GenerationInvocation"]] = relationship(
+        back_populates="generation_task", cascade="all, delete-orphan", order_by="GenerationInvocation.attempt_number"
+    )
+
+
+class GenerationInvocation(Base):
+    """一次 Provider 尝试，完整保留 fallback 错误链和使用量。"""
+
+    __tablename__ = "generation_invocations"
+    __table_args__ = (
+        UniqueConstraint("generation_task_id", "attempt_number", name="uq_generation_invocation_attempt"),
+        Index("ix_generation_invocation_project_created", "project_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    generation_task_id: Mapped[str] = mapped_column(
+        ForeignKey("generation_tasks.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    provider_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    model_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    request_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    sanitized_response: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    provider_task_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    usage: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[RunStatus] = mapped_column(
+        SqlEnum(RunStatus, native_enum=False, create_constraint=True), nullable=False
+    )
+    error_code: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    latency_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    generation_task: Mapped[GenerationTask] = relationship(back_populates="invocations")
+
+
+class ProjectMember(Base):
+    """认证接入前的项目成员事实；principal 只是外部身份映射，不是登录凭据。"""
+
+    __tablename__ = "project_members"
+    __table_args__ = (UniqueConstraint("project_id", "principal_id", name="uq_project_member_principal"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    principal_id: Mapped[str] = mapped_column(String(120), nullable=False)
+    role: Mapped[ProjectMemberRole] = mapped_column(
+        SqlEnum(ProjectMemberRole, native_enum=False, create_constraint=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="members")
+
+
+class SaaSPlan(Base):
+    """套餐定义；仅保存配额策略，不保存支付账户或价格扣款信息。"""
+
+    __tablename__ = "saas_plans"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    code: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    quota_policy: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    subscriptions: Mapped[list["ProjectSubscription"]] = relationship(back_populates="plan", passive_deletes=True)
+
+
+class ProjectSubscription(Base):
+    """项目采用的套餐快照；不等同于真实支付或第三方订阅。"""
+
+    __tablename__ = "project_subscriptions"
+    __table_args__ = (
+        Index(
+            "uq_active_project_subscription",
+            "project_id",
+            unique=True,
+            postgresql_where=text("status = 'ACTIVE'"),
+            sqlite_where=text("status = 'ACTIVE'"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    plan_id: Mapped[str] = mapped_column(ForeignKey("saas_plans.id", ondelete="RESTRICT"), nullable=False, index=True)
+    status: Mapped[SubscriptionStatus] = mapped_column(
+        SqlEnum(SubscriptionStatus, native_enum=False, create_constraint=True),
+        default=SubscriptionStatus.ACTIVE,
+        nullable=False,
+    )
+    quota_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="subscriptions")
+    plan: Mapped[SaaSPlan] = relationship(back_populates="subscriptions")
+
+
+class UsageEvent(Base):
+    """不可变项目用量流水；冲正通过新行表达而非修改原记录。"""
+
+    __tablename__ = "usage_events"
+    __table_args__ = (
+        UniqueConstraint("project_id", "idempotency_key", name="uq_usage_event_project_idempotency"),
+        CheckConstraint("quantity <> 0", name="ck_usage_event_nonzero_quantity"),
+        Index("ix_usage_event_project_created", "project_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    subscription_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("project_subscriptions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    correction_of_event_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("usage_events.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    event_kind: Mapped[UsageEventKind] = mapped_column(
+        SqlEnum(UsageEventKind, native_enum=False, create_constraint=True), nullable=False
+    )
+    capability: Mapped[str] = mapped_column(String(80), nullable=False)
+    unit: Mapped[str] = mapped_column(String(80), nullable=False)
+    quantity: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    project: Mapped[Project] = relationship(back_populates="usage_events")

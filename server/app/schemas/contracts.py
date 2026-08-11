@@ -859,5 +859,213 @@ class CommerceWorkflowDefinitionResponse(BaseModel):
     published_at: Optional[datetime]
 
 
+# ---------------------------------------------------------------------------
+# Commerce Phase 3：知识库和图片/视频生成能力预埋。
+# ---------------------------------------------------------------------------
+
+
+class ViralCaseCreateRequest(BaseModel):
+    source_type: str = Field(min_length=1, max_length=60)
+    source_identifier: str = Field(min_length=1, max_length=512)
+    title: str = Field(min_length=1, max_length=240)
+    source_url: Optional[str] = Field(default=None, max_length=1024)
+    summary: Optional[str] = Field(default=None, max_length=20_000)
+    raw_text: Optional[str] = Field(default=None, max_length=100_000)
+    transcript_reference: Optional[str] = Field(default=None, max_length=512)
+    raw_analysis: dict[str, Any] = Field(default_factory=dict)
+    structured_analysis: dict[str, Any] = Field(default_factory=dict)
+    tags: list[str] = Field(default_factory=list, max_length=50)
+    category: Optional[str] = Field(default=None, max_length=100)
+
+
+class ViralCasePatchRequest(BaseModel):
+    title: Optional[str] = Field(default=None, min_length=1, max_length=240)
+    source_url: Optional[str] = Field(default=None, max_length=1024)
+    summary: Optional[str] = Field(default=None, max_length=20_000)
+    raw_text: Optional[str] = Field(default=None, max_length=100_000)
+    transcript_reference: Optional[str] = Field(default=None, max_length=512)
+    raw_analysis: Optional[dict[str, Any]] = None
+    structured_analysis: Optional[dict[str, Any]] = None
+    tags: Optional[list[str]] = Field(default=None, max_length=50)
+    category: Optional[str] = Field(default=None, max_length=100)
+
+
+class ViralCaseResponse(BaseModel):
+    id: str
+    project_id: str
+    source_type: str
+    source_identifier: str
+    source_url: Optional[str]
+    title: str
+    summary: Optional[str]
+    raw_text: Optional[str]
+    transcript_reference: Optional[str]
+    raw_analysis: dict[str, Any]
+    structured_analysis: dict[str, Any]
+    tags: list[str]
+    category: Optional[str]
+    status: str
+    created_by: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+
+
+class ViralCasePageResponse(BaseModel):
+    items: list[ViralCaseResponse]
+    page: int
+    page_size: int
+    total: int
+
+
+class ViralPatternCreateRequest(BaseModel):
+    pattern_type: str = Field(min_length=1, max_length=80)
+    name: str = Field(min_length=1, max_length=240)
+    source_case_id: Optional[str] = Field(default=None, min_length=1, max_length=36)
+    summary: Optional[str] = Field(default=None, max_length=20_000)
+    structured_rules: dict[str, Any] = Field(default_factory=dict)
+    applicable_scenarios: list[str] = Field(default_factory=list, max_length=50)
+    tags: list[str] = Field(default_factory=list, max_length=50)
+
+
+class ViralPatternPatchRequest(BaseModel):
+    pattern_type: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    name: Optional[str] = Field(default=None, min_length=1, max_length=240)
+    source_case_id: Optional[str] = Field(default=None, min_length=1, max_length=36)
+    summary: Optional[str] = Field(default=None, max_length=20_000)
+    structured_rules: Optional[dict[str, Any]] = None
+    applicable_scenarios: Optional[list[str]] = Field(default=None, max_length=50)
+    tags: Optional[list[str]] = Field(default=None, max_length=50)
+
+
+class ViralPatternPublishRequest(BaseModel):
+    """草稿可带更新发布；已发布模式传入内容会创建不可覆盖的新版本。"""
+
+    updates: Optional[ViralPatternPatchRequest] = None
+
+
+class ViralPatternResponse(BaseModel):
+    id: str
+    project_id: str
+    pattern_key: str
+    source_case_id: Optional[str]
+    pattern_type: str
+    name: str
+    summary: Optional[str]
+    structured_rules: dict[str, Any]
+    applicable_scenarios: list[str]
+    tags: list[str]
+    version: int
+    is_current: bool
+    status: str
+    created_by: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+
+
+class ViralPatternPageResponse(BaseModel):
+    items: list[ViralPatternResponse]
+    page: int
+    page_size: int
+    total: int
+
+
+class KnowledgeChunkCreateRequest(BaseModel):
+    viral_case_id: Optional[str] = Field(default=None, min_length=1, max_length=36)
+    viral_pattern_id: Optional[str] = Field(default=None, min_length=1, max_length=36)
+    chunk_index: int = Field(ge=0)
+    content: str = Field(min_length=1, max_length=100_000)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    embedding_provider: Optional[str] = Field(default=None, max_length=80)
+    embedding_model: Optional[str] = Field(default=None, max_length=160)
+    embedding_dimension: Optional[int] = Field(default=None, gt=0)
+    external_vector_id: Optional[str] = Field(default=None, max_length=255)
+
+
+class KnowledgeChunkResponse(BaseModel):
+    id: str
+    viral_case_id: Optional[str]
+    viral_pattern_id: Optional[str]
+    resource_type: str
+    resource_id: str
+    chunk_index: int
+    content: str
+    content_hash: str
+    metadata: dict[str, Any]
+    embedding_provider: Optional[str]
+    embedding_model: Optional[str]
+    embedding_dimension: Optional[int]
+    external_vector_id: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+
+
+class RetrievalPreviewRequest(BaseModel):
+    provider_key: str = Field(default="fake_in_memory", min_length=1, max_length=80)
+    query_text: str = Field(min_length=1, max_length=20_000)
+    top_k: int = Field(default=5, ge=1, le=50)
+    resource_types: list[str] = Field(default_factory=list, max_length=2)
+    tags: list[str] = Field(default_factory=list, max_length=50)
+    statuses: list[str] = Field(default_factory=lambda: ["ACTIVE"], max_length=3)
+    request_id: Optional[str] = Field(default=None, max_length=80)
+
+
+class RetrievalHitResponse(BaseModel):
+    rank: int
+    chunk_id: str
+    resource_type: str
+    resource_id: str
+    score: float
+    metadata: dict[str, Any]
+
+
+class RetrievalPreviewResponse(BaseModel):
+    retrieval_call_id: str
+    provider_key: str
+    status: str
+    hits: list[RetrievalHitResponse]
+
+
+class GenerationTaskCreateRequest(BaseModel):
+    modality: str = Field(pattern="^(IMAGE|VIDEO)$")
+    capability: str = Field(min_length=1, max_length=80)
+    model_key: str = Field(min_length=1, max_length=160)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: Optional[str] = Field(default=None, min_length=1, max_length=160)
+    preferred_provider: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    fallback_providers: list[str] = Field(default_factory=list, max_length=10)
+
+
+class GenerationCallbackRequest(BaseModel):
+    provider_key: str = Field(min_length=1, max_length=80)
+    provider_task_id: str = Field(min_length=1, max_length=255)
+    status: str = Field(pattern="^(RUNNING|SUCCEEDED|FAILED|CANCELLED)$")
+    output_reference: Optional[dict[str, Any]] = None
+    usage: dict[str, Any] = Field(default_factory=dict)
+    sanitized_response: dict[str, Any] = Field(default_factory=dict)
+    error_code: Optional[str] = Field(default=None, max_length=120)
+    error_message: Optional[str] = Field(default=None, max_length=500)
+
+
+class GenerationTaskResponse(BaseModel):
+    id: str
+    project_id: str
+    modality: str
+    capability: str
+    idempotency_key: Optional[str]
+    request_snapshot: dict[str, Any]
+    provider_key: Optional[str]
+    model_key: Optional[str]
+    provider_task_id: Optional[str]
+    output_reference: Optional[dict[str, Any]]
+    usage: dict[str, Any]
+    fallback_used: bool
+    status: str
+    error_code: Optional[str]
+    error_message: Optional[str]
+    created_at: datetime
+    started_at: Optional[datetime]
+    finished_at: Optional[datetime]
+
+
 # Pydantic 需要在全部类型声明后解析前向引用。
 ProjectDetailResponse.model_rebuild()

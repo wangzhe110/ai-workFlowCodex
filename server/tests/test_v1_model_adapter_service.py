@@ -3,7 +3,8 @@
 import pytest
 
 from app.services.analysis_provider import VideoTaskResult
-from app.services.v1_model_adapter_service import assert_supported, wait_for_video_result
+from app.services.storage import LocalImageReference
+from app.services.v1_model_adapter_service import assert_supported, create_video_request, wait_for_video_result
 
 
 def test_v1_adapter_support_is_based_on_capability_not_model_name() -> None:
@@ -50,3 +51,18 @@ def test_v1_video_waiter_polls_to_terminal_state(monkeypatch) -> None:
     assert provider.task_ids == ["task-1"]
     assert result.status == "SUCCEEDED"
     assert result.video_url == "https://cdn.example/clip.mp4"
+
+
+def test_video_request_accepts_verified_in_memory_first_frame_without_public_url() -> None:
+    """单机 Commerce 首帧可只在 Worker 内存中传给原生方舟 Adapter。"""
+
+    reference = LocalImageReference(
+        asset_id="keyframe-1", role="first_frame", mime_type="image/jpeg",
+        width=2848, height=1600, sha256="a" * 64,
+        data_url="data:image/jpeg;base64,AAECAwQ=",
+    )
+    request = create_video_request(
+        project_id="project-1", shot_number=1, prompt="固定提示词", image_urls=[], reference_images=[reference]
+    )
+    assert request.image_urls == []
+    assert request.reference_images == [reference]

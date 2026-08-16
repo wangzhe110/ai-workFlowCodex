@@ -24,6 +24,14 @@ _SENSITIVE_NORMALIZED_KEYS = frozenset(
         "accesstoken",
         "refreshtoken",
         "clientsecret",
+        "credential",
+        "credentials",
+        "cookie",
+        "setcookie",
+        "authentication",
+        "bearer",
+        "secretkey",
+        "privatekey",
         "secret",
         "token",
         "password",
@@ -32,8 +40,16 @@ _SENSITIVE_NORMALIZED_KEYS = frozenset(
 
 _ERROR_SENSITIVE_VALUE = re.compile(
     r"(?i)\b(authorization|proxy[-_ ]?authorization|api[-_ ]?key|x[-_ ]?api[-_ ]?key|"
-    r"access[-_ ]?token|refresh[-_ ]?token|client[-_ ]?secret|secret|token|password)\b"
+    r"access[-_ ]?token|refresh[-_ ]?token|client[-_ ]?secret|credential(?:s)?|"
+    r"set[-_ ]?cookie|cookie|authentication|bearer|secret[-_ ]?key|private[-_ ]?key|"
+    r"secret|token|password)\b"
     r"\s*([:=])\s*(?:\"[^\"]*\"|'[^']*'|[^,\n\r}\]]*)"
+)
+
+# Seedream 图生图的 Data URL 仅允许在 Worker 内存中临时存在。即便异常文本或历史
+# JSON 使用了非敏感字段名，也不能让 Base64 因为字段名白名单而绕过脱敏边界。
+_IMAGE_DATA_URL = re.compile(
+    r"(?i)data:image/(?:jpeg|png|webp);base64,[a-z0-9+/=\r\n\t ]+"
 )
 
 
@@ -56,6 +72,8 @@ def redact_sensitive_data(value: Any) -> Any:
         return [redact_sensitive_data(item) for item in value]
     if isinstance(value, tuple):
         return tuple(redact_sensitive_data(item) for item in value)
+    if isinstance(value, str):
+        return _IMAGE_DATA_URL.sub("data:image/[REDACTED]", value)
     return value
 
 
@@ -66,4 +84,5 @@ def sanitize_error_summary(error: object, *, max_length: int = 500) -> str:
     sanitized = _ERROR_SENSITIVE_VALUE.sub(
         lambda match: f"{match.group(1)}{match.group(2)}{REDACTED_VALUE}", text
     )
+    sanitized = _IMAGE_DATA_URL.sub("data:image/[REDACTED]", sanitized)
     return sanitized[:max_length]

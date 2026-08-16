@@ -179,6 +179,194 @@ export interface ProductionState {
   updated_at: string
 }
 
+/** Slice 1：由 V1 分析自动生成、待制作人确认的脚本与商品输入版本。 */
+export interface CommerceReferenceIntake {
+  id: string
+  project_id: string
+  reference_analysis_id: string
+  script_asset_id: string
+  script_analysis_version_id: string
+  product_asset_id: string
+  product_analysis_version_id: string
+  product_asset_version_id: string
+  product_status: 'DRAFT' | 'CONFIRMED' | 'ARCHIVED'
+  product_frozen_at: string | null
+  input_snapshot: Record<string, unknown>
+  created_at: string
+  updated_at: string
+}
+
+/** 固定十个候选之一；选择后由现有 Commerce StoryRun 继续生成大纲。 */
+export interface CommerceCreativeIdea {
+  id: string
+  batch_id: string
+  project_id: string
+  candidate_number: number
+  content: Record<string, unknown>
+  status: 'CANDIDATE' | 'SELECTED' | 'REJECTED'
+  topic_candidate_id: string | null
+  created_at: string
+}
+
+export interface CommerceCreativeBatch {
+  id: string
+  project_id: string
+  reference_intake_id: string
+  workflow_run_id: string
+  batch_number: number
+  status: 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED'
+  input_snapshot: Record<string, unknown>
+  model_snapshot: Record<string, unknown>
+  prompt_snapshot: Record<string, unknown>
+  error_message: string | null
+  created_at: string
+  finished_at: string | null
+  ideas: CommerceCreativeIdea[]
+}
+
+export interface CommerceStoryRunSelection {
+  story_run_id: string
+  project_id: string
+  topic_candidate_id: string
+  product_asset_version_id: string
+  current_stage: string
+  current_status: string
+}
+
+/** Slice 1 选择创意后复用的 Commerce StoryRun；Slice 2 的所有资产都只挂在它下面。 */
+export interface CommerceStoryRun {
+  id: string
+  project_id: string
+  topic_candidate_id: string
+  product_asset_version_id: string
+  run_number: number
+  mode: 'STEPWISE' | 'AUTO'
+  current_stage: string
+  current_status: string
+  blocked_reason: string | null
+  can_start: boolean
+  can_continue: boolean
+  can_confirm: boolean
+  latest_error: string | null
+  stage_result_references: Record<string, unknown>
+  created_at: string
+  updated_at: string
+}
+
+/** 已审核的大纲与商品融入策略；角色、场景、分镜任务都会冻结它的具体版本。 */
+export interface CommerceOutline {
+  id: string
+  story_run_id: string
+  version: number
+  title: string
+  premise: string
+  story_beats: Array<Record<string, unknown>>
+  product_placement_strategy: Record<string, unknown>
+  status: string
+  created_at: string
+}
+
+/** Slice 2 的文本版本：角色设定、场景设定或导演分镜，均为只追加版本。 */
+export interface CommerceProductionVersion {
+  id: string
+  story_run_id: string
+  version: number
+  status: 'READY' | 'LOCKED' | 'SUPERSEDED' | 'STALE' | 'FAILED' | string
+  content: Record<string, unknown>
+  input_snapshot: Record<string, unknown>
+  prompt_snapshot: Record<string, unknown>
+  locked_at: string | null
+  stale_at: string | null
+  created_at: string
+}
+
+/** 角色图、场景图或单镜关键帧的独立版本；锁定后才可成为后续任务输入。 */
+export interface CommerceProductionImage {
+  id: string
+  story_run_id: string
+  owner_version_id: string
+  logical_id: string
+  version: number
+  image_url: string | null
+  status: 'READY' | 'LOCKED' | 'STALE' | 'FAILED' | string
+  prompt_snapshot: string
+  input_snapshot: Record<string, unknown>
+  error_message: string | null
+  locked_at: string | null
+  stale_at: string | null
+  created_at: string
+}
+
+export interface CommerceVideoPrompt {
+  id: string
+  story_run_id: string
+  storyboard_version_id: string
+  shot_id: string
+  shot_number: number
+  keyframe_version_id: string
+  version: number
+  prompt: string
+  trace: Record<string, unknown>
+  status: string
+  locked_at: string | null
+  stale_at: string | null
+  created_at: string
+}
+
+/** 单镜头独立视频任务。失败只重做本镜，不会回滚同一 StoryRun 的其他镜头。 */
+export interface CommerceVideoClip {
+  id: string
+  story_run_id: string
+  storyboard_version_id: string
+  shot_id: string
+  shot_number: number
+  keyframe_version_id: string
+  video_prompt_version_id: string
+  version: number
+  provider_task_id: string | null
+  video_url: string | null
+  status: 'RUNNING' | 'SUCCEEDED' | 'APPROVED' | 'REJECTED' | 'FAILED' | 'STALE' | string
+  error_message: string | null
+  retry_count: number
+  duration_ms: number | null
+  media_metadata: Record<string, unknown>
+  reviewed_at: string | null
+  review_note: string | null
+  stale_at: string | null
+  created_at: string
+  finished_at: string | null
+}
+
+/** FFmpeg 导出的成片版本，冻结有序镜头版本；旧成片不会被新镜头覆盖。 */
+export interface CommerceFinalVideo {
+  id: string
+  story_run_id: string
+  storyboard_version_id: string
+  version: number
+  clip_ids: string[]
+  output_url: string | null
+  download_url: string | null
+  status: 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'STALE' | string
+  error_message: string | null
+  media_metadata: Record<string, unknown>
+  stale_at: string | null
+  created_at: string
+  finished_at: string | null
+}
+
+export interface CommerceProductionAssets {
+  story_run_id: string
+  character_designs: CommerceProductionVersion[]
+  scene_designs: CommerceProductionVersion[]
+  storyboards: CommerceProductionVersion[]
+  character_images: CommerceProductionImage[]
+  scene_images: CommerceProductionImage[]
+  keyframes: CommerceProductionImage[]
+  video_prompts: CommerceVideoPrompt[]
+  clips: CommerceVideoClip[]
+  finals: CommerceFinalVideo[]
+}
+
 export type ProductionStage =
   | 'REFERENCE_ANALYSIS'
   | 'ANALYSIS_REVIEW'

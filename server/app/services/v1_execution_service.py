@@ -75,13 +75,18 @@ from app.services.v1_model_adapter_service import (
     analyze_reference_video,
     assert_supported,
     create_video_request,
-    generate_image,
     generate_structured_text,
     is_mock_adapter,
     persist_v1_image,
+    persist_v1_image_bytes,
+    start_image_generation,
     video_provider,
+    wait_for_image_result,
     wait_for_video_result,
 )
+from app.services.storage import LocalImageReference, local_asset_storage
+from app.services.provider_config_security import redact_provider_config
+from app.services.sensitive_data import sanitize_error_summary
 from app.services.final_video_service import _compose_real_video
 from app.services.workflow_service import get_project_or_404
 
@@ -91,6 +96,9 @@ V1_WORKFLOW_PREFIX = "v1_"
 RUN_SPECS: dict[str, tuple[str, str, str]] = {
     "reference_analysis": ("VIDEO_ANALYSIS", "VIDEO_ANALYSIS", "Gemini 视频分析"),
     "story_generation": ("STORY_GENERATE", "STORY_GENERATE", "多模型原创故事生成"),
+    # Slice 1 复用 V1 的故事能力槽位与任务冻结机制，但结果写入 Commerce 的十创意
+    # 批次；它不会替换历史 StoryProposal 流程。
+    "commerce_creative_generation": ("STORY_GENERATE", "STORY_GENERATE", "带货短剧十个创意生成"),
     "character_design": ("CHARACTER_DESIGN", "CHARACTER_DESIGN", "角色资产设计"),
     "character_images": ("CHARACTER_IMAGE_GENERATE", "IMAGE_GENERATE", "角色参考图生成"),
     "scene_design": ("SCENE_DESIGN", "SCENE_DESIGN", "场景资产设计"),
@@ -104,6 +112,8 @@ RUN_SPECS: dict[str, tuple[str, str, str]] = {
 ALLOWED_STAGES: dict[str, set[ProductionStage]] = {
     "reference_analysis": {ProductionStage.REFERENCE_ANALYSIS},
     "story_generation": {ProductionStage.STORY_GENERATION},
+    # 历史成功批次可显式再生成新批次；不会覆盖旧十创意，仍需人工重新选择。
+    "commerce_creative_generation": {ProductionStage.STORY_GENERATION, ProductionStage.STORY_REVIEW},
     "character_design": {ProductionStage.CHARACTER_ASSETS},
     "character_images": {ProductionStage.CHARACTER_ASSETS},
     "scene_design": {ProductionStage.SCENE_ASSETS},
@@ -199,7 +209,13 @@ def create_v1_run(
         workflow_key=workflow_key,
         workflow_definition_id=definition.id,
         workflow_version=definition.version,
-        idempotency_key=_run_idempotency_key(project_id, run_key, frozen_context),
+        # “重新生成十创意”是显式的人工动作；输入快照相同也必须新建一个保留历史的
+        # 批次，因此 run 的幂等键以新的 UUID 语义种子区分。普通 V1 节点继续稳定键。
+        idempotency_key=(
+            f"{_run_idempotency_key(project_id, run_key, frozen_context)}:{utcnow().isoformat()}"
+            if run_key == "commerce_creative_generation"
+            else _run_idempotency_key(project_id, run_key, frozen_context)
+        ),
         input_snapshot=input_snapshot,
     )
     step = WorkflowStep(
@@ -362,6 +378,11 @@ def _validate_inputs(
         _source_asset_for_reference_analysis(db, project_id, source_asset_id)
     elif run_key == "story_generation" and state.locked_reference_analysis_id is None:
         _conflict("请先人工锁定创作简报")
+    elif run_key == "commerce_creative_generation":
+        # 函数返回可 JSON 化的完整版本快照；创建任务时读取一次，Worker 只读取该副本。
+        from app.services.commerce_mainline_service import frozen_creative_input
+
+        frozen_creative_input(db, state)
     elif run_key.startswith(("character_", "scene_")) and state.selected_story_proposal_id is None:
         _conflict("请先人工选择原创故事")
     elif run_key == "character_images":
@@ -466,7 +487,7 @@ def _freeze_run_context(
             shot for shot in shots
             if (not requested and not _shot_has_selected_approved_clip(db, shot)) or (requested and shot.id in requested)
         ]
-    return {
+    context = {
         "source_asset_id": source.id if source else None,
         "source_asset": _asset_snapshot(source),
         "locked_reference_analysis_id": analysis.id if analysis else None,
@@ -489,6 +510,11 @@ def _freeze_run_context(
         "selected_video_clip_ids": [shot.selected_video_clip_id for shot in shots if shot.selected_video_clip_id],
         "requested_shot_plan_ids": [shot.id for shot in shots] if run_key == "video_generation" else [],
     }
+    if run_key == "commerce_creative_generation":
+        from app.services.commerce_mainline_service import frozen_creative_input
+
+        context["commerce_mainline"] = frozen_creative_input(db, state)
+    return context
 
 
 def _asset_snapshot(source: MediaAsset | None) -> dict[str, Any] | None:
@@ -661,6 +687,7 @@ def execute_v1_workflow(run_id: str) -> None:
         db.commit()
     except Exception as exc:
         db.rollback()
+        error_message = sanitize_error_summary(exc, max_length=2000)
         run = db.get(WorkflowRun, run_id)
         if run is not None:
             # 运行失败也必须结束本次已创建但尚未完成的模型调用审计，避免后台看板
@@ -679,7 +706,7 @@ def execute_v1_workflow(run_id: str) -> None:
             step = db.scalars(select(WorkflowStep).where(WorkflowStep.workflow_run_id == run.id)).first()
             if step is not None:
                 step.status = RunStatus.FAILED
-                step.error_message = str(exc)[:2000]
+                step.error_message = error_message
                 step.finished_at = run.finished_at
             db.commit()
     finally:
@@ -698,7 +725,7 @@ def _profile_snapshot(profile_id: str, db: Session) -> dict[str, Any]:
         "model_version": profile.model_version or profile.model_key,
         "display_name": profile.display_name or profile.model_key,
         "version": profile.version,
-        "provider_config": deepcopy(profile.provider_config),
+        "provider_config": redact_provider_config(profile.provider_config),
     }
 
 
@@ -769,6 +796,10 @@ def _invoke(
     profile_id = binding.get("model_profile_id")
     if not isinstance(profile_snapshot, dict) or not isinstance(slot_id, str) or not isinstance(profile_id, str):
         raise RuntimeError("冻结模型绑定格式无效")
+    # 防御历史任务在本次审计落库时再次复制异常配置。新任务创建时已脱敏，
+    # 这里仍做一次边界清理，保证 ModelInvocation 永远不成为明文扩散点。
+    safe_profile_snapshot = deepcopy(profile_snapshot)
+    safe_profile_snapshot["provider_config"] = redact_provider_config(profile_snapshot.get("provider_config"))
     prompt = _frozen_prompt(run, task_type)
     invocation = ModelInvocation(
         project_id=run.project_id,
@@ -778,7 +809,7 @@ def _invoke(
         model_profile_id=profile_id,
         prompt_template_id=prompt.get("id"),
         task_type=task_type,
-        model_profile_snapshot=deepcopy(profile_snapshot),
+        model_profile_snapshot=safe_profile_snapshot,
         prompt_snapshot=deepcopy(prompt),
         input_snapshot=deepcopy(input_snapshot),
         idempotency_key=idempotency_key,
@@ -835,7 +866,7 @@ def _fail_invocation(
         invocation.latency_ms = max(0, int((perf_counter() - started_at) * 1000))
     if provider_task_id:
         invocation.provider_task_id = provider_task_id
-    invocation.output_reference = {"error": message[:1000]}
+    invocation.output_reference = {"error": sanitize_error_summary(message, max_length=1000)}
 
 
 def _is_mock(profile_snapshot: dict[str, Any]) -> bool:
@@ -958,10 +989,22 @@ def _execute_reference_analysis(db: Session, run: WorkflowRun) -> None:
         generation_status=RunStatus.SUCCEEDED,
     )
     db.add(analysis)
+    # UUID 默认值在 flush 时生成。先落出分析 ID，再创建一对一 Commerce intake，
+    # 使模型调用审计、脚本分析和商品草稿可完整互相追溯。
+    db.flush()
+    from app.services.commerce_mainline_service import ensure_reference_intake_from_analysis
+
+    intake = ensure_reference_intake_from_analysis(db, analysis)
     _finish_invocation(
         db,
         invocation,
-        {"reference_analysis_id": analysis.id, "version": version},
+        {
+            "reference_analysis_id": analysis.id,
+            "version": version,
+            "commerce_reference_intake_id": intake.id,
+            "script_analysis_version_id": intake.script_analysis_version_id,
+            "product_asset_version_id": intake.product_asset_version_id,
+        },
         started_at=started_at,
         media_units=media_units,
     )
@@ -1126,6 +1169,21 @@ def _execute_story_generation(db: Session, run: WorkflowRun) -> None:
     batch.finished_at = utcnow()
     db.commit()
     mark_story_batch_ready(db, batch.id)
+
+
+def _execute_commerce_creative_generation(db: Session, run: WorkflowRun) -> None:
+    """调用已冻结的文本 Adapter，生成固定十个 Commerce 创意并进入人工选择。"""
+
+    bindings = _frozen_bindings(run, "STORY_GENERATE")
+    # 固定十个创意是一个可审计批次，不按当前启用模型数量漂移。完整模型列表已随
+    # WorkflowRun 冻结；V1 当前策略使用排在第一位的已冻结能力配置执行该批次。
+    binding = bindings[0]
+    prompt = _frozen_prompt(run, "STORY_GENERATE")
+    from app.services.commerce_mainline_service import execute_creative_generation, mark_creative_batch_ready
+
+    batch = execute_creative_generation(db, run, binding=binding, prompt=prompt)
+    db.commit()
+    mark_creative_batch_ready(db, batch)
 
 
 def _frozen_story_id(run: WorkflowRun) -> str:
@@ -1304,6 +1362,87 @@ def _image_prompt(instruction: str, subject: str) -> str:
     return f"{instruction.strip()}\n\n生成对象：{subject.strip()}"
 
 
+def _generate_persisted_v1_image(
+    db: Session,
+    *,
+    invocation: ModelInvocation,
+    snapshot: dict[str, Any],
+    prompt: str,
+    reference_image_urls: list[str],
+    reference_images: list[LocalImageReference] | None = None,
+) -> tuple[Any, dict[str, Any], str | None]:
+    """提交或恢复一张真实图片，并先持久化 Fal 队列任务号。
+
+    这是 V1 图片任务的收费边界：Fal 提交返回 ``request_id`` 后立刻提交数据库，
+    随后的轮询、下载或 Worker 进程中断都只能复用这个任务号。恢复时没有重新 POST
+    的路径，因此不能对同一张图重复扣费。
+    """
+
+    provider, first_result = start_image_generation(
+        snapshot,
+        prompt=prompt,
+        reference_image_urls=reference_image_urls,
+        reference_images=reference_images,
+        existing_provider_task_id=invocation.provider_task_id,
+    )
+    provider_task_id = first_result.provider_task_id or invocation.provider_task_id
+    if provider_task_id and invocation.provider_task_id != provider_task_id:
+        invocation.provider_task_id = provider_task_id
+        # 不等到整个工作流结束：后续 Worker 退出时，下一次执行可从这个任务号继续轮询。
+        db.commit()
+    result = wait_for_image_result(provider, snapshot, first_result)
+    provider_task_id = result.provider_task_id or provider_task_id
+    if result.status != "SUCCEEDED" or (not result.image_url and not result.image_bytes):
+        message = result.error_message or "图片供应商任务失败"
+        _fail_invocation(invocation, message, provider_task_id=provider_task_id)
+        db.commit()
+        raise RuntimeError(message)
+    media_units: dict[str, Any] = {"images": 1}
+    if result.content_type:
+        media_units["content_type"] = result.content_type
+    if result.byte_size is not None:
+        media_units["byte_size"] = result.byte_size
+    if result.sha256:
+        media_units["sha256"] = result.sha256
+    if result.width is not None:
+        media_units["width"] = result.width
+    if result.height is not None:
+        media_units["height"] = result.height
+    return result, media_units, provider_task_id
+
+
+def _persist_generated_v1_image(
+    *,
+    project_id: str,
+    asset_kind: str,
+    asset_id: str,
+    version: int,
+    result: Any,
+) -> str:
+    """把图片结果保存为稳定资产；方舟临时 URL 绝不离开 Worker 内存。"""
+
+    if isinstance(result.image_bytes, bytes):
+        if not isinstance(result.content_type, str):
+            raise RuntimeError("方舟图片结果缺少 MIME 类型")
+        return persist_v1_image_bytes(
+            project_id=project_id,
+            asset_kind=asset_kind,
+            asset_id=asset_id,
+            version=version,
+            content=result.image_bytes,
+            content_type=result.content_type,
+        )
+    if not isinstance(result.image_url, str) or not result.image_url:
+        raise RuntimeError("图片供应商未返回可持久化结果")
+    return persist_v1_image(
+        project_id=project_id,
+        asset_kind=asset_kind,
+        asset_id=asset_id,
+        version=version,
+        source_url=result.image_url,
+    )
+
+
 def _frozen_asset_rows(run: WorkflowRun, key: str) -> list[dict[str, Any]]:
     """读取创建时冻结的资产定义，拒绝由运行时数据库内容填充模型输入。"""
 
@@ -1320,9 +1459,24 @@ def _execute_character_images(db: Session, run: WorkflowRun) -> None:
         character_id = character.get("definition_id")
         if not isinstance(character_id, str):
             raise RuntimeError("冻结角色资产缺少 definition_id")
-        invocation = _invoke(db, run=run, slot_key="CHARACTER_IMAGE_GENERATE", task_type="IMAGE_GENERATE", input_snapshot={"character_id": character_id}, binding=binding)
+        version = (
+            db.scalar(
+                select(func.max(CharacterReferenceImage.version)).where(
+                    CharacterReferenceImage.character_id == character_id
+                )
+            )
+            or 0
+        ) + 1
+        invocation = _invoke(
+            db,
+            run=run,
+            slot_key="CHARACTER_IMAGE_GENERATE",
+            task_type="IMAGE_GENERATE",
+            input_snapshot={"character_id": character_id},
+            binding=binding,
+            idempotency_key=f"{run.id}:character-image:{character_id}:v{version}",
+        )
         snapshot = invocation.model_profile_snapshot
-        version = (db.scalar(select(func.max(CharacterReferenceImage.version)).where(CharacterReferenceImage.character_id == character_id)) or 0) + 1
         prompt = _image_prompt(
             _system_instruction(invocation, "输出单人角色设定参考图，不出现文字、水印或其他未定义角色。"),
             f"角色编码：{character.get('character_code', '')}；姓名：{character.get('name', '')}；"
@@ -1330,16 +1484,24 @@ def _execute_character_images(db: Session, run: WorkflowRun) -> None:
             f"服装：{character.get('costume', '')}；气质：{character.get('temperament', '')}。",
         )
         started_at = perf_counter()
+        media_units: dict[str, Any] = {"images": 1}
+        provider_task_id: str | None = None
         if _is_mock(snapshot):
             image_url = _mock_image_url("character", character_id, version)
         else:
-            provider_url = generate_image(snapshot, prompt=prompt)
-            image_url = persist_v1_image(
+            provider_result, media_units, provider_task_id = _generate_persisted_v1_image(
+                db,
+                invocation=invocation,
+                snapshot=snapshot,
+                prompt=prompt,
+                reference_image_urls=[],
+            )
+            image_url = _persist_generated_v1_image(
                 project_id=run.project_id,
                 asset_kind="character-reference",
                 asset_id=character_id,
                 version=version,
-                source_url=provider_url,
+                result=provider_result,
             )
         image = CharacterReferenceImage(character_id=character_id, project_id=run.project_id, generation_run_id=run.id, model_invocation_id=invocation.id, version=version, prompt_snapshot=prompt, image_url=image_url, generation_status=RunStatus.SUCCEEDED)
         db.add(image)
@@ -1354,7 +1516,8 @@ def _execute_character_images(db: Session, run: WorkflowRun) -> None:
             invocation,
             {"image_id": image.id, "version": version, "character_asset_version_id": asset_version.id},
             started_at=started_at,
-            media_units={"images": 1},
+            provider_task_id=provider_task_id,
+            media_units=media_units,
         )
     db.commit()
 
@@ -1366,9 +1529,22 @@ def _execute_scene_images(db: Session, run: WorkflowRun) -> None:
         scene_id = scene.get("definition_id")
         if not isinstance(scene_id, str):
             raise RuntimeError("冻结场景资产缺少 definition_id")
-        invocation = _invoke(db, run=run, slot_key="SCENE_IMAGE_GENERATE", task_type="IMAGE_GENERATE", input_snapshot={"scene_id": scene_id}, binding=binding)
+        version = (
+            db.scalar(
+                select(func.max(SceneReferenceImage.version)).where(SceneReferenceImage.scene_id == scene_id)
+            )
+            or 0
+        ) + 1
+        invocation = _invoke(
+            db,
+            run=run,
+            slot_key="SCENE_IMAGE_GENERATE",
+            task_type="IMAGE_GENERATE",
+            input_snapshot={"scene_id": scene_id},
+            binding=binding,
+            idempotency_key=f"{run.id}:scene-image:{scene_id}:v{version}",
+        )
         snapshot = invocation.model_profile_snapshot
-        version = (db.scalar(select(func.max(SceneReferenceImage.version)).where(SceneReferenceImage.scene_id == scene_id)) or 0) + 1
         prompt = _image_prompt(
             _system_instruction(invocation, "输出无人场景设定参考图，不出现文字、水印或未定义人物。"),
             f"场景编码：{scene.get('scene_code', '')}；名称：{scene.get('name', '')}；地点：{scene.get('location', '')}；"
@@ -1376,16 +1552,24 @@ def _execute_scene_images(db: Session, run: WorkflowRun) -> None:
             f"氛围：{scene.get('mood', '')}。",
         )
         started_at = perf_counter()
+        media_units: dict[str, Any] = {"images": 1}
+        provider_task_id: str | None = None
         if _is_mock(snapshot):
             image_url = _mock_image_url("scene", scene_id, version)
         else:
-            provider_url = generate_image(snapshot, prompt=prompt)
-            image_url = persist_v1_image(
+            provider_result, media_units, provider_task_id = _generate_persisted_v1_image(
+                db,
+                invocation=invocation,
+                snapshot=snapshot,
+                prompt=prompt,
+                reference_image_urls=[],
+            )
+            image_url = _persist_generated_v1_image(
                 project_id=run.project_id,
                 asset_kind="scene-reference",
                 asset_id=scene_id,
                 version=version,
-                source_url=provider_url,
+                result=provider_result,
             )
         image = SceneReferenceImage(scene_id=scene_id, project_id=run.project_id, generation_run_id=run.id, model_invocation_id=invocation.id, version=version, prompt_snapshot=prompt, image_url=image_url, generation_status=RunStatus.SUCCEEDED)
         db.add(image)
@@ -1399,7 +1583,8 @@ def _execute_scene_images(db: Session, run: WorkflowRun) -> None:
             invocation,
             {"image_id": image.id, "version": version, "scene_asset_version_id": asset_version.id},
             started_at=started_at,
-            media_units={"images": 1},
+            provider_task_id=provider_task_id,
+            media_units=media_units,
         )
     db.commit()
 
@@ -1614,6 +1799,10 @@ def _execute_shot_keyframes(db: Session, run: WorkflowRun) -> None:
         scene_references = shot.get("scene_reference_images")
         if not isinstance(character_references, list) or not isinstance(scene_references, list):
             raise RuntimeError("冻结分镜缺少资产引用快照")
+        if not character_references:
+            raise RuntimeError("分镜关键帧缺少冻结的角色图")
+        if not scene_references:
+            raise RuntimeError("分镜关键帧缺少冻结的场景图")
         reference_rows = [*character_references, *scene_references]
         reference_urls = list(
             dict.fromkeys(
@@ -1623,6 +1812,70 @@ def _execute_shot_keyframes(db: Session, run: WorkflowRun) -> None:
         )
         if not reference_urls:
             raise RuntimeError("分镜关键帧缺少冻结的角色图或场景图")
+        profile_snapshot = binding.get("profile_snapshot")
+        if not isinstance(profile_snapshot, dict):
+            raise RuntimeError("分镜关键帧缺少冻结模型快照")
+        ark_reference_images: list[LocalImageReference] = []
+        reference_audit_metadata: list[dict[str, object]] = []
+        if adapter_key(profile_snapshot) == "volcengine_ark_image":
+            # 官方方舟无法访问单机 ``/media`` URL。角色图在前、场景图在后，由
+            # Storage 以冻结 ID 校验后转为仅在当前 Worker 内存存活的 Data URL。
+            for role, rows in (("character", character_references), ("scene", scene_references)):
+                for item in rows:
+                    if not isinstance(item, dict):
+                        raise RuntimeError("冻结分镜参考图格式无效")
+                    asset_id = item.get("id")
+                    image_url = item.get("image_url")
+                    if not isinstance(asset_id, str) or not isinstance(image_url, str):
+                        raise RuntimeError("冻结分镜参考图缺少资产 ID 或本地媒体地址")
+                    # 只用冻结的图片版本 ID 查询其所属逻辑资产，以校验旧版媒体目录
+                    # 命名；不读取“最新”角色/场景图，也不接受前端给出的路径字段。
+                    image_model = CharacterReferenceImage if role == "character" else SceneReferenceImage
+                    reference_row = db.get(image_model, asset_id)
+                    if (
+                        reference_row is None
+                        or reference_row.project_id != run.project_id
+                        or reference_row.image_url != image_url
+                    ):
+                        raise RuntimeError("冻结分镜参考图与当前项目或图片版本不一致")
+                    storage_namespace_id = (
+                        reference_row.character_id if role == "character" else reference_row.scene_id
+                    )
+                    ark_reference_images.append(
+                        local_asset_storage.load_generated_image_reference(
+                            project_id=run.project_id,
+                            asset_id=asset_id,
+                            role=role,
+                            image_url=image_url,
+                            storage_namespace_id=storage_namespace_id,
+                        )
+                    )
+            # 将可审计的身份摘要保存到调用快照；Data URL、字节和本地路径不允许
+            # 出现在数据库。按 SHA 去重时仍保留角色优先的稳定顺序。
+            seen_sha256: set[str] = set()
+            ark_reference_images = [
+                item
+                for item in ark_reference_images
+                if not (item.sha256 in seen_sha256 or seen_sha256.add(item.sha256))
+            ]
+            if len(ark_reference_images) > 14:
+                raise RuntimeError("分镜关键帧最多允许 14 张参考图")
+            reference_audit_metadata = [item.audit_metadata() for item in ark_reference_images]
+        existing_frame = db.scalars(
+            select(ShotKeyframe).where(
+                ShotKeyframe.shot_id == shot_id,
+                ShotKeyframe.generation_run_id == run.id,
+                ShotKeyframe.generation_status == RunStatus.SUCCEEDED,
+                ShotKeyframe.image_url.is_not(None),
+            )
+        ).first()
+        if existing_frame is not None:
+            # 同一已领取任务被 Worker 重复执行时，成功关键帧就是幂等结果；不得再向
+            # 同步图片接口发起第二次付费 POST。
+            continue
+        version = (
+            db.scalar(select(func.max(ShotKeyframe.version)).where(ShotKeyframe.shot_id == shot_id)) or 0
+        ) + 1
         invocation = _invoke(
             db,
             run=run,
@@ -1634,11 +1887,12 @@ def _execute_shot_keyframes(db: Session, run: WorkflowRun) -> None:
                 "scene_reference_image_ids": deepcopy(shot.get("scene_reference_image_ids") or []),
                 "character_asset_version_ids": deepcopy(shot.get("character_asset_version_ids") or []),
                 "scene_asset_version_ids": deepcopy(shot.get("scene_asset_version_ids") or []),
+                "reference_assets": reference_audit_metadata,
             },
             binding=binding,
+            idempotency_key=f"{run.id}:shot-keyframe:{shot_id}:v{version}",
         )
         snapshot = invocation.model_profile_snapshot
-        version = (db.scalar(select(func.max(ShotKeyframe.version)).where(ShotKeyframe.shot_id == shot_id)) or 0) + 1
         prompt = _image_prompt(
             _system_instruction(
                 invocation,
@@ -1650,16 +1904,33 @@ def _execute_shot_keyframes(db: Session, run: WorkflowRun) -> None:
             f"光线：{shot.get('lighting', '')}。",
         )
         started_at = perf_counter()
+        media_units: dict[str, Any] = {
+            "images": 1,
+            "reference_image_count": len(ark_reference_images) if ark_reference_images else len(reference_urls),
+        }
+        if reference_audit_metadata:
+            media_units["reference_assets"] = deepcopy(reference_audit_metadata)
+        provider_task_id: str | None = None
         if _is_mock(snapshot):
             image_url = _mock_image_url("keyframe", shot_id, version)
         else:
-            provider_url = generate_image(snapshot, prompt=prompt, reference_image_urls=reference_urls)
-            image_url = persist_v1_image(
+            provider_result, media_units, provider_task_id = _generate_persisted_v1_image(
+                db,
+                invocation=invocation,
+                snapshot=snapshot,
+                prompt=prompt,
+                reference_image_urls=reference_urls,
+                reference_images=ark_reference_images,
+            )
+            media_units["reference_image_count"] = len(ark_reference_images) if ark_reference_images else len(reference_urls)
+            if reference_audit_metadata:
+                media_units["reference_assets"] = deepcopy(reference_audit_metadata)
+            image_url = _persist_generated_v1_image(
                 project_id=run.project_id,
                 asset_kind="shot-keyframe",
                 asset_id=shot_id,
                 version=version,
-                source_url=provider_url,
+                result=provider_result,
             )
         frame = ShotKeyframe(
             shot_id=shot_id,
@@ -1687,7 +1958,8 @@ def _execute_shot_keyframes(db: Session, run: WorkflowRun) -> None:
             invocation,
             {"keyframe_id": frame.id, "version": version},
             started_at=started_at,
-            media_units={"images": 1, "reference_image_count": len(reference_urls)},
+            provider_task_id=provider_task_id,
+            media_units=media_units,
         )
     db.commit()
 
@@ -1782,7 +2054,7 @@ def execute_v1_video_child(run_id: str, step_id: str) -> None:
         clip.provider_task_id = result.provider_task_id or provider_task_id
         step.provider_task_id = clip.provider_task_id
         if result.status != "SUCCEEDED" or not result.video_url:
-            message = result.error_message or "视频供应商任务失败"
+            message = sanitize_error_summary(result.error_message or "视频供应商任务失败", max_length=2000)
             clip.status = VideoClipStatus.FAILED
             clip.generation_status = RunStatus.FAILED.value
             clip.error_message = message[:2000]
@@ -1796,6 +2068,7 @@ def execute_v1_video_child(run_id: str, step_id: str) -> None:
         _finish_video_child(db, run, step, clip)
     except Exception as exc:
         db.rollback()
+        error_message = sanitize_error_summary(exc, max_length=2000)
         run = db.get(WorkflowRun, run_id)
         step = db.get(WorkflowStep, step_id)
         if run is not None and step is not None:
@@ -1803,12 +2076,12 @@ def execute_v1_video_child(run_id: str, step_id: str) -> None:
             if clip is not None:
                 clip.status = VideoClipStatus.FAILED
                 clip.generation_status = RunStatus.FAILED.value
-                clip.error_message = str(exc)[:2000]
+                clip.error_message = error_message
             invocation = db.scalars(select(ModelInvocation).where(ModelInvocation.idempotency_key == step.idempotency_key)).first()
             if invocation is not None and invocation.status == RunStatus.RUNNING:
-                _fail_invocation(invocation, str(exc), provider_task_id=step.provider_task_id)
+                _fail_invocation(invocation, error_message, provider_task_id=step.provider_task_id)
             step.status = RunStatus.FAILED
-            step.error_message = str(exc)[:2000]
+            step.error_message = error_message
             step.finished_at = utcnow()
             _aggregate_video_parent(db, run)
             db.commit()
@@ -1940,6 +2213,7 @@ def _execute_final_compose(db: Session, run: WorkflowRun) -> None:
 _EXECUTORS: dict[str, Callable[[Session, WorkflowRun], None]] = {
     "reference_analysis": _execute_reference_analysis,
     "story_generation": _execute_story_generation,
+    "commerce_creative_generation": _execute_commerce_creative_generation,
     "character_design": _execute_character_design,
     "character_images": _execute_character_images,
     "scene_design": _execute_scene_design,

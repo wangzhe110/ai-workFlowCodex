@@ -6,6 +6,7 @@ import type {
   ModelSlot,
   ModelInvocationTrace,
   ModelQualityEvaluation,
+  ModelProfilePreflight,
   ProductionState,
   PromptTemplate,
   ReferenceAnalysis,
@@ -18,6 +19,16 @@ import type {
   V1ModelProfileCreatePayload,
   V1ModelProfileUpdatePayload,
   WorkflowRun,
+  CommerceCreativeBatch,
+  CommerceFinalVideo,
+  CommerceOutline,
+  CommerceProductionAssets,
+  CommerceProductionImage,
+  CommerceProductionVersion,
+  CommerceReferenceIntake,
+  CommerceStoryRun,
+  CommerceStoryRunSelection,
+  CommerceVideoClip,
 } from '@/types/domain'
 
 const jsonPost = <T>(path: string, payload: object = {}): Promise<T> => request<T>(path, {
@@ -56,6 +67,93 @@ export function startProductionRun(
 
 export function getReferenceAnalyses(projectId: string): Promise<ReferenceAnalysis[]> {
   return request<ReferenceAnalysis[]>(`/production/projects/${projectId}/reference-analyses`)
+}
+
+/** V1 分析完成后自动生成的脚本分析版本与商品草稿；不会隐式启动模型。 */
+export function getCommerceReferenceIntakes(projectId: string): Promise<CommerceReferenceIntake[]> {
+  return request<CommerceReferenceIntake[]>(`/production/projects/${projectId}/commerce-reference-intakes`)
+}
+
+/** 人工确认后冻结某一个商品版本；后续十创意任务只消费这个不可变版本。 */
+export function confirmCommerceProduct(
+  intakeId: string,
+  payload: ReviewActionPayload,
+): Promise<CommerceReferenceIntake> {
+  return jsonPost<CommerceReferenceIntake>(`/production/commerce-reference-intakes/${intakeId}/confirm-product`, payload)
+}
+
+/** 创意批次保留历史，调用方可只在页面上突出最新成功的一批。 */
+export function getCommerceCreativeBatches(projectId: string): Promise<CommerceCreativeBatch[]> {
+  return request<CommerceCreativeBatch[]>(`/production/projects/${projectId}/commerce-creative-batches`)
+}
+
+/** 选择十创意中的一个，并建立现有 Commerce StoryRun 的冻结输入证据链。 */
+export function selectCommerceCreativeIdea(
+  ideaId: string,
+  payload: ReviewActionPayload & { mode?: 'STEPWISE' | 'AUTO' } = {},
+): Promise<CommerceStoryRunSelection> {
+  return jsonPost<CommerceStoryRunSelection>(`/production/commerce-creative-ideas/${ideaId}/select`, payload)
+}
+
+/** 读取 Slice 1 已创建的 Commerce StoryRun；不再让页面从项目级“最新状态”猜当前运行。 */
+export function getCommerceStoryRuns(projectId: string): Promise<CommerceStoryRun[]> {
+  return request<CommerceStoryRun[]>(`/commerce/projects/${projectId}/story-runs`)
+}
+
+export function getCommerceOutlines(storyRunId: string): Promise<CommerceOutline[]> {
+  return request<CommerceOutline[]>(`/commerce/story-runs/${storyRunId}/outlines`)
+}
+
+/** Commerce 主工作流的大纲审核，与 Slice 2 资产锁定是两道独立且可追溯的闸门。 */
+export function confirmCommerceStage(storyRunId: string, stage: string, payload: ReviewActionPayload): Promise<CommerceStoryRun> {
+  return jsonPost<CommerceStoryRun>(`/commerce/story-runs/${storyRunId}/stages/${encodeURIComponent(stage)}/confirm`, payload)
+}
+
+/** 创建 Slice 2 冻结任务；同一冻结输入的重复点击返回活动 WorkflowRun。 */
+export function startCommerceProduction(
+  storyRunId: string,
+  operation: string,
+  payload: { target_id?: string; retry?: boolean } = {},
+): Promise<WorkflowRun> {
+  return jsonPost<WorkflowRun>(`/commerce/story-runs/${storyRunId}/production/${encodeURIComponent(operation)}`, payload)
+}
+
+export function getCommerceProductionAssets(storyRunId: string): Promise<CommerceProductionAssets> {
+  return request<CommerceProductionAssets>(`/commerce/story-runs/${storyRunId}/production-assets`)
+}
+
+export function lockCommerceCharacterDesign(storyRunId: string, versionId: string, payload: ReviewActionPayload): Promise<CommerceProductionVersion> {
+  return jsonPost<CommerceProductionVersion>(`/commerce/story-runs/${storyRunId}/character-designs/${versionId}/lock`, payload)
+}
+
+export function lockCommerceSceneDesign(storyRunId: string, versionId: string, payload: ReviewActionPayload): Promise<CommerceProductionVersion> {
+  return jsonPost<CommerceProductionVersion>(`/commerce/story-runs/${storyRunId}/scene-designs/${versionId}/lock`, payload)
+}
+
+export function lockCommerceStoryboard(storyRunId: string, versionId: string, payload: ReviewActionPayload): Promise<CommerceProductionVersion> {
+  return jsonPost<CommerceProductionVersion>(`/commerce/story-runs/${storyRunId}/storyboards/${versionId}/lock`, payload)
+}
+
+export function lockCommerceProductionImage(
+  storyRunId: string,
+  imageKind: 'CHARACTER' | 'SCENE' | 'KEYFRAME',
+  imageId: string,
+  payload: ReviewActionPayload,
+): Promise<CommerceProductionImage> {
+  return jsonPost<CommerceProductionImage>(`/commerce/story-runs/${storyRunId}/images/${imageKind}/${imageId}/lock`, payload)
+}
+
+export function reviewCommerceVideoClip(
+  storyRunId: string,
+  clipId: string,
+  decision: 'APPROVED' | 'REJECTED',
+  payload: ReviewActionPayload,
+): Promise<CommerceVideoClip> {
+  return jsonPost<CommerceVideoClip>(`/commerce/story-runs/${storyRunId}/clips/${clipId}/review?decision=${decision}`, payload)
+}
+
+export function commerceFinalDownloadUrl(finalVideo: CommerceFinalVideo): string | null {
+  return finalVideo.download_url || (finalVideo.output_url?.startsWith('https://') ? finalVideo.output_url : null)
 }
 
 export function lockReferenceAnalysis(id: string, payload: ReviewActionPayload): Promise<ReferenceAnalysis> {
@@ -139,6 +237,11 @@ export function getModelSlots(): Promise<ModelSlot[]> {
 /** V1 模型候选与实际槽位启用状态；只显示 V1，不混入旧流程模型。 */
 export function getV1ModelProfiles(): Promise<V1ModelProfile[]> {
   return request<V1ModelProfile[]>('/production/v1-model-profiles')
+}
+
+/** 不生成内容或提交任务，只校验 V1 Adapter、密钥注入和只读模型目录。 */
+export function preflightV1ModelProfile(profileId: string): Promise<ModelProfilePreflight> {
+  return jsonPost<ModelProfilePreflight>(`/production/v1-model-profiles/${encodeURIComponent(profileId)}/preflight`)
 }
 
 /** 读取每个“模型 + Prompt + 任务”的最新质量快照，不改变任何模型启用状态。 */

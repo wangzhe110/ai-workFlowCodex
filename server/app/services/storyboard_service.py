@@ -17,6 +17,7 @@ from app.services.analysis_provider import (
     StoryboardGenerationInput,
 )
 from app.services.model_profile_service import get_active_profile_snapshot
+from app.services.sensitive_data import sanitize_error_summary
 from app.services.workflow_service import get_project_or_404, get_workflow_run_or_404
 
 
@@ -173,6 +174,7 @@ def execute(run_id: str) -> None:
         db.commit()
     except Exception as exc:
         db.rollback()
+        error_message = sanitize_error_summary(exc, max_length=2000)
         run = db.get(WorkflowRun, run_id)
         if run is not None:
             run.status = RunStatus.FAILED
@@ -182,7 +184,7 @@ def execute(run_id: str) -> None:
             ).first()
             if step is not None:
                 step.status = RunStatus.FAILED
-                step.error_message = str(exc)[:2000]
+                step.error_message = error_message
                 step.finished_at = now()
             db.commit()
     finally:

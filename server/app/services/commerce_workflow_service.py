@@ -75,6 +75,8 @@ from app.services.commerce_domain_service import (
     validate_story_run_bindings,
 )
 from app.services.v1_configuration_service import enabled_profiles_for_slot
+from app.services.v1_model_adapter_service import assert_supported, generate_structured_text, is_mock_adapter
+from app.services.provider_config_security import redact_provider_config
 
 
 # 一个 StoryRun 只拥有一个长期存在的 Commerce 父运行。每个阶段和人工重做均在
@@ -181,7 +183,7 @@ def _profile_snapshot(db: Session, binding, slot_key: str) -> dict[str, Any]:
             "model_version": profile.model_version or profile.model_key,
             "display_name": profile.display_name or profile.model_key,
             "version": profile.version,
-            "provider_config": deepcopy(profile.provider_config),
+            "provider_config": redact_provider_config(profile.provider_config),
         },
         # Adapter 是业务能力到供应商协议的唯一边界，必须随任务冻结，不能仅靠
         # 后续的 profile.adapter_key 再推导。
@@ -226,7 +228,7 @@ def _freeze_execution_snapshot(db: Session, story_run: StoryRun, stage: StoryRun
     product_version = db.get(ProductAssetVersion, story_run.product_asset_version_id)
     if selection is None or product_version is None:
         _error("StoryRun 的冻结产品选择或产品版本不存在", status.HTTP_409_CONFLICT)
-    return {
+    snapshot = {
         "frozen_at": utcnow().isoformat(),
         "commerce": {
             "story_run_id": story_run.id,
@@ -268,6 +270,11 @@ def _freeze_execution_snapshot(db: Session, story_run: StoryRun, stage: StoryRun
         "model_bindings": {slot_key: bindings} if slot_key else {},
         "prompt_templates": {task_type: prompt} if task_type and prompt else {},
     }
+    # Slice 1 的 StoryRun 有一对一的上游输入版本快照。这里复制它，不再执行时回读
+    # ScriptAnalysis、产品或创意表；旧 Commerce StoryRun 保持原有快照结构。
+    if story_run.mainline_input is not None:
+        snapshot["commerce_mainline"] = deepcopy(story_run.mainline_input.input_snapshot)
+    return snapshot
 
 
 def create_next_story_run(
@@ -1125,7 +1132,11 @@ class MockCommerceNodeExecutor:
     """无网络、确定性的 Phase 2 验收执行器；只建立领域候选，绝不替代人工审核。"""
 
     def execute(self, context: CommerceNodeContext) -> CommerceNodeResult:
-        if context.stage != StoryRunStage.TOPIC and not _is_mock(context):
+        has_mainline_outline = (
+            context.stage == StoryRunStage.OUTLINE
+            and isinstance((context.workflow_step.input_payload or {}).get("commerce_mainline"), dict)
+        )
+        if context.stage != StoryRunStage.TOPIC and not _is_mock(context) and not has_mainline_outline:
             raise RuntimeError("冻结的 Commerce 能力尚未配置受支持 Adapter")
         handler = getattr(self, f"_execute_{context.stage.value.lower()}")
         return handler(context)
@@ -1139,6 +1150,9 @@ class MockCommerceNodeExecutor:
         return self._result({"topic_candidate_id": context.story_run.topic_candidate_id}, {"validated": True})
 
     def _execute_outline(self, context: CommerceNodeContext) -> CommerceNodeResult:
+        mainline = (context.workflow_step.input_payload or {}).get("commerce_mainline")
+        if isinstance(mainline, dict):
+            return self._execute_mainline_outline(context, mainline)
         outline = create_next_story_outline_version(
             context.db,
             story_run_id=context.story_run.id,
@@ -1148,6 +1162,87 @@ class MockCommerceNodeExecutor:
             product_placement_strategy={"method": "SOFT_PROP", "strength": "LIGHT"},
         )
         return self._result({"outline_id": outline.id}, {"outline_version": outline.version})
+
+    def _execute_mainline_outline(
+        self, context: CommerceNodeContext, frozen_input: dict[str, Any]
+    ) -> CommerceNodeResult:
+        """以 Slice 1 的冻结脚本、商品、创意生成正式大纲与融入策略。
+
+        Mock 和真实模型仅在 Adapter 调用处区别；两条路径保存相同版本产物和引用，避免
+        非 Mock 配置伪造成功。Worker 不读取当前商品、当前 Prompt 或当前创意。
+        """
+
+        product = frozen_input.get("product_asset_version")
+        script = frozen_input.get("script_analysis")
+        idea = frozen_input.get("creative_idea")
+        if not all(isinstance(item, dict) for item in (product, script, idea)):
+            raise RuntimeError("大纲节点缺少冻结脚本、商品或创意")
+        content = idea.get("content") if isinstance(idea.get("content"), dict) else {}
+        if _is_mock(context):
+            outline_payload = {
+                "title": str(content.get("title") or "带货短剧大纲"),
+                "premise": str(content.get("synopsis") or "围绕真实痛点与产品体验的原创故事。"),
+                "story_beats": [
+                    {"beat": "hook", "content": str(content.get("opening_hook") or "异常事件推动人物行动")},
+                    {"beat": "conflict", "content": "人物的真实痛点升级，不能靠虚构功效解决。"},
+                    {"beat": "integration", "content": "根据已确认产品事实安排自然体验。"},
+                    {"beat": "resolution", "content": "关系或目标发生可验证变化。"},
+                ],
+                "product_placement_strategy": deepcopy(content.get("product_integration") or {"method": "SOFT_PROP"}),
+            }
+        else:
+            bindings = (context.workflow_step.model_profile_snapshot or {}).get("model_bindings") or {}
+            items = bindings.get("STORY_GENERATE")
+            if not isinstance(items, list) or not items:
+                raise RuntimeError("大纲节点缺少冻结的故事模型")
+            profile = items[0].get("profile_snapshot") or {}
+            prompts = (context.workflow_step.input_payload or {}).get("prompt_templates") or {}
+            prompt = prompts.get("STORY_GENERATE") or {}
+            if not isinstance(profile, dict) or not isinstance(prompt, dict):
+                raise RuntimeError("大纲节点冻结模型或 Prompt 无效")
+            assert_supported(profile, "STORY_GENERATE")
+            outline_payload = generate_structured_text(
+                profile,
+                task_type="STORY_GENERATE",
+                system_instruction=(
+                    f"{str(prompt.get('content') or '').strip()}\n\n"
+                    "基于冻结脚本、冻结商品和已选创意生成原创故事大纲与结构化商品融入方案。"
+                    "禁止创造冻结商品分析中不存在的功效、包装、使用方法或宣传结论。"
+                ),
+                user_payload={"frozen_input": deepcopy(frozen_input)},
+                output_contract=(
+                    '{"title":"string","premise":"string","story_beats":[{"beat":"string","content":"string"}],'
+                    '"product_placement_strategy":{"method":"string"}}'
+                ),
+            )
+        title = outline_payload.get("title") if isinstance(outline_payload, dict) else None
+        premise = outline_payload.get("premise") if isinstance(outline_payload, dict) else None
+        beats = outline_payload.get("story_beats") if isinstance(outline_payload, dict) else None
+        strategy = outline_payload.get("product_placement_strategy") if isinstance(outline_payload, dict) else None
+        if not isinstance(title, str) or not title.strip() or not isinstance(premise, str) or not premise.strip() or not isinstance(beats, list) or not beats or not isinstance(strategy, dict):
+            raise RuntimeError("大纲模型返回不符合结构化契约")
+        outline = create_next_story_outline_version(
+            context.db,
+            story_run_id=context.story_run.id,
+            title=title.strip()[:180],
+            premise=premise.strip()[:20_000],
+            story_beats=deepcopy(beats),
+            product_placement_strategy={
+                **deepcopy(strategy),
+                "frozen_product_asset_version_id": product.get("id"),
+                "creative_idea_id": idea.get("id"),
+                "script_analysis_version_id": script.get("id"),
+            },
+        )
+        return self._result(
+            {
+                "outline_id": outline.id,
+                "script_analysis_version_id": script.get("id"),
+                "product_asset_version_id": product.get("id"),
+                "creative_idea_id": idea.get("id"),
+            },
+            {"outline_version": outline.version, "mainline": True},
+        )
 
     def _execute_chapters(self, context: CommerceNodeContext) -> CommerceNodeResult:
         outline = context.db.scalars(select(StoryOutlineVersion).where(StoryOutlineVersion.story_run_id == context.story_run.id, StoryOutlineVersion.status == OutlineVersionStatus.LOCKED)).first()

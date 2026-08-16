@@ -860,6 +860,190 @@ class CommerceWorkflowDefinitionResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Commerce Slice 2：StoryRun 导演、视觉、视频与成片工作台。
+# ---------------------------------------------------------------------------
+
+
+class CommerceProductionActionRequest(BaseModel):
+    """创建一个冻结的角色/场景/分镜/媒体任务。
+
+    ``target_id`` 仅用于当前锁定分镜中的单镜关键帧、Prompt 或视频任务；服务端
+    会再次校验归属。``retry`` 明确表示人工重做，因而追加新版本而不覆盖旧产物。
+    """
+
+    target_id: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    retry: bool = False
+
+
+class CommerceProductionReviewRequest(BaseModel):
+    reviewer_label: str = Field(default="制作人", min_length=1, max_length=120)
+    note: Optional[str] = Field(default=None, max_length=4000)
+
+
+class CommerceProductionVersionResponse(BaseModel):
+    id: str
+    story_run_id: str
+    version: int
+    status: str
+    content: dict[str, Any]
+    input_snapshot: dict[str, Any]
+    prompt_snapshot: dict[str, Any]
+    locked_at: Optional[datetime]
+    stale_at: Optional[datetime]
+    created_at: datetime
+
+
+class CommerceProductionImageResponse(BaseModel):
+    id: str
+    story_run_id: str
+    owner_version_id: str
+    logical_id: str
+    version: int
+    image_url: Optional[str]
+    status: str
+    prompt_snapshot: str
+    input_snapshot: dict[str, Any]
+    error_message: Optional[str]
+    locked_at: Optional[datetime]
+    stale_at: Optional[datetime]
+    created_at: datetime
+
+
+class CommerceVideoPromptResponse(BaseModel):
+    id: str
+    story_run_id: str
+    storyboard_version_id: str
+    shot_id: str
+    shot_number: int
+    keyframe_version_id: str
+    version: int
+    prompt: str
+    trace: dict[str, Any]
+    status: str
+    locked_at: Optional[datetime]
+    stale_at: Optional[datetime]
+    created_at: datetime
+
+
+class CommerceVideoClipResponse(BaseModel):
+    id: str
+    story_run_id: str
+    storyboard_version_id: str
+    shot_id: str
+    shot_number: int
+    keyframe_version_id: str
+    video_prompt_version_id: str
+    version: int
+    provider_task_id: Optional[str]
+    video_url: Optional[str]
+    status: str
+    error_message: Optional[str]
+    retry_count: int
+    duration_ms: Optional[int]
+    media_metadata: dict[str, Any]
+    reviewed_at: Optional[datetime]
+    review_note: Optional[str]
+    stale_at: Optional[datetime]
+    created_at: datetime
+    finished_at: Optional[datetime]
+
+
+class CommerceFinalVideoResponse(BaseModel):
+    id: str
+    story_run_id: str
+    storyboard_version_id: str
+    version: int
+    clip_ids: list[str]
+    output_url: Optional[str]
+    download_url: Optional[str]
+    status: str
+    error_message: Optional[str]
+    media_metadata: dict[str, Any]
+    stale_at: Optional[datetime]
+    created_at: datetime
+    finished_at: Optional[datetime]
+
+
+class CommerceProductionAssetsResponse(BaseModel):
+    story_run_id: str
+    character_designs: list[CommerceProductionVersionResponse]
+    scene_designs: list[CommerceProductionVersionResponse]
+    storyboards: list[CommerceProductionVersionResponse]
+    character_images: list[CommerceProductionImageResponse]
+    scene_images: list[CommerceProductionImageResponse]
+    keyframes: list[CommerceProductionImageResponse]
+    video_prompts: list[CommerceVideoPromptResponse]
+    clips: list[CommerceVideoClipResponse]
+    finals: list[CommerceFinalVideoResponse]
+
+
+# ---------------------------------------------------------------------------
+# Commerce Slice 1：V1 参考分析 -> 商品确认 -> 十创意 -> StoryRun。
+# ---------------------------------------------------------------------------
+
+
+class CommerceProductConfirmRequest(BaseModel):
+    reviewer_label: str = Field(default="制作人", min_length=1, max_length=120)
+    note: Optional[str] = Field(default=None, max_length=4000)
+    product_name: Optional[str] = Field(default=None, min_length=1, max_length=180)
+    appearance_description: Optional[str] = Field(default=None, max_length=20_000)
+    selling_points: Optional[list[dict[str, Any]]] = Field(default=None, max_length=100)
+    user_pain_points: Optional[list[dict[str, Any]]] = Field(default=None, max_length=100)
+    usage_scenarios: Optional[list[dict[str, Any]]] = Field(default=None, max_length=100)
+    package_ocr: Optional[dict[str, Any]] = None
+    reference_images: Optional[list[dict[str, Any]]] = Field(default=None, max_length=100)
+
+
+class CommerceReferenceIntakeResponse(BaseModel):
+    id: str
+    project_id: str
+    reference_analysis_id: str
+    script_asset_id: str
+    script_analysis_version_id: str
+    product_asset_id: str
+    product_analysis_version_id: str
+    product_asset_version_id: str
+    product_status: str
+    product_frozen_at: Optional[datetime]
+    input_snapshot: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+
+class CommerceCreativeIdeaResponse(BaseModel):
+    id: str
+    batch_id: str
+    project_id: str
+    candidate_number: int
+    content: dict[str, Any]
+    status: str
+    topic_candidate_id: Optional[str]
+    created_at: datetime
+
+
+class CommerceCreativeBatchResponse(BaseModel):
+    id: str
+    project_id: str
+    reference_intake_id: str
+    workflow_run_id: str
+    batch_number: int
+    status: str
+    input_snapshot: dict[str, Any]
+    model_snapshot: dict[str, Any]
+    prompt_snapshot: dict[str, Any]
+    error_message: Optional[str]
+    created_at: datetime
+    finished_at: Optional[datetime]
+    ideas: list[CommerceCreativeIdeaResponse]
+
+
+class CommerceCreativeIdeaSelectRequest(BaseModel):
+    reviewer_label: str = Field(default="制作人", min_length=1, max_length=120)
+    note: Optional[str] = Field(default=None, max_length=4000)
+    mode: str = Field(default="STEPWISE", pattern="^(STEPWISE|AUTO)$")
+
+
+# ---------------------------------------------------------------------------
 # Commerce Phase 3：知识库和图片/视频生成能力预埋。
 # ---------------------------------------------------------------------------
 

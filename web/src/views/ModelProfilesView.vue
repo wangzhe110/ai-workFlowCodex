@@ -16,7 +16,7 @@ const providerKey = ref('openai_compatible')
 const modelKey = ref('')
 const displayName = ref('云雾文本模型')
 const apiBaseUrl = ref('https://yunwu.ai/v1')
-const secretEnvName = ref('YUNWU_API_KEY')
+const secretEnvName = ref('YUNWU_REASONING_API_KEY')
 const timeoutSeconds = ref<number | null>(null)
 const imageSize = ref('1728x2304')
 const frameSampleCount = ref(6)
@@ -91,13 +91,14 @@ function providerLabel(key: string): string {
 }
 
 /**
- * 选择用途后恢复推荐模板。真实密钥不在这里出现；YUNWU_API_KEY 只是服务器里的变量名。
+ * 选择用途后恢复推荐模板。真实密钥不在这里出现；推理和图片使用两个不同的
+ * 服务器变量名，避免把两条供应商额度通道误配成同一把 Key。
  * 切换步骤时清空模型名，防止把文本模型误用于图片或视频步骤。
  */
 function applyStepTemplate(nextStep: string) {
   modelKey.value = ''
   timeoutSeconds.value = null
-  secretEnvName.value = 'YUNWU_API_KEY'
+  secretEnvName.value = 'YUNWU_REASONING_API_KEY'
   apiBaseUrl.value = 'https://yunwu.ai/v1'
 
   if (nextStep === 'transcribe_reference_audio') {
@@ -113,6 +114,7 @@ function applyStepTemplate(nextStep: string) {
   if (nextStep === 'generate_storyboard_images') {
     providerKey.value = 'openai_compatible_image'
     displayName.value = '云雾图片模型'
+    secretEnvName.value = 'YUNWU_IMAGE_API_KEY'
     return
   }
   if (nextStep === 'generate_storyboard_video_groups') {
@@ -295,7 +297,7 @@ async function submit() {
           <template v-if="!isFinalVideoStep && !isVideoStep">
             <label class="field">中转站类型<input v-model="providerKey" maxlength="80" /></label>
             <label class="field">API 地址<input v-model="apiBaseUrl" type="url" placeholder="https://…" /></label>
-            <label class="field">服务器密钥变量名<input v-model="secretEnvName" placeholder="例如 YUNWU_API_KEY" /></label>
+            <label class="field">服务器密钥变量名<input v-model="secretEnvName" placeholder="推理填 YUNWU_REASONING_API_KEY；图片填 YUNWU_IMAGE_API_KEY" /></label>
             <label class="field">最长等待时间（秒，可不填）<input v-model.number="timeoutSeconds" type="number" min="1" max="1800" /></label>
           </template>
           <label v-if="isImageStep" class="field">自定义图片尺寸<input v-model="imageSize" placeholder="例如 1728x2304" /></label>

@@ -18,6 +18,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import ModelEvaluation, ModelProfile
+from app.services.provider_config_security import normalize_provider_config, redact_provider_config
 
 
 DEFAULT_PROFILES: dict[str, dict[str, Any]] = {
@@ -63,7 +64,6 @@ DEFAULT_PROFILES: dict[str, dict[str, Any]] = {
     },
 }
 
-_FORBIDDEN_CONFIG_KEY_PARTS = ("api_key", "apikey", "token", "secret", "password", "authorization")
 _ENV_NAME_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _FIELD_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
 _JSON_PATH_PATTERN = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*$")
@@ -80,26 +80,17 @@ OPENAI_COMPATIBLE_TRANSCRIPTION_STEPS = {"transcribe_reference_audio"}
 FFMPEG_CONCAT_STEPS = {"assemble_final_video"}
 
 
-def _normalize_provider_config(provider_config: dict[str, Any]) -> dict[str, Any]:
+def _normalize_provider_config(provider_key: str, provider_config: dict[str, Any]) -> dict[str, Any]:
     """校验非敏感 JSON 配置，防止 API Key 被误写进数据库。"""
 
-    normalized = deepcopy(provider_config)
-    for key, value in normalized.items():
-        lowered = key.lower()
-        if key != "secret_env_name" and any(part in lowered for part in _FORBIDDEN_CONFIG_KEY_PARTS):
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail="配置不能包含密钥、Token 或密码；请改填 secret_env_name 环境变量名称",
-            )
-        if isinstance(value, dict):
-            _normalize_provider_config(value)
+    normalized = normalize_provider_config(adapter_key=provider_key.strip(), provider_config=provider_config)
     secret_env_name = normalized.get("secret_env_name")
     if secret_env_name and (
         not isinstance(secret_env_name, str) or not _ENV_NAME_PATTERN.fullmatch(secret_env_name)
     ):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="secret_env_name 必须是大写环境变量名称，例如 YUNWU_API_KEY",
+            detail="secret_env_name 必须是大写环境变量名称，例如 YUNWU_REASONING_API_KEY",
         )
     return normalized
 
@@ -398,7 +389,7 @@ def get_active_profile_snapshot(db: Session, step_key: str) -> dict[str, Any]:
         "provider_key": profile.provider_key,
         "model_key": profile.model_key,
         "version": profile.version,
-        "provider_config": deepcopy(profile.provider_config),
+        "provider_config": redact_provider_config(profile.provider_config),
     }
 
 
@@ -415,7 +406,7 @@ def create_model_profile(
 
     if step_key not in DEFAULT_PROFILES:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="未知的工作流步骤")
-    normalized_config = _normalize_provider_config(provider_config)
+    normalized_config = _normalize_provider_config(provider_key, provider_config)
     if activate and not is_adapter_available(step_key, provider_key, model_key):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

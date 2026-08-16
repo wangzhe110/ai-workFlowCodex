@@ -13,10 +13,11 @@ import {
   deleteV1ModelProfile,
   getModelSlots,
   getV1ModelProfiles,
+  preflightV1ModelProfile,
   setV1ModelProfileEnabled,
   updateV1ModelProfile,
 } from '@/api/production'
-import type { ModelSlot, V1ModelProfile } from '@/types/domain'
+import type { ModelProfilePreflight, ModelSlot, V1ModelProfile } from '@/types/domain'
 
 const slots = ref<ModelSlot[]>([])
 const profiles = ref<V1ModelProfile[]>([])
@@ -29,8 +30,10 @@ const modelKey = ref('')
 const displayName = ref('')
 const modelVersion = ref('')
 const apiBaseUrl = ref('https://yunwu.ai/v1')
-const secretEnvName = ref('YUNWU_API_KEY')
-const imageSize = ref('1728x2304')
+// 推理/视觉理解和图片生成是两条独立的供应商额度通道。这里只保存变量名，
+// 绝不保存或展示变量的实际值。
+const secretEnvName = ref('YUNWU_REASONING_API_KEY')
+const imageSize = ref('2K')
 const referenceImageField = ref('images')
 const videoRatio = ref('9:16')
 const videoDuration = ref(5)
@@ -39,6 +42,8 @@ const enableAfterSave = ref(false)
 const editingProfileId = ref<string | null>(null)
 const editingAdapterKey = ref('')
 const editingProviderConfig = ref<Record<string, unknown>>({})
+const preflightingProfileId = ref<string | null>(null)
+const preflights = ref<Record<string, ModelProfilePreflight>>({})
 
 const slotLabels: Record<string, string> = {
   VIDEO_ANALYSIS: '分析参考视频',
@@ -64,11 +69,15 @@ const isFinalCompose = computed(() => slotKey.value === 'FINAL_COMPOSE')
 const defaultAdapterKey = computed(() => {
   if (isVision.value) return 'openai_compatible_vision'
   if (isText.value) return 'openai_compatible'
-  if (isImage.value) return 'openai_compatible_image'
+  // 新建图片候选默认走方舟官方 Seedream；编辑历史 Fal/OpenAI 兼容版本仍保持
+  // 原 Adapter，绝不无提示覆盖历史模型配置或将其改成新通道。
+  if (isImage.value) return 'volcengine_ark_image'
   if (isVideo.value) return 'volcengine_ark_video'
   return 'ffmpeg_concat'
 })
 const adapterKey = computed(() => editingAdapterKey.value || defaultAdapterKey.value)
+const isFalImage = computed(() => isImage.value && adapterKey.value === 'fal_queue_image')
+const isArkImage = computed(() => isImage.value && adapterKey.value === 'volcengine_ark_image')
 const slotProfiles = computed(() => profiles.value.filter((item) => item.slot_key === slotKey.value))
 const editingVersionLabel = computed(() => {
   const profile = profiles.value.find((item) => item.id === editingProfileId.value)
@@ -99,7 +108,7 @@ function applySlotTemplate(next: string) {
   estimatedCost.value = null
   enableAfterSave.value = false
   apiBaseUrl.value = 'https://yunwu.ai/v1'
-  secretEnvName.value = 'YUNWU_API_KEY'
+  secretEnvName.value = 'YUNWU_REASONING_API_KEY'
   if (next === 'VIDEO_ANALYSIS') {
     displayName.value = '参考视频分析模型'
     modelKey.value = ''
@@ -107,8 +116,10 @@ function applySlotTemplate(next: string) {
     displayName.value = next === 'STORY_GENERATE' ? '原创故事导演模型' : 'AI 导演文本模型'
     modelKey.value = ''
   } else if (['CHARACTER_IMAGE_GENERATE', 'SCENE_IMAGE_GENERATE', 'SHOT_KEYFRAME_GENERATE'].includes(next)) {
-    displayName.value = next === 'SHOT_KEYFRAME_GENERATE' ? '参考生图关键帧模型' : '图片资产模型'
-    modelKey.value = ''
+    displayName.value = next === 'SHOT_KEYFRAME_GENERATE' ? '方舟 Seedream 分镜关键帧模型' : '方舟 Seedream 图片资产模型'
+    modelKey.value = 'doubao-seedream-5-0-260128'
+    secretEnvName.value = 'ARK_API_KEY'
+    apiBaseUrl.value = 'https://ark.cn-beijing.volces.com/api/v3'
   } else if (next === 'VIDEO_GENERATE') {
     displayName.value = '豆包 Seedance 视频模型'
     modelKey.value = 'doubao-seedance-2-0-mini-260615'
@@ -147,8 +158,15 @@ function currentProviderConfig(): Record<string, unknown> {
     config.result_contract = 'V1_REFERENCE_ANALYSIS'
     config.frame_sample_count = 6
   }
-  if (isImage.value) config.image_size = imageSize.value.trim()
-  if (isKeyframe.value) config.reference_image_field = referenceImageField.value.trim()
+  if (isArkImage.value) {
+    config.size = '2K'
+    config.sequential_image_generation = 'disabled'
+    config.response_format = 'url'
+    config.watermark = false
+  } else if (isImage.value && !isFalImage.value) {
+    config.image_size = imageSize.value.trim()
+    if (isKeyframe.value) config.reference_image_field = referenceImageField.value.trim()
+  }
   return withEstimatedCost(config)
 }
 
@@ -221,7 +239,7 @@ function beginEdit(profile: V1ModelProfile) {
   modelVersion.value = profile.model_version || ''
   apiBaseUrl.value = String(profile.provider_config.api_base_url || '')
   secretEnvName.value = String(profile.provider_config.secret_env_name || '')
-  imageSize.value = String(profile.provider_config.image_size || '')
+  imageSize.value = String(profile.provider_config.size || profile.provider_config.image_size || '')
   referenceImageField.value = String(profile.provider_config.reference_image_field || '')
   videoRatio.value = String(profile.provider_config.ratio || '9:16')
   videoDuration.value = Number(profile.provider_config.duration || 5)
@@ -244,6 +262,24 @@ async function copyProfile(profile: V1ModelProfile) {
     error.value = cause instanceof Error ? cause.message : '复制新版本失败，请重试。'
   } finally {
     saving.value = false
+  }
+}
+
+/**
+ * 真实运行前的无扣费预检。它只校验 Adapter、非敏感配置、服务器密钥是否注入，
+ * 并对 OpenAI 兼容中转站读取 /models；不会生成图片、视频或创建供应商任务。
+ */
+async function preflightProfile(profile: V1ModelProfile) {
+  preflightingProfileId.value = profile.id
+  error.value = ''
+  try {
+    const result = await preflightV1ModelProfile(profile.id)
+    preflights.value = { ...preflights.value, [profile.id]: result }
+    if (result.ready) ElMessage.success('基础预检通过；视频模型仍需使用公网首帧完成一次明确的小样本权限验收')
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : '基础预检失败，请检查后端服务。'
+  } finally {
+    preflightingProfileId.value = null
   }
 }
 
@@ -374,12 +410,14 @@ applySlotTemplate(slotKey.value)
 
             <template v-else>
               <el-form-item label="模型名称"><el-input v-model="modelKey" placeholder="从中转站后台直接复制" maxlength="160" /></el-form-item>
-              <el-form-item label="中转站 API 地址"><el-input v-model="apiBaseUrl" placeholder="https://…/v1" /></el-form-item>
-              <el-form-item label="服务器密钥变量名"><el-input v-model="secretEnvName" placeholder="例如 YUNWU_API_KEY" /></el-form-item>
-              <div class="form-help">只填变量名，绝不在网页粘贴 API Key。</div>
+              <el-form-item label="中转站 API 地址"><el-input v-model="apiBaseUrl" :placeholder="isArkImage ? 'https://ark.cn-beijing.volces.com/api/v3' : (isFalImage ? 'https://yunwu.ai' : 'https://…/v1')" /></el-form-item>
+              <el-form-item label="服务器密钥变量名"><el-input v-model="secretEnvName" :placeholder="isArkImage ? '图片填 ARK_API_KEY' : '推理填 YUNWU_REASONING_API_KEY；旧图片填 YUNWU_IMAGE_API_KEY'" /></el-form-item>
+              <div class="form-help">只填变量名，绝不在网页粘贴 API Key。Seedream 图片与 Seedance 视频可共用 ARK_API_KEY，但不会互相调用。</div>
+              <el-alert v-if="isFalImage" title="图片使用云雾 Nano Banana 队列：系统会先保存供应商任务号，再轮询并下载一张校验后的图片。无需填写图片尺寸、参考图字段或请求路径。" type="info" :closable="false" show-icon class="compact-alert" />
+              <el-alert v-if="isArkImage" title="图片使用方舟官方 Seedream 5.0 Pro：只生成一张纯文本图片，系统立即下载并保存到本机资产目录；本轮不支持参考图、多图或流式生成。" type="info" :closable="false" show-icon class="compact-alert" />
             </template>
 
-            <template v-if="isImage">
+            <template v-if="isImage && !isFalImage && !isArkImage">
               <el-form-item label="图片尺寸"><el-input v-model="imageSize" placeholder="例如 1728x2304" /></el-form-item>
               <el-form-item v-if="isKeyframe" label="中转站文档中的参考图字段名"><el-input v-model="referenceImageField" placeholder="通常为 images，以文档为准" /></el-form-item>
             </template>
@@ -439,11 +477,20 @@ applySlotTemplate(slotKey.value)
                 <el-tooltip v-if="!profile.can_delete" :content="profile.delete_block_reason || '当前不可删除'" placement="top">
                   <div class="blocked-reason">{{ profile.delete_block_reason }}</div>
                 </el-tooltip>
+                <div v-if="preflights[profile.id]" class="preflight-result">
+                  <el-tag :type="preflights[profile.id].ready ? 'success' : 'danger'" size="small" effect="plain">
+                    {{ preflights[profile.id].ready ? '基础预检通过' : '基础预检未通过' }}
+                  </el-tag>
+                  <div v-for="check in preflights[profile.id].checks" :key="`${profile.id}-${check.key}`" class="table-subline">
+                    {{ check.key }}：{{ check.message }}
+                  </div>
+                </div>
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="210" fixed="right">
+            <el-table-column label="操作" width="270" fixed="right">
               <template #default="{ row: profile }">
                 <div class="row-actions">
+                  <el-button link type="primary" :loading="preflightingProfileId === profile.id" :disabled="saving" @click="preflightProfile(profile)">基础预检</el-button>
                   <el-button v-if="profile.can_edit" link type="primary" :disabled="saving" @click="beginEdit(profile)">编辑</el-button>
                   <el-button link type="primary" :disabled="saving" @click="copyProfile(profile)">复制</el-button>
                   <el-button link :type="profile.is_enabled_in_slot ? 'warning' : 'success'" :disabled="saving" @click="toggleProfile(profile)">{{ profile.is_enabled_in_slot ? '停用' : '启用' }}</el-button>
@@ -485,6 +532,7 @@ applySlotTemplate(slotKey.value)
 .profile-title, .model-key { margin-bottom: 7px; color: #303133; font-weight: 600; overflow-wrap: anywhere; }
 .table-subline { color: #909399; font-size: 12px; line-height: 1.65; overflow-wrap: anywhere; }
 .blocked-reason { margin-top: 6px; color: #f56c6c; font-size: 12px; line-height: 1.45; }
+.preflight-result { display: grid; gap: 4px; margin-top: 8px; }
 .row-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 0 4px; }
 .bottom-tip { margin-top: 18px; }
 @media (max-width: 1199px) { .versions-column { margin-top: 20px; } }

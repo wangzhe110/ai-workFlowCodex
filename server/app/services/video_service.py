@@ -34,6 +34,7 @@ from app.services.analysis_provider import (
 )
 from app.services.image_service import selected_board
 from app.services.model_profile_service import get_active_profile_snapshot
+from app.services.sensitive_data import sanitize_error_summary
 from app.services.workflow_service import get_project_or_404, get_workflow_run_or_404
 
 
@@ -250,7 +251,7 @@ def _apply_provider_result(clip: VideoClip, result: VideoTaskResult) -> None:
         clip.error_message = None
     elif result.status == "FAILED":
         clip.status = VideoClipStatus.FAILED
-        clip.error_message = (result.error_message or "视频供应商任务失败")[:2000]
+        clip.error_message = sanitize_error_summary(result.error_message or "视频供应商任务失败", max_length=2000)
     elif result.status != "PENDING":
         raise RuntimeError(f"视频适配器返回未知标准状态：{result.status}")
 
@@ -355,7 +356,7 @@ def execute_video_generation(run_id: str) -> None:
                 _apply_provider_result(clip, result)
             except Exception as exc:
                 clip.status = VideoClipStatus.FAILED
-                clip.error_message = str(exc)[:2000]
+                clip.error_message = sanitize_error_summary(exc, max_length=2000)
             _update_progress(step, existing_clips)
             db.commit()
 
@@ -377,7 +378,7 @@ def execute_video_generation(run_id: str) -> None:
                     _apply_provider_result(clip, provider.poll(clip.provider_task_id))
                 except Exception as exc:
                     clip.status = VideoClipStatus.FAILED
-                    clip.error_message = str(exc)[:2000]
+                    clip.error_message = sanitize_error_summary(exc, max_length=2000)
             _update_progress(step, existing_clips)
             db.commit()
             if any(clip.status == VideoClipStatus.PENDING for clip in existing_clips):
@@ -401,6 +402,7 @@ def execute_video_generation(run_id: str) -> None:
         db.commit()
     except Exception as exc:
         db.rollback()
+        error_message = sanitize_error_summary(exc, max_length=2000)
         run = db.get(WorkflowRun, run_id)
         if run is not None:
             step = db.scalars(
@@ -412,7 +414,7 @@ def execute_video_generation(run_id: str) -> None:
             run.finished_at = utcnow()
             if step is not None:
                 step.status = RunStatus.FAILED
-                step.error_message = str(exc)[:2000]
+                step.error_message = error_message
                 step.finished_at = utcnow()
             db.commit()
     finally:

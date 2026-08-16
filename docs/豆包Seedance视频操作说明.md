@@ -7,7 +7,7 @@
 在部署环境或不提交的 `infra/backend.env` 中配置：
 
 ```dotenv
-ARK_API_KEY=你的火山方舟密钥
+ARK_API_KEY=
 ```
 
 重启 API 和 Worker 后，打开“模型中心”，为“视频片段”新建候选：

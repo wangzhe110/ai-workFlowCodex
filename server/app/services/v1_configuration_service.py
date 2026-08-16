@@ -6,8 +6,13 @@
 
 from copy import deepcopy
 from datetime import datetime, timezone
+import json
+import os
 import re
+import subprocess
 from typing import Any, Optional
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, select
@@ -30,6 +35,7 @@ from app.models import (
     WorkflowDefinitionStatus,
     WorkflowRun,
 )
+from app.services.provider_config_security import normalize_provider_config, redact_provider_config
 
 
 V1_WORKFLOW_CODE = "LEMONFLOW_PRODUCTION"
@@ -85,9 +91,9 @@ V1_SLOT_ADAPTERS: dict[str, set[str]] = {
     "CHARACTER_DESIGN": {"mock_v1", "openai_compatible"},
     "SCENE_DESIGN": {"mock_v1", "openai_compatible"},
     "DIRECTOR_PLAN": {"mock_v1", "openai_compatible"},
-    "CHARACTER_IMAGE_GENERATE": {"mock_v1", "openai_compatible_image"},
-    "SCENE_IMAGE_GENERATE": {"mock_v1", "openai_compatible_image"},
-    "SHOT_KEYFRAME_GENERATE": {"mock_v1", "openai_compatible_image"},
+    "CHARACTER_IMAGE_GENERATE": {"mock_v1", "openai_compatible_image", "fal_queue_image", "volcengine_ark_image"},
+    "SCENE_IMAGE_GENERATE": {"mock_v1", "openai_compatible_image", "fal_queue_image", "volcengine_ark_image"},
+    "SHOT_KEYFRAME_GENERATE": {"mock_v1", "openai_compatible_image", "fal_queue_image", "volcengine_ark_image"},
     "VIDEO_GENERATE": {"mock_v1", "volcengine_ark_video", "configurable_async_video"},
     "FINAL_COMPOSE": {"mock_v1", "ffmpeg_concat"},
 }
@@ -95,7 +101,6 @@ V1_SLOT_ADAPTERS: dict[str, set[str]] = {
 _ENV_NAME_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _SAFE_FIELD_NAME = re.compile(r"^[A-Za-z0-9_]+$")
 _CURRENCY_PATTERN = re.compile(r"^[A-Z]{3,12}$")
-_FORBIDDEN_CONFIG_KEY_PARTS = ("api_key", "apikey", "token", "secret", "password", "authorization")
 
 
 def utcnow() -> datetime:
@@ -303,30 +308,17 @@ def set_slot_strategy(db: Session, slot_key: str, selection_mode: ModelSelection
     return slot
 
 
-def _normalize_v1_provider_config(value: dict[str, Any]) -> dict[str, Any]:
-    """拒绝把密钥值写入数据库，只允许通过 ``secret_env_name`` 间接引用。"""
+def _normalize_v1_provider_config(adapter: str, value: dict[str, Any]) -> dict[str, Any]:
+    """只允许已接入 Adapter 的安全配置字段进入数据库。"""
 
-    if not isinstance(value, dict):
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="模型配置必须是 JSON 对象")
-    normalized = deepcopy(value)
-    for key, item in normalized.items():
-        if not isinstance(key, str):
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="模型配置的字段名必须是文本")
-        lowered = key.lower()
-        if key != "secret_env_name" and any(part in lowered for part in _FORBIDDEN_CONFIG_KEY_PARTS):
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail="配置中不能填 API Key、Token 或密码；请填写服务器密钥变量名",
-            )
-        if isinstance(item, dict):
-            _normalize_v1_provider_config(item)
+    normalized = normalize_provider_config(adapter_key=adapter, provider_config=value)
     secret_env_name = normalized.get("secret_env_name")
     if secret_env_name is not None and (
         not isinstance(secret_env_name, str) or not _ENV_NAME_PATTERN.fullmatch(secret_env_name)
     ):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="服务器密钥变量名必须是大写英文，例如 YUNWU_API_KEY",
+            detail="服务器密钥变量名必须是大写英文，例如 YUNWU_REASONING_API_KEY",
         )
     estimated_cost = normalized.get("estimated_cost_per_call")
     if estimated_cost is not None:
@@ -383,10 +375,48 @@ def _validate_v1_profile_config(slot_key: str, adapter: str, config: dict[str, A
             ):
                 raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="参考图字段名只能包含字母、数字和下划线")
         return
+    if adapter == "fal_queue_image":
+        _require_openai_compatible_base(config, "云雾 Nano Banana 图片模型")
+        api_base_url = str(config.get("api_base_url", "")).rstrip("/")
+        if api_base_url != "https://yunwu.ai":
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="云雾 Nano Banana 图片模型 API 地址必须为 https://yunwu.ai",
+            )
+        for field_name, default, minimum, maximum in (
+            ("poll_interval_seconds", 3, 1, 60),
+            ("max_poll_seconds", 600, 10, 1800),
+        ):
+            value = config.get(field_name, default)
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or not minimum <= float(value) <= maximum:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail=f"{field_name} 必须在 {minimum} 至 {maximum} 秒之间",
+                )
+        return
+    if adapter == "volcengine_ark_image":
+        _require_openai_compatible_base(config, "方舟 Seedream 图片模型")
+        if str(config.get("api_base_url", "")).rstrip("/") != "https://ark.cn-beijing.volces.com/api/v3":
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="方舟 Seedream 图片模型 API 地址必须为 https://ark.cn-beijing.volces.com/api/v3",
+            )
+        if config.get("secret_env_name") != "ARK_API_KEY":
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="方舟 Seedream 图片模型必须使用 ARK_API_KEY")
+        if config.get("size", "2K") != "2K":
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="方舟 Seedream V1 图片尺寸必须为 2K")
+        if config.get("sequential_image_generation", "disabled") != "disabled":
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="方舟 Seedream V1 必须关闭 sequential_image_generation")
+        if config.get("response_format", "url") != "url":
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="方舟 Seedream V1 必须使用 response_format=url")
+        if config.get("watermark", False) is not False:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="方舟 Seedream V1 必须设置 watermark=false")
+        return
     if adapter == "volcengine_ark_video":
-        secret_env_name = config.get("secret_env_name", "ARK_API_KEY")
-        if not isinstance(secret_env_name, str) or not _ENV_NAME_PATTERN.fullmatch(secret_env_name):
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="豆包视频需要 ARK_API_KEY 服务器变量名")
+        if str(config.get("api_base_url", "")).rstrip("/") != "https://ark.cn-beijing.volces.com/api/v3":
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="豆包视频 API 地址必须为 https://ark.cn-beijing.volces.com/api/v3")
+        if config.get("secret_env_name") != "ARK_API_KEY":
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="豆包视频必须使用 ARK_API_KEY")
         ratio = config.get("ratio", "9:16")
         if ratio not in {"16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "adaptive"}:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="豆包视频画幅不受支持")
@@ -404,6 +434,16 @@ def _validate_v1_profile_config(slot_key: str, adapter: str, config: dict[str, A
     if adapter == "ffmpeg_concat":
         return
     raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="不支持的 V1 Adapter")
+
+
+def _validate_v1_model_key(adapter: str, model_key: str) -> None:
+    """约束当前只接入的一版官方图片模型，避免配置成看似可用的未知型号。"""
+
+    if adapter == "volcengine_ark_image" and model_key != "doubao-seedream-5-0-260128":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="方舟 Seedream V1 图片模型必须为 doubao-seedream-5-0-260128",
+        )
 
 
 def create_v1_model_profile(
@@ -438,8 +478,9 @@ def create_v1_model_profile(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="模型名称和显示名称不能为空")
     if priority < 0 or priority > 10_000:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="优先级必须在 0 至 10000 之间")
-    config = _normalize_v1_provider_config(provider_config)
+    config = _normalize_v1_provider_config(clean_adapter, provider_config)
     _validate_v1_profile_config(clean_slot, clean_adapter, config)
+    _validate_v1_model_key(clean_adapter, clean_model_key)
     version = db.scalar(select(func.max(ModelProfile.version)).where(ModelProfile.step_key == clean_slot)) or 0
     profile = ModelProfile(
         step_key=clean_slot,
@@ -595,8 +636,9 @@ def update_v1_model_profile(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="该模型协议不能用于当前 V1 功能")
     if not clean_model_key or not clean_display_name:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="模型名称和显示名称不能为空")
-    config = _normalize_v1_provider_config(provider_config)
+    config = _normalize_v1_provider_config(clean_adapter, provider_config)
     _validate_v1_profile_config(profile.step_key, clean_adapter, config)
+    _validate_v1_model_key(clean_adapter, clean_model_key)
     profile.provider_key = clean_adapter
     profile.adapter_key = clean_adapter
     profile.model_key = clean_model_key
@@ -624,7 +666,7 @@ def copy_v1_model_profile(db: Session, profile_id: str) -> ModelProfile:
         display_name=f"{source.display_name or source.model_key}（复制草稿）"[:160],
         version=version + 1,
         profile_status="DRAFT",
-        provider_config=deepcopy(source.provider_config),
+        provider_config=redact_provider_config(source.provider_config),
         is_active=False,
     )
     db.add(copied)
@@ -780,6 +822,198 @@ def enabled_profiles_for_slot(db: Session, slot_key: str) -> list[ModelSlotProfi
     if slot.selection_mode == ModelSelectionMode.SINGLE and len(bindings) > 1:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="单模型槽位存在多个启用配置，请在模型中心人工处理")
     return bindings
+
+
+def preflight_v1_model_profile(db: Session, profile_id: str) -> list[dict[str, str]]:
+    """对一版 V1 模型执行无内容、无扣费的部署预检。
+
+    旧流程的 ``model_profile_service`` 使用另一套步骤名称，不能拿来判断 V1
+    槽位是否已接入。这里按照 V1 的 ``slot_key + adapter_key`` 组合校验，避免
+    已配置的真实 Gemini / 图片候选被误报为“未接入”。OpenAI 兼容模型只读取
+    ``/models``；视频模型不提交任务，真实权限会留给拥有稳定公网首帧后的显式
+    小样本验收。
+    """
+
+    profile = db.get(ModelProfile, profile_id)
+    if profile is None or profile.step_key not in V1_SLOT_ADAPTERS:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="V1 模型配置不存在")
+
+    adapter = (profile.adapter_key or profile.provider_key or "").strip()
+    checks: list[dict[str, str]] = []
+    adapter_available = adapter in V1_SLOT_ADAPTERS[profile.step_key]
+    checks.append(
+        {
+            "key": "adapter",
+            "status": "passed" if adapter_available else "failed",
+            "message": "当前代码包已接入该 V1 槽位的适配器"
+            if adapter_available
+            else "当前 V1 槽位尚未接入此适配器",
+        }
+    )
+    if not adapter_available:
+        return checks
+
+    try:
+        _validate_v1_profile_config(profile.step_key, adapter, profile.provider_config or {})
+    except HTTPException as exc:
+        checks.append({"key": "config", "status": "failed", "message": str(exc.detail)})
+        return checks
+    checks.append({"key": "config", "status": "passed", "message": "必要参数与安全约束校验通过"})
+
+    if adapter == "mock_v1":
+        checks.append({"key": "runtime", "status": "warning", "message": "这是本地模拟配置，不能用于真实样片"})
+        return checks
+    if adapter == "ffmpeg_concat":
+        checks.extend(_preflight_v1_ffmpeg())
+        return checks
+
+    secret_check = _preflight_v1_secret(profile.provider_config or {})
+    checks.append(secret_check)
+    if secret_check["status"] != "passed":
+        return checks
+
+    if adapter == "volcengine_ark_video":
+        checks.append(
+            {
+                "key": "provider_permission",
+                "status": "warning",
+                "message": "火山方舟密钥已注入；真实模型权限必须在已验证的公网 HTTPS 首帧图片就绪后，通过一次明确的视频小样本任务确认。",
+            }
+        )
+        return checks
+    if adapter == "configurable_async_video":
+        checks.append(
+            {
+                "key": "provider_permission",
+                "status": "warning",
+                "message": "通用异步视频协议没有统一的无扣费权限探针；请在公网 HTTPS 首帧图片就绪后提交一个明确的视频小样本。",
+            }
+        )
+        return checks
+
+    if adapter == "fal_queue_image":
+        checks.append(
+            {
+                "key": "provider_permission",
+                "status": "warning",
+                "message": "Fal 队列图片没有无扣费权限探针；密钥已注入后请通过一次明确的单图小样本确认提交、轮询和下载。",
+            }
+        )
+        return checks
+
+    if adapter == "volcengine_ark_image":
+        checks.append(
+            {
+                "key": "provider_permission",
+                "status": "warning",
+                "message": "方舟 Seedream 图片没有无扣费权限探针；密钥已注入后请通过一次明确的单图小样本确认生成与本地转存。",
+            }
+        )
+        return checks
+
+    checks.append(
+        _preflight_v1_openai_catalog(
+            api_base_url=str((profile.provider_config or {}).get("api_base_url", "")),
+            api_key=os.environ[str((profile.provider_config or {})["secret_env_name"])],
+            model_key=profile.model_key,
+            timeout_seconds=_preflight_v1_timeout_seconds(profile.provider_config or {}),
+        )
+    )
+    return checks
+
+
+def _preflight_v1_secret(provider_config: dict[str, Any]) -> dict[str, str]:
+    """只检查密钥变量是否已注入，不读取或回显实际密钥。"""
+
+    secret_env_name = provider_config.get("secret_env_name")
+    if not isinstance(secret_env_name, str) or not _ENV_NAME_PATTERN.fullmatch(secret_env_name):
+        return {"key": "secret", "status": "failed", "message": "缺少有效的服务器密钥变量名"}
+    if not os.getenv(secret_env_name):
+        return {
+            "key": "secret",
+            "status": "failed",
+            "message": f"服务器尚未注入环境变量 {secret_env_name}；请配置后重启 API 和 Worker。",
+        }
+    return {"key": "secret", "status": "passed", "message": f"服务器已注入 {secret_env_name}"}
+
+
+def _preflight_v1_ffmpeg() -> list[dict[str, str]]:
+    """同时核对合成和验收所需的 ffmpeg / ffprobe 二进制。"""
+
+    checks: list[dict[str, str]] = []
+    for binary in ("ffmpeg", "ffprobe"):
+        try:
+            result = subprocess.run(
+                [binary, "-version"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            checks.append({"key": binary, "status": "failed", "message": f"当前服务环境找不到可用 {binary}"})
+            continue
+        checks.append(
+            {
+                "key": binary,
+                "status": "passed" if result.returncode == 0 else "failed",
+                "message": f"{binary} 已安装，可用于真实媒体处理"
+                if result.returncode == 0
+                else f"{binary} 命令无法正常执行",
+            }
+        )
+    return checks
+
+
+def _preflight_v1_openai_catalog(
+    *,
+    api_base_url: str,
+    api_key: str,
+    model_key: str,
+    timeout_seconds: float,
+) -> dict[str, str]:
+    """读取 OpenAI 兼容 ``/models``，不提交模型生成请求。"""
+
+    request = Request(
+        f"{api_base_url.rstrip('/')}/models",
+        headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+    )
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            raw_body = response.read(2 * 1024 * 1024)
+    except HTTPError as exc:
+        if exc.code in (404, 405, 501):
+            return {
+                "key": "network",
+                "status": "warning",
+                "message": "中转站未提供 /models 目录接口；静态配置已通过，请用一条明确的小样本验收真实生成。",
+            }
+        if exc.code in (401, 403):
+            return {"key": "network", "status": "failed", "message": "中转站拒绝密钥，请检查密钥、账户权限或 API 地址"}
+        return {"key": "network", "status": "failed", "message": f"中转站目录接口返回 HTTP {exc.code}"}
+    except (URLError, TimeoutError, OSError):
+        return {"key": "network", "status": "failed", "message": "当前 API 服务无法连接中转站，请检查地址、网络和出口策略"}
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+        data = payload.get("data") if isinstance(payload, dict) else None
+        available_models = {
+            item.get("id") for item in data if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+        return {"key": "network", "status": "warning", "message": "中转站可连接，但 /models 响应格式无法识别；请用小样本验证。"}
+    if available_models and model_key not in available_models:
+        return {"key": "network", "status": "failed", "message": "中转站可连接，但当前账户的 /models 列表中没有该模型标识"}
+    return {"key": "network", "status": "passed", "message": "中转站可连接，当前账户可查询到该模型"}
+
+
+def _preflight_v1_timeout_seconds(provider_config: dict[str, Any]) -> float:
+    """预检使用短超时，不继承生成任务的长超时。"""
+
+    configured = provider_config.get("timeout_seconds", 10)
+    if not isinstance(configured, (int, float)):
+        return 10
+    return min(max(float(configured), 1), 15)
 
 
 def _validate_variables_schema(value: dict[str, Any]) -> None:

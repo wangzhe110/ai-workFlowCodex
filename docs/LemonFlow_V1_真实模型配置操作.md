@@ -19,14 +19,14 @@ cp infra/backend.env.example infra/backend.env
 打开 `infra/backend.env`，只由负责人填写真实 Key。例如：
 
 ```dotenv
-# 任一 OpenAI 兼容渠道的 Key；变量名可自行命名，但模型中心的 secret_env_name 必须完全一致。
-TEXT_OR_VISION_PROVIDER_KEY=这里填写真实的中转站密钥
+# 云雾推理/视觉理解：视频分析、故事、角色、场景、导演与视频 Prompt。
+YUNWU_REASONING_API_KEY=
 
-# 火山方舟的视频 Key。
-ARK_API_KEY=这里填写真实的火山方舟密钥
+# 火山方舟：官方 Seedream 图片与豆包 Seedance 视频片段可共用同一 Key。
+ARK_API_KEY=
 ```
 
-保存后重启 API 服务和 Worker。Key 不要发到群里、飞书文档、截图或网页表单中。
+同一通道的多个模型 Profile 可以填写同一个 `secret_env_name`，但每个 Profile 的模型名、Base URL 和参数仍单独配置。保存后重启 API 服务和 Worker。Key 不要发到群里、飞书文档、截图或网页表单中。
 
 ## 二、打开 V1 模型中心
 
@@ -42,7 +42,7 @@ ARK_API_KEY=这里填写真实的火山方舟密钥
 - 中转站类型：系统自动选择“视觉分析模型”
 - 模型名称：从中转站复制 Gemini 3.1 Pro Preview 的实际模型名
 - API 地址：中转站文档给出的 `https://.../v1`
-- 服务器变量名：例如 `TEXT_OR_VISION_PROVIDER_KEY`
+- 服务器变量名：`YUNWU_REASONING_API_KEY`
 
 保存为候选即可。这个模型必须支持“图片 + 文字”的 Chat Completions 接口；系统会在 Worker 中从上传视频抽取少量画面，要求它输出：脚本结构、爆款开头、爆款元素、场景分析和创作简报。
 
@@ -56,11 +56,14 @@ ARK_API_KEY=这里填写真实的火山方舟密钥
 
 它们都使用“文本模型（OpenAI 兼容）”协议。先保存候选；验收通过后，分别点击“启用此版本”。这是唯一允许多个模型同时启用的 V1 槽位，系统会为每个模型分别产出一个故事候选。
 
+这三份故事 Profile 都应填写 `YUNWU_REASONING_API_KEY`；它们可以分别使用不同模型名、Base URL 和非敏感参数。
+
 ### 3. 角色、场景与导演分镜
 
 分别配置：`设计角色文字资产`、`设计场景文字资产`、`AI 导演生成分镜`。
 
 V1 可以先让这三项使用同一个性价比好的文本模型。每个功能仍需单独保存一版配置，因为未来可独立替换、比较成本和回溯结果。
+服务器变量名同样填写 `YUNWU_REASONING_API_KEY`。
 
 ### 4. 图片资产
 
@@ -70,9 +73,11 @@ V1 可以先让这三项使用同一个性价比好的文本模型。每个功�
 - `生成场景参考图`
 - `生成分镜关键帧`
 
-模型名称填写 Banana 2 在中转站显示的实际名称。关键帧页面会多出“参考图字段名”：这是中转站 API 文档中表示“传入参考图”的字段，常见为 `images`，但必须以你所用中转站的文档为准。
+V1 当前图片默认使用 **火山方舟官方 Seedream 5.0 Pro**：Adapter 选择 `volcengine_ark_image`，模型名称固定填 `doubao-seedream-5-0-260128`，API 地址固定填 `https://ark.cn-beijing.volces.com/api/v3`。不要填写 `/v1`、`/images/generations` 或其他请求路径。
 
-关键帧不能使用不支持参考图的图片模型。系统会把锁定后的角色图、场景图传给模型；没有配置该字段时会停止任务，而不是假装使用了锁图。
+三项图片 Profile 的服务器变量名统一填写 `ARK_API_KEY`；它可与 Seedance 视频 Profile 共用，但两条 Adapter 通道不会互相调用。没有参考图时，官方 Adapter 只提交一张纯文本图片；关键帧则从已锁定的本地角色图与场景图读取受控媒体资产，仅在 Worker 内存中按“角色、场景”顺序转换为官方 `image` Data URL，不会把本机 URL、Base64 或签名 URL 写入数据库、日志或审计。返回后立即无鉴权下载到本机资产并校验 HTTPS、大小、MIME、文件头与真实宽高。
+
+如未来改用其他 OpenAI 兼容图片中转协议，才选择旧的 `openai_compatible_image` 版本；那时关键帧需要由渠道文档明确给出参考图字段名。两种协议不能混填参数。
 
 ### 5. 视频片段
 

@@ -1,5 +1,6 @@
 """LemonFlow V1 模型槽位与 Prompt 模板版本配置接口。"""
 
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -14,6 +15,7 @@ from app.schemas import (
     ModelSlotStrategyRequest,
     ModelQualityEvaluationResponse,
     ModelQualityRefreshRequest,
+    ModelProfilePreflightResponse,
     PromptTemplateCreateRequest,
     PromptTemplateResponse,
     V1ModelProfileCreateRequest,
@@ -35,9 +37,11 @@ from app.services.v1_configuration_service import (
     set_slot_strategy,
     update_v1_model_profile,
     model_profile_deletion_status,
+    preflight_v1_model_profile,
     profile_has_model_invocations,
 )
 from app.services.v1_quality_service import list_latest_quality_evaluations, refresh_quality_evaluations
+from app.services.provider_config_security import redact_provider_config
 
 
 router = APIRouter(prefix="/api/v1/production", tags=["V1 模型与 Prompt 配置"])
@@ -81,7 +85,7 @@ def _v1_profile_response(db: Session, profile, binding) -> V1ModelProfileRespons
         display_name=profile.display_name or profile.model_key,
         model_version=profile.model_version,
         version=profile.version,
-        provider_config=profile.provider_config,
+        provider_config=redact_provider_config(profile.provider_config),
         is_bound=binding is not None,
         is_enabled_in_slot=bool(binding and binding.is_enabled),
         priority=binding.priority if binding is not None else None,
@@ -279,6 +283,22 @@ def update_v1_model_profile_endpoint(
         None,
     )
     return _v1_profile_response(db, profile, binding)
+
+
+@router.post("/v1-model-profiles/{profile_id}/preflight", response_model=ModelProfilePreflightResponse)
+def preflight_v1_model_profile_endpoint(
+    profile_id: str,
+    db: Session = Depends(get_db),
+) -> ModelProfilePreflightResponse:
+    """预检 V1 槽位的真实配置，不生成内容或提交供应商任务。"""
+
+    checks = preflight_v1_model_profile(db, profile_id)
+    return ModelProfilePreflightResponse(
+        profile_id=profile_id,
+        ready=all(check["status"] != "failed" for check in checks),
+        checked_at=datetime.now(timezone.utc),
+        checks=checks,
+    )
 
 
 @router.post(

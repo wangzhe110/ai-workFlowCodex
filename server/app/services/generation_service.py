@@ -281,7 +281,7 @@ def submit_generation(db: Session, *, request: GenerationRequest) -> tuple[Gener
             result = GenerationResult(
                 status=RunStatus.FAILED,
                 error_code="GENERATION_PROVIDER_EXCEPTION",
-                error_message=str(exc),
+                error_message=sanitize_error_summary(exc),
                 sanitized_response={"outcome": "exception"},
             )
         _record_invocation(

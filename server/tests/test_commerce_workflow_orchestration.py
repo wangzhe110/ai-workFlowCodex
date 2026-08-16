@@ -1,6 +1,7 @@
 """Commerce Phase 2：状态机、幂等、审核及本地 Mock 工作流。"""
 
 import ast
+import importlib.util
 import inspect
 import json
 import sqlite3
@@ -16,7 +17,8 @@ import pytest
 from fastapi import HTTPException
 from fastapi import BackgroundTasks
 from fastapi.testclient import TestClient
-from sqlalchemy import MetaData, create_engine, event, func, select
+from sqlalchemy import Column, Enum, MetaData, String, Table, create_engine, event, func, select
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.orm.attributes import flag_modified
@@ -1836,6 +1838,90 @@ def test_0013_sqlite_integrity_triggers_and_nonempty_round_trip(tmp_path):
         "uq_commerce_workflow_step_attempt",
         "uq_active_commerce_workflow_step",
     }.issubset(indexes_up_again)
+
+
+def test_0014_casts_workflow_step_enum_to_text_before_comparing_legacy_sidecar_status():
+    """PostgreSQL 不能直接比较 runstatus 枚举和 0012 的 VARCHAR 状态列。"""
+
+    server_root = Path(__file__).resolve().parents[1]
+    path = server_root / "migrations" / "versions" / "0014_commerce_phase2_legacy_compatibility.py"
+    spec = importlib.util.spec_from_file_location("lemonflow_migration_0014", path)
+    assert spec is not None and spec.loader is not None
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+
+    metadata = MetaData()
+    workflow_steps = Table(
+        "workflow_steps",
+        metadata,
+        Column("status", Enum("PENDING", "SUCCEEDED", name="runstatus"), nullable=False),
+    )
+    commerce_steps = Table(
+        "commerce_workflow_steps",
+        metadata,
+        Column("status", String(20), nullable=False),
+    )
+    expression = migration._workflow_step_status_mismatch(workflow_steps, commerce_steps)
+    postgresql_sql = str(expression.compile(dialect=postgresql.dialect()))
+    sqlite_sql = str(expression.compile(dialect=sqlite.dialect()))
+
+    assert "CAST(workflow_steps.status AS TEXT)" in postgresql_sql
+    assert "commerce_workflow_steps.status" in postgresql_sql
+    assert "CAST(workflow_steps.status AS TEXT)" in sqlite_sql
+
+
+def test_0019_repairs_postgresql_scope_guard_without_relaxing_its_predicates(tmp_path):
+    """0019 只能转换枚举侧，且 PostgreSQL 不允许回装已知坏函数。"""
+
+    server_root = Path(__file__).resolve().parents[1]
+    path = server_root / "migrations" / "versions" / "0019_commerce_step_scope_guard_enum_compatibility.py"
+    spec = importlib.util.spec_from_file_location("lemonflow_migration_0019", path)
+    assert spec is not None and spec.loader is not None
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+
+    function_sql = migration.POSTGRES_SCOPE_GUARD_FUNCTION_SQL
+    assert "CREATE OR REPLACE FUNCTION commerce_workflow_step_scope_guard() RETURNS trigger" in function_sql
+    assert "CAST(step.status AS TEXT) = NEW.status" in function_sql
+    assert "NEW.status::runstatus" not in function_sql
+    # 所有既有 Commerce 作用域谓词和异常语义都必须原样存在。
+    for predicate in (
+        "link.workflow_run_id = NEW.workflow_run_id",
+        "link.story_run_id = NEW.story_run_id",
+        "run.workflow_key = 'commerce_story_run'",
+        "run.project_id = story.project_id",
+        "step.workflow_run_id = NEW.workflow_run_id",
+        "step.step_key = NEW.stage",
+        "step.attempt = NEW.attempt",
+        "RAISE EXCEPTION 'commerce workflow step scope invalid'",
+    ):
+        assert predicate in function_sql
+
+    database_url = f"sqlite:///{tmp_path / 'commerce-0019-roundtrip.db'}"
+    config = Config(str(server_root / "alembic.ini"))
+    config.set_main_option("script_location", str(server_root / "migrations"))
+    migration_engine = create_engine(database_url)
+    try:
+        with migration_engine.connect() as connection:
+            connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+            connection.commit()
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0018_commerce_storyrun_production_slice2")
+            command.upgrade(config, "0019_commerce_step_scope_guard_enum_compatibility")
+            assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == (
+                "0019_commerce_step_scope_guard_enum_compatibility"
+            )
+            # ``SELECT`` starts SQLAlchemy's implicit SQLite transaction; the
+            # migration environment intentionally refuses to toggle foreign
+            # keys while it is still open.
+            connection.commit()
+            command.downgrade(config, "0018_commerce_storyrun_production_slice2")
+            assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == (
+                "0018_commerce_storyrun_production_slice2"
+            )
+            config.attributes.pop("connection", None)
+    finally:
+        migration_engine.dispose()
 
 
 def test_0014_backfills_published_phase2_data_and_rejects_unrepairable_sidecars(tmp_path):

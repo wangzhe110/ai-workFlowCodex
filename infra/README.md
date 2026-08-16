@@ -14,7 +14,14 @@
 数据库迁移，之后才启动 API 和 RQ Worker；两者共用同一个服务镜像、同一个媒体卷。
 先复制 `compose.env.example` 和 `backend.env.example` 为未提交的 `compose.env`、
 `backend.env`。后者会同时注入 API 和 Worker，填写模型配置中心对应
-`secret_env_name` 的真实 Key（例如 `ARK_API_KEY` 或自定义的兼容渠道变量）以及 S3 凭据。再在项目根目录执行：
+`secret_env_name` 的真实 Key 以及 S3 凭据。V1 固定使用三条独立通道：
+
+- `YUNWU_REASONING_API_KEY`：云雾推理、视觉理解、故事、角色、场景和导演文本模型；同一 Key 可被多个 Profile 引用。
+- `ARK_API_KEY`：火山方舟官方 `volcengine_ark_image`（Seedream 图片）和 `volcengine_ark_video`（Seedance 视频）可共享这一渠道 Key；图片和视频仍由各自 Profile、Adapter 独立调用。
+
+旧云雾/Fal 图片 Profile 与 Adapter 仅为历史审计保留，当前三个图片槽位不再绑定它；默认部署与 Run 1 不需要云雾图片 Key。
+
+不要把模型 ID、API Base URL 或生成参数放入 `backend.env`；它们属于模型中心各 Profile 的非敏感配置。再在项目根目录执行：
 
 ```bash
 docker compose --env-file infra/compose.env up --build

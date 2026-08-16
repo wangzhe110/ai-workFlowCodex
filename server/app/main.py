@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -42,6 +43,12 @@ app = FastAPI(
     description="V1：项目、素材上传、创作资产库和异步工作流接口。",
     lifespan=lifespan,
 )
+
+# 真实图片结果在下载校验后转存至本机受控目录。仅挂载 generated 子目录，避免
+# 把参考视频、临时文件或最终成片的内部存储键暴露为静态路径。
+_generated_image_root = settings.local_storage_path / "generated"
+_generated_image_root.mkdir(parents=True, exist_ok=True)
+app.mount("/media/generated", StaticFiles(directory=str(_generated_image_root)), name="generated-images")
 
 # V1 暂无登录，但 CORS 仍显式限制前端来源，避免开发配置默认允许任意站点调用。
 app.add_middleware(

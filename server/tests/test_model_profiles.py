@@ -2,7 +2,9 @@
 
 from fastapi.testclient import TestClient
 
+from app.core.database import SessionLocal
 from app.main import app
+from app.models import ModelProfile
 
 
 def test_model_profiles_seed_and_keep_unavailable_provider_inactive() -> None:
@@ -156,3 +158,52 @@ def test_model_profiles_seed_and_keep_unavailable_provider_inactive() -> None:
             },
         )
         assert secret_attempt.status_code == 422
+
+
+def test_legacy_model_profile_api_redacts_historical_sensitive_provider_config() -> None:
+    """旧模型中心同样不应把绕过新白名单的历史数据直接回显给前端。"""
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/model-profiles",
+            json={
+                "step_key": "generate_story_package",
+                "provider_key": "openai_compatible",
+                "model_key": "legacy-security-candidate",
+                "provider_config": {
+                    "api_base_url": "https://reasoning.example/v1",
+                    "secret_env_name": "YUNWU_REASONING_API_KEY",
+                },
+                "activate": False,
+            },
+        )
+        assert created.status_code == 201, created.text
+        profile_id = created.json()["id"]
+        try:
+            db = SessionLocal()
+            try:
+                profile = db.get(ModelProfile, profile_id)
+                assert profile is not None
+                profile.provider_config = {
+                    "api_base_url": "https://reasoning.example/v1",
+                    "secret_env_name": "YUNWU_REASONING_API_KEY",
+                    "Access-Token": "legacy-api-value",
+                }
+                db.commit()
+            finally:
+                db.close()
+
+            listed = client.get("/api/v1/model-profiles?step_key=generate_story_package")
+            assert listed.status_code == 200, listed.text
+            item = next(row for row in listed.json() if row["id"] == profile_id)
+            assert item["provider_config"]["Access-Token"] == "[REDACTED]"
+            assert "legacy-api-value" not in listed.text
+        finally:
+            db = SessionLocal()
+            try:
+                profile = db.get(ModelProfile, profile_id)
+                if profile is not None:
+                    db.delete(profile)
+                    db.commit()
+            finally:
+                db.close()

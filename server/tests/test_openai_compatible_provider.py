@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from app.services.analysis_provider import (
     ConfigurableAsyncVideoProvider,
     OpenAICompatibleImageProvider,
@@ -29,6 +31,75 @@ class _FakeHttpResponse:
 
     def read(self) -> bytes:
         return json.dumps(self.payload).encode("utf-8")
+
+
+def test_openai_profiles_use_independent_reasoning_and_image_secret_channels(monkeypatch) -> None:
+    """文本与图片 Adapter 必须只读取各自冻结 Profile 指定的环境变量。
+
+    两个云雾通道可以使用不同的模型 ID、Base URL 和 Key。保留旧变量作为诱饵，
+    证明运行时不会悄悄回退到通用 ``YUNWU_API_KEY``。
+    """
+
+    from app.services import analysis_provider
+
+    observed: list[tuple[str, str]] = []
+
+    def fake_post(url, api_key, payload, timeout):
+        observed.append((url, api_key))
+        if url.endswith("/images/generations"):
+            return {"data": [{"url": "https://image-relay.example/generated.png"}]}
+        return {"choices": [{"message": {"content": '{"story":"ok"}'}}]}
+
+    monkeypatch.setenv("YUNWU_REASONING_API_KEY", "reasoning-channel-key")
+    monkeypatch.setenv("YUNWU_IMAGE_API_KEY", "image-channel-key")
+    monkeypatch.setenv("YUNWU_API_KEY", "legacy-key-must-not-be-used")
+    monkeypatch.setattr(analysis_provider, "_post_json", fake_post)
+
+    text = OpenAICompatibleJsonProvider(
+        {
+            "model_key": "gemini-reasoning-preview",
+            "provider_config": {
+                "api_base_url": "https://reasoning-relay.example/v1",
+                "secret_env_name": "YUNWU_REASONING_API_KEY",
+            },
+        }
+    )
+    image = OpenAICompatibleImageProvider(
+        {
+            "model_key": "banana-image-model",
+            "provider_config": {
+                "api_base_url": "https://image-relay.example/v1",
+                "secret_env_name": "YUNWU_IMAGE_API_KEY",
+            },
+        }
+    )
+
+    assert text.generate_json(system_instruction="json", user_payload={}, output_contract="{}") == {"story": "ok"}
+    assert image.generate("生成角色设定图") == "https://image-relay.example/generated.png"
+    assert observed == [
+        ("https://reasoning-relay.example/v1/chat/completions", "reasoning-channel-key"),
+        ("https://image-relay.example/v1/images/generations", "image-channel-key"),
+    ]
+
+
+def test_missing_image_secret_does_not_fallback_to_reasoning_or_legacy_secret(monkeypatch) -> None:
+    """缺少图片 Key 只阻塞图片通道，不能借用推理 Key 或退回 mock。"""
+
+    monkeypatch.setenv("YUNWU_REASONING_API_KEY", "reasoning-channel-key")
+    monkeypatch.setenv("YUNWU_API_KEY", "legacy-key-must-not-be-used")
+    monkeypatch.delenv("YUNWU_IMAGE_API_KEY", raising=False)
+    provider = OpenAICompatibleImageProvider(
+        {
+            "model_key": "banana-image-model",
+            "provider_config": {
+                "api_base_url": "https://image-relay.example/v1",
+                "secret_env_name": "YUNWU_IMAGE_API_KEY",
+            },
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="YUNWU_IMAGE_API_KEY"):
+        provider.generate("生成角色设定图")
 
 
 def test_openai_compatible_provider_normalizes_url_and_json(monkeypatch) -> None:

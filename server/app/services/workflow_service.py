@@ -19,6 +19,7 @@ from app.services.analysis_provider import (
     VideoAnalysisProvider,
 )
 from app.services.model_profile_service import get_active_profile_snapshot
+from app.services.sensitive_data import sanitize_error_summary
 from app.services.video_audio_service import extract_reference_audio
 from app.services.video_frame_service import extract_sampled_video_frames
 
@@ -408,6 +409,7 @@ def execute_video_analysis(run_id: str) -> None:
         db.commit()
     except Exception as exc:  # Worker 必须把失败转换为用户可见的状态。
         db.rollback()
+        error_message = sanitize_error_summary(exc, max_length=2000)
         run = db.get(WorkflowRun, run_id)
         if run is not None:
             step = db.get(WorkflowStep, active_step_id) if active_step_id else None
@@ -415,7 +417,7 @@ def execute_video_analysis(run_id: str) -> None:
             run.finished_at = utcnow()
             if step is not None:
                 step.status = RunStatus.FAILED
-                step.error_message = str(exc)[:2000]
+                step.error_message = error_message
                 step.finished_at = utcnow()
             db.commit()
     finally:

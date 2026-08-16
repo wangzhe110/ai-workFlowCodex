@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -20,6 +21,14 @@ from app.schemas import (
     CommerceWorkflowDefinitionResponse,
     CommerceWorkflowRunResponse,
     CommerceWorkflowStepResponse,
+    CommerceFinalVideoResponse,
+    CommerceProductionActionRequest,
+    CommerceProductionAssetsResponse,
+    CommerceProductionImageResponse,
+    CommerceProductionReviewRequest,
+    CommerceProductionVersionResponse,
+    CommerceVideoClipResponse,
+    CommerceVideoPromptResponse,
 )
 from app.services.commerce_configuration_service import ensure_commerce_foundation
 from app.services.commerce_workflow_service import (
@@ -40,9 +49,79 @@ from app.services.commerce_workflow_service import (
     workflow_for_story_run,
 )
 from app.services.worker_runtime import dispatch_workflow
+from app.services.commerce_production_service import (
+    create_production_run,
+    list_story_run_assets,
+    lock_character_design,
+    lock_image,
+    lock_scene_design,
+    lock_storyboard,
+    review_video_clip,
+)
+from app.services.storage import local_asset_storage
+from app.services.sensitive_data import redact_sensitive_data
 
 
 router = APIRouter(prefix="/api/v1/commerce", tags=["Commerce 带货短剧"])
+
+
+def _safe_snapshot(value):
+    """审核页只能看到安全快照，历史异常 Data URL 也不得被接口回显。"""
+
+    redacted = redact_sensitive_data(value or {})
+    return redacted if isinstance(redacted, dict) else {}
+
+
+def _production_version_response(item) -> CommerceProductionVersionResponse:
+    return CommerceProductionVersionResponse(
+        id=item.id, story_run_id=item.story_run_id, version=item.version, status=item.status,
+        content=_safe_snapshot(item.content), input_snapshot=_safe_snapshot(item.input_snapshot), prompt_snapshot=_safe_snapshot(item.prompt_snapshot),
+        locked_at=item.locked_at, stale_at=item.stale_at, created_at=item.created_at,
+    )
+
+
+def _production_image_response(item) -> CommerceProductionImageResponse:
+    owner = getattr(item, "character_design_version_id", None) or getattr(item, "scene_design_version_id", None) or getattr(item, "storyboard_version_id", None)
+    logical = getattr(item, "role_id", None) or getattr(item, "scene_id", None) or getattr(item, "shot_id", None)
+    return CommerceProductionImageResponse(
+        id=item.id, story_run_id=item.story_run_id, owner_version_id=owner, logical_id=logical,
+        version=item.version, image_url=item.image_url, status=item.status, prompt_snapshot=item.prompt_snapshot,
+        input_snapshot=_safe_snapshot(getattr(item, "input_snapshot", None) or getattr(item, "input_asset_snapshot", {})),
+        error_message=item.error_message, locked_at=item.locked_at, stale_at=item.stale_at, created_at=item.created_at,
+    )
+
+
+def _video_prompt_response(item) -> CommerceVideoPromptResponse:
+    return CommerceVideoPromptResponse(
+        id=item.id, story_run_id=item.story_run_id, storyboard_version_id=item.storyboard_version_id,
+        shot_id=item.shot_id, shot_number=item.shot_number, keyframe_version_id=item.keyframe_version_id,
+        version=item.version, prompt=item.prompt, trace=_safe_snapshot(item.trace), status=item.status,
+        locked_at=item.locked_at, stale_at=item.stale_at, created_at=item.created_at,
+    )
+
+
+def _clip_response(item) -> CommerceVideoClipResponse:
+    return CommerceVideoClipResponse(
+        id=item.id, story_run_id=item.story_run_id, storyboard_version_id=item.storyboard_version_id,
+        shot_id=item.shot_id, shot_number=item.shot_number, keyframe_version_id=item.keyframe_version_id,
+        video_prompt_version_id=item.video_prompt_version_id, version=item.version, provider_task_id=item.provider_task_id,
+        video_url=item.video_url, status=item.status, error_message=item.error_message, retry_count=item.retry_count,
+        duration_ms=item.duration_ms, media_metadata=item.media_metadata, reviewed_at=item.reviewed_at,
+        review_note=item.review_note, stale_at=item.stale_at, created_at=item.created_at, finished_at=item.finished_at,
+    )
+
+
+def _final_response(item) -> CommerceFinalVideoResponse:
+    download_url = item.output_url if item.output_url and item.output_url.startswith("https://") else (
+        f"/api/v1/commerce/story-runs/{item.story_run_id}/final-videos/{item.id}/download"
+        if item.storage_key and item.status == "SUCCEEDED" else None
+    )
+    return CommerceFinalVideoResponse(
+        id=item.id, story_run_id=item.story_run_id, storyboard_version_id=item.storyboard_version_id,
+        version=item.version, clip_ids=item.clip_ids, output_url=item.output_url, download_url=download_url,
+        status=item.status, error_message=item.error_message, media_metadata=item.media_metadata,
+        stale_at=item.stale_at, created_at=item.created_at, finished_at=item.finished_at,
+    )
 
 
 def _dispatch_or_service_unavailable(background_tasks: BackgroundTasks, run: WorkflowRun) -> None:
@@ -76,11 +155,16 @@ def _step_response(step: WorkflowStep | None) -> CommerceWorkflowStepResponse | 
 def _workflow_response(run: WorkflowRun | None) -> CommerceWorkflowRunResponse | None:
     if run is None:
         return None
+    # Slice 2 媒体子任务不使用 Phase 2 的 CommerceWorkflowLink sidecar（后者只
+    # 表示唯一的 commerce_story_run 父运行），但其创建时冻结的上下文仍是 API
+    # 返回中可信的 StoryRun 归属来源，避免前端需要从项目级状态反推。
+    production_context = ((run.input_snapshot or {}).get("commerce_production") or {})
+    frozen_story_run_id = production_context.get("story_run_id") if isinstance(production_context, dict) else None
     return CommerceWorkflowRunResponse(
-        id=run.id, story_run_id=run.commerce_link.story_run_id if run.commerce_link else None,
+        id=run.id, story_run_id=run.commerce_link.story_run_id if run.commerce_link else frozen_story_run_id,
         project_id=run.project_id, workflow_key=run.workflow_key,
         workflow_definition_id=run.workflow_definition_id, workflow_version=run.workflow_version,
-        status=run.status.value, idempotency_key=run.idempotency_key, input_snapshot=run.input_snapshot,
+        status=run.status.value, idempotency_key=run.idempotency_key, input_snapshot=_safe_snapshot(run.input_snapshot),
         created_at=run.created_at, started_at=run.started_at, finished_at=run.finished_at,
         steps=[_step_response(step) for step in run.steps if _step_response(step) is not None],
     )
@@ -251,3 +335,82 @@ def patch_outline_endpoint(story_run_id: str, outline_id: str, payload: Commerce
     if not changes:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="至少提供一个可修改字段")
     return _outline_response(patch_manual_outline(db, story_run_id, outline_id, changes))
+
+
+# ---------------------------------------------------------------------------
+# Commerce Slice 2 生产台：所有状态写入均委托服务层；路由只做请求解析、投递和
+# 响应编码。这样浏览器不能跳过冻结输入、人工锁定或单镜头归属校验。
+# ---------------------------------------------------------------------------
+
+
+@router.get("/story-runs/{story_run_id}/production-assets", response_model=CommerceProductionAssetsResponse)
+def production_assets_endpoint(story_run_id: str, db: Session = Depends(get_db)) -> CommerceProductionAssetsResponse:
+    rows = list_story_run_assets(db, story_run_id)
+    return CommerceProductionAssetsResponse(
+        story_run_id=story_run_id,
+        character_designs=[_production_version_response(item) for item in rows["character_designs"]],
+        scene_designs=[_production_version_response(item) for item in rows["scene_designs"]],
+        storyboards=[_production_version_response(item) for item in rows["storyboards"]],
+        character_images=[_production_image_response(item) for item in rows["character_images"]],
+        scene_images=[_production_image_response(item) for item in rows["scene_images"]],
+        keyframes=[_production_image_response(item) for item in rows["keyframes"]],
+        video_prompts=[_video_prompt_response(item) for item in rows["video_prompts"]],
+        clips=[_clip_response(item) for item in rows["clips"]],
+        finals=[_final_response(item) for item in rows["finals"]],
+    )
+
+
+@router.post("/story-runs/{story_run_id}/production/{operation}", response_model=CommerceWorkflowRunResponse, status_code=status.HTTP_202_ACCEPTED)
+def create_production_action_endpoint(
+    story_run_id: str,
+    operation: str,
+    payload: CommerceProductionActionRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+) -> CommerceWorkflowRunResponse:
+    run, created = create_production_run(
+        db, story_run_id=story_run_id, operation=operation, target_id=payload.target_id, retry=payload.retry
+    )
+    if created:
+        _dispatch_or_service_unavailable(background_tasks, run)
+    return _workflow_response(run)
+
+
+@router.post("/story-runs/{story_run_id}/character-designs/{version_id}/lock", response_model=CommerceProductionVersionResponse)
+def lock_character_design_endpoint(story_run_id: str, version_id: str, payload: CommerceProductionReviewRequest, db: Session = Depends(get_db)) -> CommerceProductionVersionResponse:
+    return _production_version_response(lock_character_design(db, story_run_id=story_run_id, version_id=version_id, reviewer_label=payload.reviewer_label, note=payload.note))
+
+
+@router.post("/story-runs/{story_run_id}/scene-designs/{version_id}/lock", response_model=CommerceProductionVersionResponse)
+def lock_scene_design_endpoint(story_run_id: str, version_id: str, payload: CommerceProductionReviewRequest, db: Session = Depends(get_db)) -> CommerceProductionVersionResponse:
+    return _production_version_response(lock_scene_design(db, story_run_id=story_run_id, version_id=version_id, reviewer_label=payload.reviewer_label, note=payload.note))
+
+
+@router.post("/story-runs/{story_run_id}/storyboards/{version_id}/lock", response_model=CommerceProductionVersionResponse)
+def lock_storyboard_endpoint(story_run_id: str, version_id: str, payload: CommerceProductionReviewRequest, db: Session = Depends(get_db)) -> CommerceProductionVersionResponse:
+    return _production_version_response(lock_storyboard(db, story_run_id=story_run_id, version_id=version_id, reviewer_label=payload.reviewer_label, note=payload.note))
+
+
+@router.post("/story-runs/{story_run_id}/images/{image_kind}/{image_id}/lock", response_model=CommerceProductionImageResponse)
+def lock_production_image_endpoint(story_run_id: str, image_kind: str, image_id: str, payload: CommerceProductionReviewRequest, db: Session = Depends(get_db)) -> CommerceProductionImageResponse:
+    return _production_image_response(lock_image(db, story_run_id=story_run_id, image_id=image_id, kind=image_kind.upper(), reviewer_label=payload.reviewer_label, note=payload.note))
+
+
+@router.post("/story-runs/{story_run_id}/clips/{clip_id}/review", response_model=CommerceVideoClipResponse)
+def review_production_clip_endpoint(story_run_id: str, clip_id: str, decision: str, payload: CommerceProductionReviewRequest, db: Session = Depends(get_db)) -> CommerceVideoClipResponse:
+    return _clip_response(review_video_clip(db, story_run_id=story_run_id, clip_id=clip_id, decision=decision, reviewer_label=payload.reviewer_label, note=payload.note))
+
+
+@router.get("/story-runs/{story_run_id}/final-videos/{final_id}/download")
+def download_commerce_final_video_endpoint(story_run_id: str, final_id: str, db: Session = Depends(get_db)) -> FileResponse:
+    rows = list_story_run_assets(db, story_run_id)
+    row = next((item for item in rows["finals"] if item.id == final_id), None)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Commerce 成片不存在")
+    if row.status != "SUCCEEDED" or not row.storage_key:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Commerce 成片尚未生成可下载 MP4")
+    try:
+        path = local_asset_storage.final_video_path(row.storage_key)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Commerce 成片文件不存在") from exc
+    return FileResponse(path, media_type="video/mp4", filename=f"带货短剧成片-v{row.version}.mp4")

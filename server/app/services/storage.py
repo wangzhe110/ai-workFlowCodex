@@ -5,9 +5,13 @@ V1 开发阶段把源文件写入本地目录、直接使用图片供应商 URL�
 URL 失效导致后续图生视频无法读取首帧。业务服务只依赖本模块的标准接口。
 """
 
+from base64 import b64encode
 from contextlib import contextmanager
+from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import Path
 import shutil
+import struct
 from tempfile import TemporaryDirectory
 from typing import Iterator, Optional, Protocol
 from urllib.parse import urlparse
@@ -17,6 +21,36 @@ from uuid import uuid4
 from fastapi import UploadFile
 
 from app.core.config import settings
+
+
+@dataclass(frozen=True)
+class LocalImageReference:
+    """经过本地资产边界验证、仅供一次模型调用使用的参考图。
+
+    ``data_url`` 只在 Worker 内存中存活，刻意不参与 ``repr``。调用方只能把
+    :meth:`audit_metadata` 的非敏感摘要写入任务快照或审计记录，绝不能把该对象或
+    Data URL 原样序列化进数据库、日志或 API 响应。
+    """
+
+    asset_id: str
+    role: str
+    mime_type: str
+    width: int
+    height: int
+    sha256: str
+    data_url: str = field(repr=False)
+
+    def audit_metadata(self) -> dict[str, object]:
+        """返回允许持久化的参考图描述，不包含路径、字节或 Base64。"""
+
+        return {
+            "asset_id": self.asset_id,
+            "role": self.role,
+            "sha256": self.sha256,
+            "mime_type": self.mime_type,
+            "width": self.width,
+            "height": self.height,
+        }
 
 
 class LocalAssetStorage:
@@ -107,6 +141,314 @@ class LocalAssetStorage:
         """解析完整成片的安全本地路径，供已验证项目范围的下载接口使用。"""
 
         return self.source_video_path(storage_key)
+
+    def save_generated_image_bytes(
+        self,
+        *,
+        project_id: str,
+        asset_kind: str,
+        asset_id: str,
+        version: int,
+        content: bytes,
+        content_type: str,
+    ) -> str:
+        """原子保存已验证的生成图片，返回不含供应商签名的本地访问路径。
+
+        真实图片供应商常返回短期签名 URL；该 URL 只允许停留在 Adapter 内存中。本
+        地单机部署将图片转存到 ``LOCAL_STORAGE_PATH/generated``，供后续人工审核
+        和资产引用使用。``asset_id`` 经过哈希，避免异常业务数据形成路径片段。
+        """
+
+        suffix_by_mime = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}
+        suffix = suffix_by_mime.get(content_type)
+        if suffix is None:
+            raise RuntimeError("生成图片 MIME 类型不受本地资产存储支持")
+        if not isinstance(content, bytes) or not content:
+            raise RuntimeError("生成图片内容为空")
+        safe_asset_id = sha256(asset_id.encode("utf-8")).hexdigest()[:16]
+        storage_key = f"projects/{project_id}/{asset_kind}/{safe_asset_id}/v{version}-{uuid4().hex}{suffix}"
+        root = settings.local_storage_path / "generated"
+        destination = root / storage_key
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary_destination = destination.with_suffix(f"{suffix}.tmp")
+        try:
+            temporary_destination.write_bytes(content)
+            temporary_destination.replace(destination)
+        except Exception:
+            temporary_destination.unlink(missing_ok=True)
+            raise
+        return f"/media/generated/{storage_key}"
+
+    def download_generated_video(self, source_url: str) -> tuple[str, bytes]:
+        """下载供应商临时 MP4，但绝不把临时 URL 或鉴权带入本地资产。
+
+        视频供应商的 ``content.video_url`` 常带短期签名，只能在 Worker 内存中用
+        一次。本方法只接受 HTTPS、不会附带 ``Authorization``，并在完整读入前后
+        限制大小和验证 MP4 的 ``ftyp`` 文件头。调用方只能持久化随后由
+        :meth:`save_generated_video_bytes` 生成的 LemonFlow 本地媒体地址。
+        """
+
+        if not isinstance(source_url, str) or not source_url:
+            raise RuntimeError("视频供应商未返回可下载地址")
+        parsed = urlparse(source_url)
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise RuntimeError("视频供应商结果必须是 HTTPS 地址")
+
+        maximum = settings.max_upload_bytes
+        if maximum <= 0:
+            raise RuntimeError("视频文件大小限制配置无效")
+        request = Request(source_url, headers={"User-Agent": "LemonFlow/1.0"})
+        try:
+            with urlopen(request, timeout=settings.generated_image_download_timeout_seconds) as response:
+                # urllib 会自动跟随重定向；最终媒体地址仍必须是 HTTPS，不能让供应商
+                # 临时链接把 Worker 带到明文协议。
+                final_url = urlparse(response.geturl())
+                if final_url.scheme != "https" or not final_url.netloc:
+                    raise RuntimeError("视频下载重定向后不是 HTTPS 地址")
+                if getattr(response, "status", response.getcode()) != 200:
+                    raise RuntimeError("视频下载未返回 HTTP 200")
+                content_type = response.headers.get_content_type().lower()
+                if content_type != "video/mp4":
+                    raise RuntimeError("视频下载 MIME 类型不是 video/mp4")
+                chunks: list[bytes] = []
+                size = 0
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > maximum:
+                        raise RuntimeError("视频下载超过本地文件大小限制")
+                    chunks.append(chunk)
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            # 不把临时签名 URL 或底层 HTTP 错误原样带入任务错误与日志。
+            raise RuntimeError("无法安全下载视频供应商结果") from exc
+
+        content = b"".join(chunks)
+        if len(content) < 12 or content[4:8] != b"ftyp":
+            raise RuntimeError("视频下载内容不是有效 MP4 文件头")
+        return content_type, content
+
+    def save_generated_video_bytes(
+        self,
+        *,
+        project_id: str,
+        asset_kind: str,
+        asset_id: str,
+        version: int,
+        content: bytes,
+        content_type: str,
+    ) -> str:
+        """原子保存已验证的 MP4，并返回不含供应商签名的本地媒体地址。"""
+
+        if content_type != "video/mp4":
+            raise RuntimeError("生成视频 MIME 类型必须是 video/mp4")
+        if not isinstance(content, bytes) or len(content) < 12 or content[4:8] != b"ftyp":
+            raise RuntimeError("生成视频内容不是有效 MP4 文件")
+        if len(content) > settings.max_upload_bytes:
+            raise RuntimeError("生成视频超过本地文件大小限制")
+
+        safe_asset_id = sha256(asset_id.encode("utf-8")).hexdigest()[:16]
+        storage_key = f"projects/{project_id}/{asset_kind}/{safe_asset_id}/v{version}-{uuid4().hex}.mp4"
+        root = settings.local_storage_path / "generated"
+        destination = root / storage_key
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary_destination = destination.with_suffix(".mp4.tmp")
+        try:
+            temporary_destination.write_bytes(content)
+            temporary_destination.replace(destination)
+        except Exception:
+            temporary_destination.unlink(missing_ok=True)
+            raise
+        return f"/media/generated/{storage_key}"
+
+    def generated_media_path(self, media_url: str) -> Path:
+        """把受控本地生成媒体 URL 解析为 Worker 可交给 FFprobe 的真实路径。"""
+
+        if not isinstance(media_url, str) or not media_url:
+            raise RuntimeError("本地生成媒体地址为空")
+        parsed = urlparse(media_url)
+        public_prefix = "/media/generated/"
+        if (
+            parsed.scheme
+            or parsed.netloc
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+            or not parsed.path.startswith(public_prefix)
+        ):
+            raise RuntimeError("媒体必须是 LemonFlow 本地生成地址")
+        storage_key = parsed.path.removeprefix(public_prefix)
+        if not storage_key or ".." in Path(storage_key).parts:
+            raise RuntimeError("媒体存储键不在允许目录内")
+        root = (settings.local_storage_path / "generated").resolve()
+        candidate = (root / storage_key).resolve()
+        if candidate == root or root not in candidate.parents or not candidate.is_file():
+            raise RuntimeError("本地生成媒体文件不存在或不在允许目录")
+        return candidate
+
+    def load_generated_image_reference(
+        self,
+        *,
+        project_id: str,
+        asset_id: str,
+        role: str,
+        image_url: str,
+        storage_namespace_id: Optional[str] = None,
+    ) -> LocalImageReference:
+        """以冻结资产读取已持久化图片，并在内存中转为官方 Data URL。
+
+        方舟不能访问单机 Docker 内部的 ``/media`` 地址，因此只接受本存储模块写入的
+        本地生成图。这里既不接受公网 URL，也不接受绝对路径；路径同时要满足项目和
+        存储命名空间哈希目录约束，防止异常快照跨项目或穿越媒体根目录读取文件。
+
+        ``asset_id`` 始终是需要写入审计的图片版本 ID。较早的 V1 / Commerce 图片
+        文件则按所属角色或场景的逻辑 ID 分目录保存；调用方只能从该已冻结图片记录
+        取得 ``storage_namespace_id``，不能从客户端请求或 URL 推导。这样历史媒体
+        仍可安全读取，同时审计继续精确指向图片版本而非逻辑角色。
+        """
+
+        if role not in {"character", "scene", "first_frame"}:
+            raise RuntimeError("参考图角色只能是 character、scene 或 first_frame")
+        if not isinstance(project_id, str) or not project_id:
+            raise RuntimeError("参考图缺少项目 ID")
+        if not isinstance(asset_id, str) or not asset_id:
+            raise RuntimeError("参考图缺少资产 ID")
+        if storage_namespace_id is not None and (
+            not isinstance(storage_namespace_id, str) or not storage_namespace_id
+        ):
+            raise RuntimeError("参考图存储命名空间无效")
+        if not isinstance(image_url, str) or not image_url:
+            raise RuntimeError("参考图缺少本地媒体地址")
+
+        public_prefix = "/media/generated/"
+        parsed = urlparse(image_url)
+        if parsed.scheme or parsed.netloc or parsed.params or parsed.query or parsed.fragment:
+            raise RuntimeError("参考图必须是 LemonFlow 本地生成媒体地址")
+        if not parsed.path.startswith(public_prefix):
+            raise RuntimeError("参考图不在允许的本地生成媒体目录")
+        storage_key = parsed.path.removeprefix(public_prefix)
+        if not storage_key or ".." in Path(storage_key).parts:
+            raise RuntimeError("参考图存储键不在允许目录内")
+
+        parts = Path(storage_key).parts
+        namespace_id = storage_namespace_id or asset_id
+        expected_asset_dir = sha256(namespace_id.encode("utf-8")).hexdigest()[:16]
+        if (
+            len(parts) != 5
+            or parts[0] != "projects"
+            or parts[1] != project_id
+            or parts[3] != expected_asset_dir
+        ):
+            raise RuntimeError("参考图地址与冻结项目或资产 ID 不匹配")
+
+        root = (settings.local_storage_path / "generated").resolve()
+        candidate = (root / storage_key).resolve()
+        if candidate == root or root not in candidate.parents or not candidate.is_file():
+            raise RuntimeError("参考图文件不存在或不在允许的媒体根目录")
+        # 方舟参考图单张上限固定为 30 MB；不依赖可变下载限制，避免 Profile 配置
+        # 意外放宽本地读取边界。
+        max_bytes = 30 * 1024 * 1024
+        if candidate.stat().st_size > max_bytes:
+            raise RuntimeError("参考图超过 30MB 限制")
+        content = candidate.read_bytes()
+        if not content or len(content) > max_bytes:
+            raise RuntimeError("参考图为空或超过 30MB 限制")
+
+        mime_type = self._image_mime_from_magic(content)
+        suffix_by_mime = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
+        if candidate.suffix.lower() != suffix_by_mime[mime_type]:
+            raise RuntimeError("参考图文件扩展名与 MIME 类型不一致")
+        width, height = self._image_dimensions(content, mime_type)
+        # 只接受正尺寸且不超过本轮官方图片输入允许的保守 8K 上限。生成图在此
+        # 之前已经完成文件头校验；此处再次验证，避免被替换后的异常媒体进入模型。
+        if width > 8192 or height > 8192:
+            raise RuntimeError("参考图尺寸超过 8192 像素限制")
+        encoded = b64encode(content).decode("ascii")
+        return LocalImageReference(
+            asset_id=asset_id,
+            role=role,
+            mime_type=mime_type,
+            width=width,
+            height=height,
+            sha256=sha256(content).hexdigest(),
+            data_url=f"data:{mime_type};base64,{encoded}",
+        )
+
+    @staticmethod
+    def _image_mime_from_magic(content: bytes) -> str:
+        if content.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if content.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+            return "image/webp"
+        raise RuntimeError("参考图文件头不是受支持的 JPEG、PNG 或 WebP")
+
+    @classmethod
+    def _image_dimensions(cls, content: bytes, mime_type: str) -> tuple[int, int]:
+        if mime_type == "image/png":
+            if len(content) < 24 or content[12:16] != b"IHDR":
+                raise RuntimeError("PNG 参考图缺少尺寸信息")
+            width, height = struct.unpack(">II", content[16:24])
+        elif mime_type == "image/jpeg":
+            width, height = cls._jpeg_dimensions(content)
+        else:
+            width, height = cls._webp_dimensions(content)
+        if width <= 0 or height <= 0:
+            raise RuntimeError("参考图尺寸无效")
+        return width, height
+
+    @staticmethod
+    def _jpeg_dimensions(content: bytes) -> tuple[int, int]:
+        cursor = 2
+        sof_markers = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+        while cursor + 9 <= len(content):
+            if content[cursor] != 0xFF:
+                cursor += 1
+                continue
+            while cursor < len(content) and content[cursor] == 0xFF:
+                cursor += 1
+            if cursor >= len(content):
+                break
+            marker = content[cursor]
+            cursor += 1
+            if marker in {0xD8, 0xD9}:
+                continue
+            if cursor + 2 > len(content):
+                break
+            length = int.from_bytes(content[cursor : cursor + 2], "big")
+            if length < 2 or cursor + length > len(content):
+                break
+            if marker in sof_markers and length >= 7:
+                return (
+                    int.from_bytes(content[cursor + 5 : cursor + 7], "big"),
+                    int.from_bytes(content[cursor + 3 : cursor + 5], "big"),
+                )
+            cursor += length
+        raise RuntimeError("JPEG 参考图缺少尺寸信息")
+
+    @staticmethod
+    def _webp_dimensions(content: bytes) -> tuple[int, int]:
+        if len(content) < 30:
+            raise RuntimeError("WebP 参考图缺少尺寸信息")
+        chunk_type = content[12:16]
+        if chunk_type == b"VP8X":
+            width = 1 + int.from_bytes(content[24:27], "little")
+            height = 1 + int.from_bytes(content[27:30], "little")
+            return width, height
+        if chunk_type == b"VP8 ":
+            if len(content) < 30 or content[23:26] != b"\x9d\x01\x2a":
+                raise RuntimeError("WebP VP8 参考图缺少尺寸信息")
+            return int.from_bytes(content[26:28], "little") & 0x3FFF, int.from_bytes(content[28:30], "little") & 0x3FFF
+        if chunk_type == b"VP8L":
+            if len(content) < 25 or content[20] != 0x2F:
+                raise RuntimeError("WebP VP8L 参考图缺少尺寸信息")
+            bits = int.from_bytes(content[21:25], "little")
+            return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+        raise RuntimeError("WebP 参考图缺少受支持的尺寸信息")
 
 
 class SourceVideoStorage(Protocol):

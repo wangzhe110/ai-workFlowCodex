@@ -17,6 +17,9 @@ from typing import Any
 from app.models import MediaAsset
 from app.services.analysis_provider import (
     ConfigurableAsyncVideoProvider,
+    FalQueueImageProvider,
+    ImageGenerationProvider,
+    ImageTaskResult,
     OpenAICompatibleImageProvider,
     OpenAICompatibleJsonProvider,
     OpenAICompatibleVisionAnalysisProvider,
@@ -24,9 +27,10 @@ from app.services.analysis_provider import (
     VideoGenerationInput,
     VideoGenerationProvider,
     VideoTaskResult,
+    VolcengineArkImageProvider,
     VolcengineArkVideoProvider,
 )
-from app.services.storage import generated_image_delivery
+from app.services.storage import LocalImageReference, generated_image_delivery, local_asset_storage
 from app.services.video_frame_service import extract_sampled_video_frames
 
 
@@ -66,7 +70,7 @@ def assert_supported(snapshot: dict[str, Any], task_type: str) -> None:
         return
     if task_type in TEXT_TASK_TYPES and key == "openai_compatible":
         return
-    if task_type == IMAGE_TASK_TYPE and key == "openai_compatible_image":
+    if task_type == IMAGE_TASK_TYPE and key in {"openai_compatible_image", "fal_queue_image", "volcengine_ark_image"}:
         return
     if task_type == VIDEO_TASK_TYPE and key in {"volcengine_ark_video", "configurable_async_video"}:
         return
@@ -144,21 +148,116 @@ def generate_structured_text(
     return result
 
 
+def start_image_generation(
+    snapshot: dict[str, Any],
+    *,
+    prompt: str,
+    reference_image_urls: list[str] | None = None,
+    reference_images: list[LocalImageReference] | None = None,
+    existing_provider_task_id: str | None = None,
+) -> tuple[ImageGenerationProvider | None, ImageTaskResult]:
+    """提交或恢复一张图片任务。
+
+    Fal 队列在提交后会立即返回 ``request_id``。调用者必须先将它写入
+    ``ModelInvocation`` 并提交数据库，再调用 :func:`wait_for_image_result`。Worker
+    恢复时传入相同任务号，只会轮询，绝不会再次向可能收费的供应商提交图片任务。
+    OpenAI 兼容图片接口仍是同步协议，因此直接返回成功态；这不是回退，也不会把
+    Fal 配置偷偷改走旧协议。
+    """
+
+    assert_supported(snapshot, IMAGE_TASK_TYPE)
+    if is_mock_adapter(snapshot):
+        raise RuntimeError("本地模拟图片由 V1 生产服务处理，不应经过真实图片 Adapter")
+    key = adapter_key(snapshot)
+    if key == "openai_compatible_image":
+        if existing_provider_task_id:
+            raise RuntimeError("同步图片模型不支持恢复供应商任务")
+        return None, ImageTaskResult(
+            provider_task_id=None,
+            status="SUCCEEDED",
+            image_url=OpenAICompatibleImageProvider(snapshot).generate(
+                prompt,
+                reference_image_urls=reference_image_urls or [],
+            ),
+        )
+    if key == "fal_queue_image":
+        provider = FalQueueImageProvider(snapshot)
+        if existing_provider_task_id:
+            return provider, provider.poll(existing_provider_task_id)
+        return provider, provider.submit(prompt, reference_image_urls=reference_image_urls or [])
+    if key == "volcengine_ark_image":
+        if existing_provider_task_id:
+            raise RuntimeError("方舟同步图片模型不支持恢复供应商任务")
+        if reference_image_urls and reference_images:
+            raise RuntimeError("方舟图片不能同时接收 URL 参考图和本地参考图")
+        # 同步官方图片协议没有 provider_task_id；POST 只在这里执行一次，异常由
+        # 上层记录后交给人工重新生成，绝不静默重试或改走其他图片模型。
+        return None, VolcengineArkImageProvider(snapshot).generate(
+            prompt,
+            reference_image_urls=reference_image_urls or [],
+            reference_images=reference_images or [],
+        )
+    raise RuntimeError(f"Adapter {key} 不能生成图片任务")
+
+
+def wait_for_image_result(
+    provider: ImageGenerationProvider | None,
+    snapshot: dict[str, Any],
+    first_result: ImageTaskResult,
+) -> ImageTaskResult:
+    """轮询异步图片任务直至终态，超时不会再次提交供应商请求。"""
+
+    if first_result.status != "PENDING":
+        return first_result
+    if provider is None:
+        raise RuntimeError("图片 Adapter 返回等待状态但没有轮询实现")
+    task_id = first_result.provider_task_id
+    if not task_id:
+        raise RuntimeError("图片 Adapter 返回等待状态但没有供应商任务号")
+    config = snapshot.get("provider_config") or {}
+    try:
+        interval = float(config.get("poll_interval_seconds", 3))
+        maximum_wait = float(config.get("max_poll_seconds", 600))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("poll_interval_seconds 和 max_poll_seconds 必须为数字") from exc
+    interval = min(max(interval, 1), 60)
+    maximum_wait = min(max(maximum_wait, 10), 1800)
+    deadline = time.monotonic() + maximum_wait
+    result = first_result
+    while result.status == "PENDING":
+        if time.monotonic() >= deadline:
+            return ImageTaskResult(
+                provider_task_id=task_id,
+                status="FAILED",
+                error_message="等待图片供应商结果超时；请检查任务号和模型配置后重新生成",
+            )
+        time.sleep(interval)
+        result = provider.poll(task_id)
+        task_id = result.provider_task_id or task_id
+    return result
+
+
 def generate_image(
     snapshot: dict[str, Any],
     *,
     prompt: str,
     reference_image_urls: list[str] | None = None,
 ) -> str:
-    """通过图片 Adapter 生成一张图；参考图传法由模型配置显式决定。"""
+    """兼容旧调用方的一次性图片入口。
 
-    assert_supported(snapshot, IMAGE_TASK_TYPE)
-    if is_mock_adapter(snapshot):
-        raise RuntimeError("本地模拟图片由 V1 生产服务处理，不应经过真实图片 Adapter")
-    return OpenAICompatibleImageProvider(snapshot).generate(
-        prompt,
-        reference_image_urls=reference_image_urls or [],
+    V1 和 Commerce 的新 Worker 路径应使用 ``start_image_generation``，以便先持久化
+    Fal ``request_id``。该函数仅保留给历史调用方，不会改变已接入 Adapter 的行为。
+    """
+
+    provider, first_result = start_image_generation(
+        snapshot,
+        prompt=prompt,
+        reference_image_urls=reference_image_urls,
     )
+    result = wait_for_image_result(provider, snapshot, first_result)
+    if result.status != "SUCCEEDED" or not result.image_url:
+        raise RuntimeError(result.error_message or "图片供应商任务失败")
+    return result.image_url
 
 
 def persist_v1_image(
@@ -182,6 +281,27 @@ def persist_v1_image(
         shot_number=1,
         version=version,
         source_url=source_url,
+    )
+
+
+def persist_v1_image_bytes(
+    *,
+    project_id: str,
+    asset_kind: str,
+    asset_id: str,
+    version: int,
+    content: bytes,
+    content_type: str,
+) -> str:
+    """保存官方方舟已下载的图片字节，不持久化供应商临时 URL。"""
+
+    return local_asset_storage.save_generated_image_bytes(
+        project_id=project_id,
+        asset_kind=asset_kind,
+        asset_id=asset_id,
+        version=version,
+        content=content,
+        content_type=content_type,
     )
 
 
@@ -242,10 +362,11 @@ def create_video_request(
     shot_number: int,
     prompt: str,
     image_urls: list[str],
+    reference_images: list[LocalImageReference] | None = None,
 ) -> VideoGenerationInput:
     """建立供应商无关的视频输入对象，视频 Adapter 再转换为其专属协议。"""
 
-    if not image_urls:
+    if not image_urls and not reference_images:
         raise RuntimeError("视频生成缺少锁定关键帧图片")
     return VideoGenerationInput(
         project_id=project_id,
@@ -254,4 +375,5 @@ def create_video_request(
         end_shot_number=shot_number,
         prompt=prompt,
         image_urls=image_urls,
+        reference_images=reference_images or [],
     )

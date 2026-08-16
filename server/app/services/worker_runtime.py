@@ -23,7 +23,9 @@ from app.services.topic_service import execute_topic_generation
 from app.services.video_service import execute_video_generation
 from app.services.v1_execution_service import execute_v1_video_child, execute_v1_workflow
 from app.services.commerce_workflow_service import execute_commerce_workflow
+from app.services.commerce_production_service import execute_commerce_production_workflow
 from app.services.workflow_service import execute_video_analysis
+from app.services.sensitive_data import sanitize_error_summary
 
 
 WorkflowExecutor = Callable[[str], None]
@@ -38,6 +40,7 @@ _WORKFLOW_EXECUTORS: dict[str, WorkflowExecutor] = {
     "final_video_export": execute_final_video_export,
     "v1_reference_analysis": execute_v1_workflow,
     "v1_story_generation": execute_v1_workflow,
+    "v1_commerce_creative_generation": execute_v1_workflow,
     "v1_character_design": execute_v1_workflow,
     "v1_character_images": execute_v1_workflow,
     "v1_scene_design": execute_v1_workflow,
@@ -49,6 +52,18 @@ _WORKFLOW_EXECUTORS: dict[str, WorkflowExecutor] = {
     # Commerce 使用一个 StoryRun 父运行；节点与 retry 是其 WorkflowStep attempt，
     # 因而队列只需要投递这一种工作流键。
     "commerce_story_run": execute_commerce_workflow,
+    # Slice 2 在同一 Commerce StoryRun 的冻结输入上运行角色、场景、分镜、视觉和
+    # 视频子任务。它复用 WorkflowRun/WorkflowStep 任务边界，不改变 Commerce 父
+    # 工作流的七阶段状态机。
+    "commerce_production_character_design": execute_commerce_production_workflow,
+    "commerce_production_scene_design": execute_commerce_production_workflow,
+    "commerce_production_storyboard": execute_commerce_production_workflow,
+    "commerce_production_character_images": execute_commerce_production_workflow,
+    "commerce_production_scene_images": execute_commerce_production_workflow,
+    "commerce_production_shot_keyframe": execute_commerce_production_workflow,
+    "commerce_production_video_prompt": execute_commerce_production_workflow,
+    "commerce_production_video_render": execute_commerce_production_workflow,
+    "commerce_production_final_compose": execute_commerce_production_workflow,
 }
 
 
@@ -202,7 +217,7 @@ def _mark_dispatch_failure(run_id: str, message: str) -> None:
                     .where(CommerceWorkflowStep.workflow_step_id == step.id)
                     .values(status=RunStatus.FAILED.value)
                 )
-                step.error_message = message[:2000]
+                step.error_message = sanitize_error_summary(message, max_length=2000)
                 step.finished_at = now
                 failed_step_id = step.id
         # Commerce 运行拥有独立状态机；队列投递失败不能只让 WorkflowRun 失败而把

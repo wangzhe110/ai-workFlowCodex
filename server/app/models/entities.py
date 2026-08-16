@@ -426,6 +426,14 @@ class Project(Base):
     story_runs: Mapped[list["StoryRun"]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )
+    # Slice 1 把 V1 参考分析转换成 Commerce 可追溯输入，而不是另起一条业务主线。
+    # 这些记录随项目删除；共享的 ProductAsset / ProductAssetVersion 不会被级联删除。
+    commerce_reference_intakes: Mapped[list["CommerceReferenceIntake"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    commerce_creative_batches: Mapped[list["CommerceCreativeBatch"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
     viral_cases: Mapped[list["ViralCase"]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )
@@ -643,6 +651,452 @@ class ProductAssetVersion(Base):
     product_asset: Mapped[ProductAsset] = relationship(back_populates="versions")
 
 
+# ---------------------------------------------------------------------------
+# Commerce Slice 1：将 V1 的参考分析正式接入带货 StoryRun。
+#
+# 这些表不是新的工作流：ReferenceAnalysis 仍由 V1 执行，后续大纲仍由既有
+# Commerce WorkflowRun / WorkflowStep 编排。它们只保存人工确认前后的不可变输入
+# 版本和“10 个故事创意”批次，保证后续不会回读“最新商品”。
+# ---------------------------------------------------------------------------
+
+
+class CommerceCreativeBatchStatus(str, Enum):
+    """一批固定十个带货故事创意的生成状态。"""
+
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+
+
+class CommerceCreativeIdeaStatus(str, Enum):
+    """创意只可被人工选择；历史批次/候选不会因新批次而覆盖。"""
+
+    CANDIDATE = "CANDIDATE"
+    SELECTED = "SELECTED"
+    REJECTED = "REJECTED"
+
+
+class CommerceReferenceIntake(Base):
+    """一个已完成 V1 分析对应的一组 Commerce 脚本和商品草稿。
+
+    ``reference_analysis_id`` 的唯一约束使 Worker 重试可幂等；分析重做会生成新的
+    ReferenceAnalysis，进而得到新的 intake / 版本，绝不修改历史资产。
+    """
+
+    __tablename__ = "commerce_reference_intakes"
+    __table_args__ = (
+        UniqueConstraint("reference_analysis_id", name="uq_commerce_reference_intake_analysis"),
+        UniqueConstraint("script_analysis_version_id", name="uq_commerce_reference_intake_script_analysis"),
+        UniqueConstraint("product_asset_version_id", name="uq_commerce_reference_intake_product_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    reference_analysis_id: Mapped[str] = mapped_column(
+        ForeignKey("reference_analyses.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    script_asset_id: Mapped[str] = mapped_column(
+        ForeignKey("script_assets.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    script_analysis_version_id: Mapped[str] = mapped_column(
+        ForeignKey("script_analysis_versions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    product_asset_id: Mapped[str] = mapped_column(
+        ForeignKey("product_assets.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    product_analysis_version_id: Mapped[str] = mapped_column(
+        ForeignKey("product_analysis_versions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    product_asset_version_id: Mapped[str] = mapped_column(
+        ForeignKey("product_asset_versions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    input_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="commerce_reference_intakes")
+
+
+class CommerceCreativeBatch(Base):
+    """固定十个原创带货创意的一次冻结生成批次。"""
+
+    __tablename__ = "commerce_creative_batches"
+    __table_args__ = (
+        UniqueConstraint("project_id", "batch_number", name="uq_commerce_creative_batch_project_number"),
+        UniqueConstraint("workflow_run_id", name="uq_commerce_creative_batch_workflow_run"),
+        CheckConstraint("batch_number >= 1", name="ck_commerce_creative_batch_number_positive"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    reference_intake_id: Mapped[str] = mapped_column(
+        ForeignKey("commerce_reference_intakes.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    workflow_run_id: Mapped[str] = mapped_column(
+        ForeignKey("workflow_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    batch_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[CommerceCreativeBatchStatus] = mapped_column(
+        SqlEnum(CommerceCreativeBatchStatus, native_enum=False, create_constraint=True),
+        default=CommerceCreativeBatchStatus.PENDING,
+        nullable=False,
+    )
+    input_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    model_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    prompt_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    raw_response: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    structured_response: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    project: Mapped[Project] = relationship(back_populates="commerce_creative_batches")
+    ideas: Mapped[list["CommerceCreativeIdea"]] = relationship(
+        back_populates="batch", cascade="all, delete-orphan", order_by="CommerceCreativeIdea.candidate_number"
+    )
+
+
+class CommerceCreativeIdea(Base):
+    """批次内可人工选择的一条创意；其 Product / Script 只从批次快照继承。"""
+
+    __tablename__ = "commerce_creative_ideas"
+    __table_args__ = (
+        UniqueConstraint("batch_id", "candidate_number", name="uq_commerce_creative_idea_batch_number"),
+        CheckConstraint("candidate_number >= 1 AND candidate_number <= 10", name="ck_commerce_creative_idea_number"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    batch_id: Mapped[str] = mapped_column(
+        ForeignKey("commerce_creative_batches.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    model_invocation_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("model_invocations.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    topic_candidate_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("topic_candidates.id", ondelete="SET NULL"), nullable=True, unique=True, index=True
+    )
+    candidate_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[CommerceCreativeIdeaStatus] = mapped_column(
+        SqlEnum(CommerceCreativeIdeaStatus, native_enum=False, create_constraint=True),
+        default=CommerceCreativeIdeaStatus.CANDIDATE,
+        nullable=False,
+    )
+    selected_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    batch: Mapped[CommerceCreativeBatch] = relationship(back_populates="ideas")
+
+
+class CommerceStoryRunInput(Base):
+    """StoryRun 所采用创意及全套上游冻结证据链的一对一快照。"""
+
+    __tablename__ = "commerce_story_run_inputs"
+
+    story_run_id: Mapped[str] = mapped_column(
+        ForeignKey("story_runs.id", ondelete="CASCADE"), primary_key=True
+    )
+    creative_batch_id: Mapped[str] = mapped_column(
+        ForeignKey("commerce_creative_batches.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    creative_idea_id: Mapped[str] = mapped_column(
+        ForeignKey("commerce_creative_ideas.id", ondelete="RESTRICT"), nullable=False, unique=True, index=True
+    )
+    reference_analysis_id: Mapped[str] = mapped_column(
+        ForeignKey("reference_analyses.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    script_analysis_version_id: Mapped[str] = mapped_column(
+        ForeignKey("script_analysis_versions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    product_asset_version_id: Mapped[str] = mapped_column(
+        ForeignKey("product_asset_versions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    input_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    story_run: Mapped[StoryRun] = relationship(back_populates="mainline_input")
+
+
+# ---------------------------------------------------------------------------
+# Commerce Slice 2：同一 StoryRun 的导演、视觉与视频生产资产。
+#
+# 这些表不替代 V1 的 ``CharacterDefinition`` / ``ShotPlan``，因为后两者的外键
+# 语义绑定 ``StoryProposal``。带货主线采用的是 ``CommerceCreativeIdea`` +
+# ``StoryRun``，强行复用会伪造一份 StoryProposal 并破坏冻结证据链。因此本组表只
+# 保存 Commerce StoryRun 的不可覆盖版本；模型调用、Prompt 与异步执行仍复用已有
+# ``WorkflowRun``、``WorkflowStep`` 和 ``ModelInvocation``。
+# ---------------------------------------------------------------------------
+
+
+class CommerceCharacterDesignVersion(Base):
+    """一版结构化角色设定；锁定后只能追加新版，不能原地覆盖。"""
+
+    __tablename__ = "commerce_character_design_versions"
+    __table_args__ = (
+        UniqueConstraint("story_run_id", "version", name="uq_commerce_character_design_version"),
+        CheckConstraint("version >= 1", name="ck_commerce_character_design_version_positive"),
+        # PostgreSQL 标识符最多 63 字符；不能依赖 SQLAlchemy 的默认长表名拼接。
+        Index("ix_ccdv_product_version", "source_product_asset_version_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    story_run_id: Mapped[str] = mapped_column(ForeignKey("story_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_outline_version_id: Mapped[str] = mapped_column(ForeignKey("story_outline_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    source_product_asset_version_id: Mapped[str] = mapped_column(ForeignKey("product_asset_versions.id", ondelete="RESTRICT"), nullable=False)
+    workflow_run_id: Mapped[Optional[str]] = mapped_column(ForeignKey("workflow_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    model_invocation_id: Mapped[Optional[str]] = mapped_column(ForeignKey("model_invocations.id", ondelete="SET NULL"), nullable=True, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # DRAFT / READY / LOCKED / SUPERSEDED / STALE / REJECTED。字符串避免修改已发布
+    # 枚举，并让历史版本可被完整保留。
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="DRAFT", index=True)
+    content: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    input_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    prompt_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    raw_response: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    locked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    stale_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class CommerceSceneDesignVersion(Base):
+    """一版结构化场景设定，明确绑定锁定角色版本和商品融入方案。"""
+
+    __tablename__ = "commerce_scene_design_versions"
+    __table_args__ = (
+        UniqueConstraint("story_run_id", "version", name="uq_commerce_scene_design_version"),
+        CheckConstraint("version >= 1", name="ck_commerce_scene_design_version_positive"),
+        Index("ix_csdev_product_version", "source_product_asset_version_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    story_run_id: Mapped[str] = mapped_column(ForeignKey("story_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_outline_version_id: Mapped[str] = mapped_column(ForeignKey("story_outline_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    character_design_version_id: Mapped[str] = mapped_column(ForeignKey("commerce_character_design_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    source_product_asset_version_id: Mapped[str] = mapped_column(ForeignKey("product_asset_versions.id", ondelete="RESTRICT"), nullable=False)
+    workflow_run_id: Mapped[Optional[str]] = mapped_column(ForeignKey("workflow_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    model_invocation_id: Mapped[Optional[str]] = mapped_column(ForeignKey("model_invocations.id", ondelete="SET NULL"), nullable=True, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="DRAFT", index=True)
+    content: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    input_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    prompt_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    raw_response: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    locked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    stale_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class CommerceStoryboardVersion(Base):
+    """AI 导演输出的一版 3--5 个独立视频片段规划。"""
+
+    __tablename__ = "commerce_storyboard_versions"
+    __table_args__ = (
+        UniqueConstraint("story_run_id", "version", name="uq_commerce_storyboard_version"),
+        CheckConstraint("version >= 1", name="ck_commerce_storyboard_version_positive"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    story_run_id: Mapped[str] = mapped_column(ForeignKey("story_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_outline_version_id: Mapped[str] = mapped_column(ForeignKey("story_outline_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    character_design_version_id: Mapped[str] = mapped_column(ForeignKey("commerce_character_design_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    scene_design_version_id: Mapped[str] = mapped_column(ForeignKey("commerce_scene_design_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    source_product_asset_version_id: Mapped[str] = mapped_column(ForeignKey("product_asset_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    workflow_run_id: Mapped[Optional[str]] = mapped_column(ForeignKey("workflow_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    model_invocation_id: Mapped[Optional[str]] = mapped_column(ForeignKey("model_invocations.id", ondelete="SET NULL"), nullable=True, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="DRAFT", index=True)
+    # ``shots`` 保留片段摘要、导演字段、商品融入节点和证据索引；每个镜头拥有稳定
+    # ``shot_id``，供后续关键帧、提示词、视频片段精确引用。
+    content: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    input_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    prompt_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    raw_response: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    locked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    stale_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class CommerceCharacterReferenceImage(Base):
+    """角色设定对应的一张可人工锁定的参考图版本。"""
+
+    __tablename__ = "commerce_character_reference_images"
+    __table_args__ = (
+        UniqueConstraint("character_design_version_id", "role_id", "version", name="uq_commerce_character_reference_image_version"),
+        CheckConstraint("version >= 1", name="ck_commerce_character_reference_image_version_positive"),
+        Index("ix_ccri_design_version", "character_design_version_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    story_run_id: Mapped[str] = mapped_column(ForeignKey("story_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    character_design_version_id: Mapped[str] = mapped_column(ForeignKey("commerce_character_design_versions.id", ondelete="CASCADE"), nullable=False)
+    role_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    workflow_run_id: Mapped[Optional[str]] = mapped_column(ForeignKey("workflow_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    model_invocation_id: Mapped[Optional[str]] = mapped_column(ForeignKey("model_invocations.id", ondelete="SET NULL"), nullable=True, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    image_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    prompt_snapshot: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    input_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="DRAFT", index=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    locked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    stale_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class CommerceSceneReferenceImage(Base):
+    """场景设定对应的一张可人工锁定的基础图版本。"""
+
+    __tablename__ = "commerce_scene_reference_images"
+    __table_args__ = (
+        UniqueConstraint("scene_design_version_id", "scene_id", "version", name="uq_commerce_scene_reference_image_version"),
+        CheckConstraint("version >= 1", name="ck_commerce_scene_reference_image_version_positive"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    story_run_id: Mapped[str] = mapped_column(ForeignKey("story_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    scene_design_version_id: Mapped[str] = mapped_column(ForeignKey("commerce_scene_design_versions.id", ondelete="CASCADE"), nullable=False, index=True)
+    scene_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    workflow_run_id: Mapped[Optional[str]] = mapped_column(ForeignKey("workflow_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    model_invocation_id: Mapped[Optional[str]] = mapped_column(ForeignKey("model_invocations.id", ondelete="SET NULL"), nullable=True, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    image_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    prompt_snapshot: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    input_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="DRAFT", index=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    locked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    stale_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class CommerceShotKeyframeVersion(Base):
+    """一个 Commerce 导演镜头的一张版本化关键帧。"""
+
+    __tablename__ = "commerce_shot_keyframe_versions"
+    __table_args__ = (
+        UniqueConstraint("storyboard_version_id", "shot_id", "version", name="uq_commerce_shot_keyframe_version"),
+        CheckConstraint("version >= 1", name="ck_commerce_shot_keyframe_version_positive"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    story_run_id: Mapped[str] = mapped_column(ForeignKey("story_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    storyboard_version_id: Mapped[str] = mapped_column(ForeignKey("commerce_storyboard_versions.id", ondelete="CASCADE"), nullable=False, index=True)
+    shot_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    shot_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    workflow_run_id: Mapped[Optional[str]] = mapped_column(ForeignKey("workflow_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    model_invocation_id: Mapped[Optional[str]] = mapped_column(ForeignKey("model_invocations.id", ondelete="SET NULL"), nullable=True, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    image_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    prompt_snapshot: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # 保存锁定角色图、场景图与冻结商品图的实际 URL/ID，而不只写在 Prompt 文字中。
+    input_asset_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="DRAFT", index=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    locked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    stale_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class CommerceVideoPromptVersion(Base):
+    """由锁定关键帧生成的一版结构化视频 Prompt。"""
+
+    __tablename__ = "commerce_video_prompt_versions"
+    __table_args__ = (
+        UniqueConstraint("storyboard_version_id", "shot_id", "version", name="uq_commerce_video_prompt_version"),
+        CheckConstraint("version >= 1", name="ck_commerce_video_prompt_version_positive"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    story_run_id: Mapped[str] = mapped_column(ForeignKey("story_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    storyboard_version_id: Mapped[str] = mapped_column(ForeignKey("commerce_storyboard_versions.id", ondelete="CASCADE"), nullable=False, index=True)
+    shot_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    shot_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    keyframe_version_id: Mapped[str] = mapped_column(ForeignKey("commerce_shot_keyframe_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    workflow_run_id: Mapped[Optional[str]] = mapped_column(ForeignKey("workflow_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    model_invocation_id: Mapped[Optional[str]] = mapped_column(ForeignKey("model_invocations.id", ondelete="SET NULL"), nullable=True, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    trace: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="DRAFT", index=True)
+    locked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    stale_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class CommerceVideoClipVersion(Base):
+    """一个独立镜头 MP4 的版本和供应商任务审计。"""
+
+    __tablename__ = "commerce_video_clip_versions"
+    __table_args__ = (
+        UniqueConstraint("storyboard_version_id", "shot_id", "version", name="uq_commerce_video_clip_version"),
+        UniqueConstraint("idempotency_key", name="uq_commerce_video_clip_idempotency"),
+        CheckConstraint("version >= 1", name="ck_commerce_video_clip_version_positive"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    story_run_id: Mapped[str] = mapped_column(ForeignKey("story_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    storyboard_version_id: Mapped[str] = mapped_column(ForeignKey("commerce_storyboard_versions.id", ondelete="CASCADE"), nullable=False, index=True)
+    shot_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    shot_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    keyframe_version_id: Mapped[str] = mapped_column(ForeignKey("commerce_shot_keyframe_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    video_prompt_version_id: Mapped[str] = mapped_column(ForeignKey("commerce_video_prompt_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    workflow_run_id: Mapped[Optional[str]] = mapped_column(ForeignKey("workflow_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    model_invocation_id: Mapped[Optional[str]] = mapped_column(ForeignKey("model_invocations.id", ondelete="SET NULL"), nullable=True, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    provider_task_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    video_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    input_asset_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING", index=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    duration_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    media_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    stale_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class CommerceFinalVideo(Base):
+    """由当前审核通过 Commerce 片段冻结导出的成片版本。"""
+
+    __tablename__ = "commerce_final_videos"
+    __table_args__ = (
+        UniqueConstraint("story_run_id", "version", name="uq_commerce_final_video_version"),
+        CheckConstraint("version >= 1", name="ck_commerce_final_video_version_positive"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    story_run_id: Mapped[str] = mapped_column(ForeignKey("story_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    storyboard_version_id: Mapped[str] = mapped_column(ForeignKey("commerce_storyboard_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    workflow_run_id: Mapped[Optional[str]] = mapped_column(ForeignKey("workflow_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    clip_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    input_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    output_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    storage_key: Mapped[Optional[str]] = mapped_column(String(512), nullable=True, unique=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING", index=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    media_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    stale_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class ProjectProductSelection(Base):
     """项目采用的具体产品版本；删除项目只删除该引用，不会删除共享产品。"""
 
@@ -727,6 +1181,9 @@ class StoryRun(Base):
         back_populates="story_run",
         cascade="all, delete-orphan",
         order_by="CommerceWorkflowLink.created_at",
+    )
+    mainline_input: Mapped[Optional["CommerceStoryRunInput"]] = relationship(
+        back_populates="story_run", cascade="all, delete-orphan", uselist=False
     )
 
 
@@ -1280,6 +1737,23 @@ class WorkflowRun(Base):
             postgresql_where=text("workflow_key LIKE 'v1_%' AND status IN ('PENDING', 'RUNNING')"),
             sqlite_where=text("workflow_key LIKE 'v1_%' AND status IN ('PENDING', 'RUNNING')"),
         ),
+        # Slice 2 的每个耗时生产操作都有一份冻结输入。该部分唯一索引把“先查询、
+        # 后创建”升级为数据库级保证：双击、页面刷新或两个 Web 请求同时抵达时，只能
+        # 保留一个活动任务。它严格限定在 commerce_production_ 命名空间，不能改变
+        # 既有 V1 视频子任务（同一父运行可并行多个镜头）的语义。
+        Index(
+            "uq_active_commerce_production_run_idempotency",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text(
+                "workflow_key LIKE 'commerce_production_%' "
+                "AND status IN ('PENDING', 'RUNNING') AND idempotency_key IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "workflow_key LIKE 'commerce_production_%' "
+                "AND status IN ('PENDING', 'RUNNING') AND idempotency_key IS NOT NULL"
+            ),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -1289,7 +1763,7 @@ class WorkflowRun(Base):
     # 新建数据库时先创建 workflow_runs 却尚未创建 workflow_definitions。
     workflow_definition_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     workflow_version: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
-    # 由创建请求确定的幂等键。真正的唯一性由 0007 的“活动任务部分唯一索引”保证，
+    # 由创建请求确定的幂等键。V1 与 Commerce 各自用部分唯一索引约束活动运行；
     # 历史运行可保留相同语义键，供制作人追溯每次人工重做。
     idempotency_key: Mapped[Optional[str]] = mapped_column(String(160), nullable=True, index=True)
     input_snapshot: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)

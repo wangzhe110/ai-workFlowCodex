@@ -506,7 +506,7 @@ def test_render_batch_reuses_existing_workflow_run(commerce_db) -> None:
 
 
 def test_alembic_commerce_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
-    """验证 Commerce 迁移链可往返，且最终只有 0014 这一个 head。"""
+    """验证 Commerce 迁移链可往返，且最终只有当前 Slice 2 head。"""
 
     server_root = Path(__file__).resolve().parents[1]
     database_path = tmp_path / "commerce-migration.db"
@@ -528,7 +528,7 @@ def test_alembic_commerce_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
 
     config = Config(str(server_root / "alembic.ini"))
     config.set_main_option("script_location", str(server_root / "migrations"))
-    assert ScriptDirectory.from_config(config).get_heads() == ["0016_commerce_phase3_integrity_hardening"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["0020_phase4_asset_center_foreign_key_repair"]
 
     run_revision("upgrade", "0010_commerce_domain_foundation")
     run_revision("upgrade", "head")
@@ -537,7 +537,11 @@ def test_alembic_commerce_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
         assert {
             "script_assets", "story_runs", "video_segment_plans", "render_batches",
             "commerce_workflow_links", "commerce_workflow_steps", "video_prompt_versions",
-            "commerce_chapter_attempt_chapters",
+            "commerce_chapter_attempt_chapters", "commerce_reference_intakes",
+            "commerce_creative_batches", "commerce_creative_ideas", "commerce_story_run_inputs",
+            "commerce_character_design_versions", "commerce_scene_design_versions", "commerce_storyboard_versions",
+            "commerce_character_reference_images", "commerce_scene_reference_images", "commerce_shot_keyframe_versions",
+            "commerce_video_prompt_versions", "commerce_video_clip_versions", "commerce_final_videos",
         }.issubset(
             inspect(migration_engine).get_table_names()
         )
@@ -552,6 +556,7 @@ def test_alembic_commerce_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
         assert "video_prompt_versions" not in inspect(migration_engine).get_table_names()
         assert "commerce_workflow_links" not in inspect(migration_engine).get_table_names()
         assert "commerce_workflow_steps" not in inspect(migration_engine).get_table_names()
+        assert "commerce_storyboard_versions" not in inspect(migration_engine).get_table_names()
         assert "story_run_id" not in {column["name"] for column in inspect(migration_engine).get_columns("workflow_runs")}
     finally:
         migration_engine.dispose()
@@ -572,6 +577,7 @@ def test_alembic_commerce_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
         assert "product_identification" in {
             column["name"] for column in inspect(migration_engine).get_columns("product_analysis_versions")
         }
+        assert "commerce_final_videos" in inspect(migration_engine).get_table_names()
     finally:
         migration_engine.dispose()
 

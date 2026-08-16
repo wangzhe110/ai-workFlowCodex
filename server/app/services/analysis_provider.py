@@ -4,17 +4,24 @@
 名称与响应格式在本模块归一化，避免供应商细节渗入选题、故事或分镜流程。
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
+from hashlib import sha256
 import json
 import os
+import struct
 from typing import Any, Optional, Protocol
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from app.services.video_audio_service import ExtractedVideoAudio
 from app.services.video_frame_service import SampledVideoFrame
+from app.core.config import settings
+from app.services.sensitive_data import sanitize_error_summary
+from app.services.storage import LocalImageReference
 
 
 @dataclass(frozen=True)
@@ -629,6 +636,557 @@ class OpenAICompatibleImageProvider:
         raise RuntimeError("图片中转站响应缺少 url 或 b64_json")
 
 
+@dataclass(frozen=True)
+class ImageTaskResult:
+    """异步图片供应商任务的标准化状态。
+
+    图片队列和视频队列一样会先返回 ``provider_task_id``。业务层把它落入
+    ``ModelInvocation`` 后才进行轮询，Worker 重新执行时便能继续查询而不会再次
+    提交已经可能扣费的请求。同步 OpenAI 兼容图片协议也用同一结构返回成功态，
+    这样调用方无需依赖供应商协议分支。
+    """
+
+    provider_task_id: str | None
+    status: str
+    image_url: Optional[str] = None
+    error_message: Optional[str] = None
+    content_type: Optional[str] = None
+    byte_size: Optional[int] = None
+    sha256: Optional[str] = None
+    # 方舟只返回会过期的签名 URL。图片二进制仅在当前 Worker 内存中短暂保存，
+    # 交给资产存储后即丢弃，绝不能把该 URL 写入审计、错误或业务资产记录。
+    image_bytes: bytes | None = field(default=None, repr=False)
+    width: int | None = None
+    height: int | None = None
+
+
+class ImageGenerationProvider(Protocol):
+    """图片任务的最小异步边界；不把 Fal 的响应结构泄漏到工作流。"""
+
+    provider_key: str
+    model_key: str
+
+    def submit(self, prompt: str, *, reference_image_urls: Optional[list[str]] = None) -> ImageTaskResult:
+        """提交一次图片任务，返回已标准化的任务状态。"""
+
+    def poll(self, provider_task_id: str) -> ImageTaskResult:
+        """查询一次已提交图片任务，绝不再次提交。"""
+
+
+class FalQueueImageProvider:
+    """云雾 Nano Banana 的最小 Fal 队列适配器。
+
+    当前只实现 ``/fal-ai/nano-banana`` 的提交、状态查询、结果读取与单张图片
+    下载校验，不把它扩展成通用 Fal SDK。鉴权请求永远发往 ``https://yunwu.ai``；
+    返回的 Fal 队列路径会被换源回云雾，最终图片下载则不携带模型鉴权头。
+    """
+
+    provider_key = "fal_queue_image"
+    _ORIGIN = "https://yunwu.ai"
+    _TASK_PREFIX = "/fal-ai/nano-banana/requests/"
+    _SUBMIT_PATH = "/fal-ai/nano-banana"
+
+    def __init__(self, model_profile_snapshot: dict[str, Any]) -> None:
+        self.model_key = str(model_profile_snapshot["model_key"])
+        self.provider_config = model_profile_snapshot.get("provider_config") or {}
+        self._task_paths: dict[str, tuple[str, str]] = {}
+
+    def submit(self, prompt: str, *, reference_image_urls: Optional[list[str]] = None) -> ImageTaskResult:
+        """向云雾提交一次 Nano Banana 队列任务，并只接受稳定的 request_id。"""
+
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise RuntimeError("图片生成提示词不能为空")
+        payload: dict[str, Any] = {"prompt": prompt.strip()}
+        references = reference_image_urls or []
+        if not isinstance(references, list) or not all(isinstance(item, str) and item for item in references):
+            raise RuntimeError("reference_image_urls 必须是非空字符串数组")
+        if references:
+            for value in references:
+                self._require_https(value, "参考图地址")
+            # Nano Banana 队列协议只接受这一项固定字段，避免让业务层猜测 Fal 参数。
+            payload["image_urls"] = references
+
+        response = _post_json(
+            self._endpoint(self._SUBMIT_PATH),
+            self._api_key(),
+            payload,
+            _request_timeout_seconds(self.provider_config),
+        )
+        task_id = self._task_id(response)
+        status_path = self._fal_path(response.get("status_url"), self._status_path(task_id))
+        result_path = self._fal_path(response.get("response_url"), self._result_path(task_id))
+        self._task_paths[task_id] = (status_path, result_path)
+        return self._result_from_status(response, task_id=task_id, result_path=result_path)
+
+    def poll(self, provider_task_id: str) -> ImageTaskResult:
+        """查询已存在的任务；恢复执行时按 request_id 使用固定云雾队列路径。"""
+
+        task_id = self._require_task_id(provider_task_id)
+        status_path, result_path = self._task_paths.get(
+            task_id,
+            (self._status_path(task_id), self._result_path(task_id)),
+        )
+        response = _get_json(
+            self._endpoint(status_path),
+            self._api_key(),
+            _request_timeout_seconds(self.provider_config),
+        )
+        return self._result_from_status(response, task_id=task_id, result_path=result_path)
+
+    def _result_from_status(
+        self,
+        payload: dict[str, Any],
+        *,
+        task_id: str,
+        result_path: str,
+    ) -> ImageTaskResult:
+        state = self._state(payload)
+        if state == "PENDING":
+            return ImageTaskResult(provider_task_id=task_id, status="PENDING")
+        if state == "FAILED":
+            return ImageTaskResult(
+                provider_task_id=task_id,
+                status="FAILED",
+                error_message=self._error_message(payload),
+            )
+        result_payload = _get_json(
+            self._endpoint(result_path),
+            self._api_key(),
+            _request_timeout_seconds(self.provider_config),
+        )
+        image_url = self._image_url(result_payload)
+        content_type, byte_size, digest = self._download_and_validate(image_url)
+        return ImageTaskResult(
+            provider_task_id=task_id,
+            status="SUCCEEDED",
+            image_url=image_url,
+            content_type=content_type,
+            byte_size=byte_size,
+            sha256=digest,
+        )
+
+    def _endpoint(self, path: str) -> str:
+        """仅把 Authorization 发送到云雾固定 HTTPS 域名。"""
+
+        base = self.provider_config.get("api_base_url")
+        if not isinstance(base, str):
+            raise RuntimeError("Fal 图片模型配置缺少 api_base_url")
+        parts = urlsplit(base)
+        if (
+            parts.scheme != "https"
+            or parts.netloc != "yunwu.ai"
+            or parts.path not in {"", "/"}
+            or parts.query
+            or parts.fragment
+        ):
+            raise RuntimeError("Fal 图片模型 api_base_url 必须是 https://yunwu.ai")
+        if not isinstance(path, str) or not path.startswith("/") or not path.startswith("/fal-ai/nano-banana"):
+            raise RuntimeError("Fal 图片队列路径无效")
+        return f"{self._ORIGIN}{path}"
+
+    def _api_key(self) -> str:
+        secret_env_name = self.provider_config.get("secret_env_name")
+        if not isinstance(secret_env_name, str) or not secret_env_name.strip():
+            raise RuntimeError("Fal 图片模型配置缺少 secret_env_name")
+        api_key = os.getenv(secret_env_name)
+        if not api_key:
+            raise RuntimeError(f"服务器环境变量 {secret_env_name} 未设置")
+        return api_key
+
+    @classmethod
+    def _require_task_id(cls, value: str) -> str:
+        if not isinstance(value, str) or not value.strip() or len(value) > 255:
+            raise RuntimeError("Fal 图片任务缺少有效 request_id")
+        return value.strip()
+
+    @classmethod
+    def _task_id(cls, payload: dict[str, Any]) -> str:
+        for key in ("request_id", "id"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return cls._require_task_id(value)
+        raise RuntimeError("Fal 图片提交响应缺少 request_id")
+
+    @classmethod
+    def _status_path(cls, task_id: str) -> str:
+        return f"{cls._TASK_PREFIX}{quote(task_id, safe='')}/status"
+
+    @classmethod
+    def _result_path(cls, task_id: str) -> str:
+        return f"{cls._TASK_PREFIX}{quote(task_id, safe='')}"
+
+    @classmethod
+    def _fal_path(cls, raw_url: Any, fallback: str) -> str:
+        """把 Fal 返回地址限定为同一模型路径，并以云雾作为唯一鉴权源。"""
+
+        if raw_url is None:
+            return fallback
+        if not isinstance(raw_url, str) or not raw_url.strip():
+            raise RuntimeError("Fal 图片队列返回了无效状态地址")
+        parts = urlsplit(raw_url)
+        if parts.scheme != "https" or not parts.netloc or not parts.path.startswith(cls._TASK_PREFIX):
+            raise RuntimeError("Fal 图片队列返回了不受支持的状态地址")
+        # 绝不携带返回 URL 的 query，避免把可能的临时签名传播到审计或日志。
+        return parts.path
+
+    @staticmethod
+    def _state(payload: dict[str, Any]) -> str:
+        raw = payload.get("status", payload.get("state"))
+        if not isinstance(raw, str) or not raw.strip():
+            # 提交接口部分实现不会给初始状态；此时安全地当作待处理，而不是重复提交。
+            return "PENDING"
+        normalized = raw.strip().lower()
+        if normalized in {"completed", "succeeded", "success", "done"}:
+            return "SUCCEEDED"
+        if normalized in {"failed", "error", "cancelled", "canceled"}:
+            return "FAILED"
+        return "PENDING"
+
+    @staticmethod
+    def _error_message(payload: dict[str, Any]) -> str:
+        for value in (payload.get("error"), payload.get("detail"), payload.get("message")):
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:500]
+            if isinstance(value, dict):
+                nested = value.get("message") or value.get("detail")
+                if isinstance(nested, str) and nested.strip():
+                    return nested.strip()[:500]
+        return "Fal 图片任务失败"
+
+    @classmethod
+    def _image_url(cls, payload: dict[str, Any]) -> str:
+        candidates = (
+            (payload.get("images") or [{}])[0] if isinstance(payload.get("images"), list) and payload.get("images") else None,
+            ((payload.get("data") or {}).get("images") or [{}])[0]
+            if isinstance(payload.get("data"), dict) and isinstance((payload.get("data") or {}).get("images"), list) and (payload.get("data") or {}).get("images")
+            else None,
+            ((payload.get("output") or {}).get("images") or [{}])[0]
+            if isinstance(payload.get("output"), dict) and isinstance((payload.get("output") or {}).get("images"), list) and (payload.get("output") or {}).get("images")
+            else None,
+            payload.get("image"),
+        )
+        for item in candidates:
+            value = item.get("url") if isinstance(item, dict) else item
+            if isinstance(value, str) and value.strip():
+                cls._require_https(value, "Fal 图片结果地址")
+                return value.strip()
+        raise RuntimeError("Fal 图片结果缺少单张图片 URL")
+
+    @staticmethod
+    def _require_https(value: str, label: str) -> None:
+        parts = urlsplit(value)
+        if parts.scheme != "https" or not parts.netloc:
+            raise RuntimeError(f"{label}必须是 HTTPS 地址")
+
+    @classmethod
+    def _download_and_validate(cls, image_url: str) -> tuple[str, int, str]:
+        """无鉴权下载一张图片，并同时校验 MIME、文件头和大小。"""
+
+        cls._require_https(image_url, "Fal 图片结果地址")
+        timeout = min(max(settings.generated_image_download_timeout_seconds, 1), 300)
+        request = Request(image_url, headers={"Accept": "image/*"}, method="GET")
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                final_url = response.geturl()
+                cls._require_https(final_url, "图片下载重定向地址")
+                content_type = response.headers.get_content_type()
+                if content_type not in {"image/png", "image/jpeg", "image/webp"}:
+                    raise RuntimeError("Fal 图片下载响应 MIME 类型不受支持")
+                length = response.headers.get("Content-Length")
+                if length and int(length) > settings.generated_image_max_bytes:
+                    raise RuntimeError("Fal 图片超过 GENERATED_IMAGE_MAX_BYTES 限制")
+                content = response.read(settings.generated_image_max_bytes + 1)
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError("无法下载 Fal 图片结果") from exc
+        if not content or len(content) > settings.generated_image_max_bytes:
+            raise RuntimeError("Fal 图片为空或超过 GENERATED_IMAGE_MAX_BYTES 限制")
+        detected = cls._image_mime_from_magic(content)
+        if detected != content_type:
+            raise RuntimeError("Fal 图片 MIME 类型与文件头不一致")
+        return content_type, len(content), sha256(content).hexdigest()
+
+    @staticmethod
+    def _image_mime_from_magic(content: bytes) -> str:
+        if content.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if content.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+            return "image/webp"
+        raise RuntimeError("Fal 图片文件头不是受支持的 PNG、JPEG 或 WebP")
+
+
+class VolcengineArkImageProvider:
+    """火山方舟 Seedream 单图与本地参考图适配器。
+
+    对纯文本请求仍维持官方 ``/api/v3/images/generations`` 的单图协议；参考图仅
+    接受 :class:`LocalImageReference`，其 Data URL 只能由本地存储边界在 Worker
+    内存中构造。临时 Data URL 与供应商结果 URL 都不会进入任何持久化对象。
+    """
+
+    provider_key = "volcengine_ark_image"
+    _BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+    _SUPPORTED_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
+
+    def __init__(self, model_profile_snapshot: dict[str, Any]) -> None:
+        self.model_key = str(model_profile_snapshot["model_key"])
+        self.provider_config = model_profile_snapshot.get("provider_config") or {}
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        reference_image_urls: Optional[list[str]] = None,
+        reference_images: Optional[list[LocalImageReference]] = None,
+    ) -> ImageTaskResult:
+        """只提交一次 Seedream 文生图或本地参考图生图请求并下载结果进内存。
+
+        图片 POST 不做自动重试。发生网络、协议、下载或解析错误时由工作流记录
+        失败，操作者通过现有的“重新生成”动作新建一次明确的付费调用。
+        """
+
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise RuntimeError("图片生成提示词不能为空")
+        legacy_references = reference_image_urls or []
+        if not isinstance(legacy_references, list) or not all(
+            isinstance(item, str) and item for item in legacy_references
+        ):
+            raise RuntimeError("reference_image_urls 必须是非空字符串数组")
+        if legacy_references:
+            # 不能让 127.0.0.1、Docker 地址、本机路径或任意用户 URL 进入方舟；图
+            # 生图必须经 LocalAssetStorage 验证后成为 LocalImageReference。
+            raise RuntimeError("方舟参考图必须使用经本地资产校验的 reference_images")
+        references = self._validate_reference_images(reference_images or [])
+
+        prompt_text = prompt.strip()
+        if references:
+            prompt_text = self._reference_aware_prompt(prompt_text, references)
+
+        payload = {
+            "model": self.model_key,
+            "prompt": prompt_text,
+            "size": self._config_value("size", "2K"),
+            "sequential_image_generation": self._config_value("sequential_image_generation", "disabled"),
+            "response_format": self._config_value("response_format", "url"),
+            "watermark": self._config_value("watermark", False),
+        }
+        if len(references) == 1:
+            payload["image"] = references[0].data_url
+        elif references:
+            payload["image"] = [reference.data_url for reference in references]
+        response_payload = _post_json(
+            self._endpoint(),
+            self._api_key(),
+            payload,
+            _request_timeout_seconds(self.provider_config),
+        )
+        image_url = self._result_url(response_payload)
+        content_type, content, width, height = self._download_and_validate(image_url)
+        return ImageTaskResult(
+            provider_task_id=None,
+            status="SUCCEEDED",
+            content_type=content_type,
+            byte_size=len(content),
+            sha256=sha256(content).hexdigest(),
+            image_bytes=content,
+            width=width,
+            height=height,
+        )
+
+    @staticmethod
+    def _validate_reference_images(references: list[LocalImageReference]) -> list[LocalImageReference]:
+        """验证内存参考图数量、类型与稳定的角色→场景排序。"""
+
+        if len(references) > 14:
+            raise RuntimeError("方舟参考图最多允许 14 张")
+        if not all(isinstance(item, LocalImageReference) for item in references):
+            raise RuntimeError("方舟参考图必须由本地资产存储解析")
+        seen_hashes: set[str] = set()
+        normalized: list[LocalImageReference] = []
+        for item in references:
+            if item.role not in {"character", "scene"}:
+                raise RuntimeError("方舟参考图角色只能是 character 或 scene")
+            if item.sha256 in seen_hashes:
+                continue
+            seen_hashes.add(item.sha256)
+            normalized.append(item)
+        if any(item.role == "scene" for item in normalized):
+            first_scene = next(index for index, item in enumerate(normalized) if item.role == "scene")
+            if any(item.role != "scene" for item in normalized[first_scene:]):
+                raise RuntimeError("方舟参考图必须按角色图在前、场景图在后的稳定顺序传入")
+        return normalized
+
+    @staticmethod
+    def _reference_aware_prompt(prompt: str, references: list[LocalImageReference]) -> str:
+        """明确规定当前 Run 1 中两类参考图的视觉职责。"""
+
+        character_count = sum(item.role == "character" for item in references)
+        scene_count = sum(item.role == "scene" for item in references)
+        if len(references) == 2 and character_count == 1 and scene_count == 1:
+            instruction = (
+                "参考图1是角色参考图：严格保持其外貌、发型、服装和配色；"
+                "参考图2是场景参考图：严格保持地点、布局、光线、色调与镜头方向。"
+                "把参考图1中的角色自然置入参考图2的场景，生成一个连续的电影分镜关键帧。"
+            )
+        else:
+            instruction = (
+                f"前 {character_count} 张参考图是角色参考图，必须保持人物外观和服装；"
+                f"后 {scene_count} 张参考图是场景参考图，必须保持环境、布局与光线。"
+                "按照该固定顺序融合为连续的电影分镜关键帧。"
+            )
+        return f"{prompt}\n\n{instruction}"
+
+    def _endpoint(self) -> str:
+        configured = self.provider_config.get("api_base_url")
+        if not isinstance(configured, str) or configured.rstrip("/") != self._BASE_URL:
+            raise RuntimeError("方舟 Seedream 图片模型 API 地址必须为 https://ark.cn-beijing.volces.com/api/v3")
+        # 不复用通用 OpenAI 地址拼接器，避免意外生成 /api/v3/v1/images/generations。
+        return f"{configured.rstrip('/')}/images/generations"
+
+    def _api_key(self) -> str:
+        secret_env_name = self.provider_config.get("secret_env_name")
+        if secret_env_name != "ARK_API_KEY":
+            raise RuntimeError("方舟 Seedream 图片模型必须使用 ARK_API_KEY")
+        api_key = os.getenv(secret_env_name)
+        if not api_key:
+            raise RuntimeError("服务器环境变量 ARK_API_KEY 未设置")
+        return api_key
+
+    def _config_value(self, field_name: str, default: Any) -> Any:
+        value = self.provider_config.get(field_name, default)
+        if field_name == "size" and value != "2K":
+            raise RuntimeError("方舟 Seedream V1 图片尺寸必须为 2K")
+        if field_name == "sequential_image_generation" and value != "disabled":
+            raise RuntimeError("方舟 Seedream V1 必须关闭 sequential_image_generation")
+        if field_name == "response_format" and value != "url":
+            raise RuntimeError("方舟 Seedream V1 必须使用 response_format=url")
+        if field_name == "watermark" and value is not False:
+            raise RuntimeError("方舟 Seedream V1 必须设置 watermark=false")
+        return value
+
+    @staticmethod
+    def _result_url(payload: dict[str, Any]) -> str:
+        try:
+            image_url = payload["data"][0]["url"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError("方舟 Seedream 响应缺少 data[0].url") from exc
+        if not isinstance(image_url, str) or not image_url.strip():
+            raise RuntimeError("方舟 Seedream 返回的图片 URL 无效")
+        VolcengineArkImageProvider._require_https(image_url, "方舟图片结果地址")
+        return image_url.strip()
+
+    @classmethod
+    def _download_and_validate(cls, image_url: str) -> tuple[str, bytes, int, int]:
+        """无鉴权下载临时图片，校验后只返回内存字节，不返回临时 URL。"""
+
+        cls._require_https(image_url, "方舟图片结果地址")
+        timeout = min(max(settings.generated_image_download_timeout_seconds, 1), 300)
+        request = Request(image_url, headers={"Accept": "image/*"}, method="GET")
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                if response.getcode() != 200:
+                    raise RuntimeError("方舟图片下载未返回 HTTP 200")
+                cls._require_https(response.geturl(), "图片下载重定向地址")
+                content_type = response.headers.get_content_type()
+                if content_type not in cls._SUPPORTED_MIME_TYPES:
+                    raise RuntimeError("方舟图片下载响应 MIME 类型不受支持")
+                length = response.headers.get("Content-Length")
+                if length and int(length) > settings.generated_image_max_bytes:
+                    raise RuntimeError("方舟图片超过 GENERATED_IMAGE_MAX_BYTES 限制")
+                content = response.read(settings.generated_image_max_bytes + 1)
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError("无法下载方舟 Seedream 图片结果") from exc
+        if not content or len(content) > settings.generated_image_max_bytes:
+            raise RuntimeError("方舟图片为空或超过 GENERATED_IMAGE_MAX_BYTES 限制")
+        detected = cls._image_mime_from_magic(content)
+        if detected != content_type:
+            raise RuntimeError("方舟图片 MIME 类型与文件头不一致")
+        width, height = cls._image_dimensions(content, detected)
+        return content_type, content, width, height
+
+    @staticmethod
+    def _require_https(value: str, label: str) -> None:
+        parts = urlsplit(value)
+        if parts.scheme != "https" or not parts.netloc:
+            raise RuntimeError(f"{label}必须是 HTTPS 地址")
+
+    @staticmethod
+    def _image_mime_from_magic(content: bytes) -> str:
+        if content.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if content.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+            return "image/webp"
+        raise RuntimeError("方舟图片文件头不是受支持的 PNG、JPEG 或 WebP")
+
+    @classmethod
+    def _image_dimensions(cls, content: bytes, content_type: str) -> tuple[int, int]:
+        if content_type == "image/png":
+            if len(content) < 24 or content[12:16] != b"IHDR":
+                raise RuntimeError("PNG 图片缺少 IHDR 尺寸信息")
+            width, height = struct.unpack(">II", content[16:24])
+        elif content_type == "image/jpeg":
+            width, height = cls._jpeg_dimensions(content)
+        else:
+            width, height = cls._webp_dimensions(content)
+        if width <= 0 or height <= 0:
+            raise RuntimeError("图片尺寸无效")
+        return width, height
+
+    @staticmethod
+    def _jpeg_dimensions(content: bytes) -> tuple[int, int]:
+        cursor = 2
+        sof_markers = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+        while cursor + 9 <= len(content):
+            if content[cursor] != 0xFF:
+                cursor += 1
+                continue
+            while cursor < len(content) and content[cursor] == 0xFF:
+                cursor += 1
+            if cursor >= len(content):
+                break
+            marker = content[cursor]
+            cursor += 1
+            if marker in {0xD8, 0xD9}:
+                continue
+            if cursor + 2 > len(content):
+                break
+            length = int.from_bytes(content[cursor : cursor + 2], "big")
+            if length < 2 or cursor + length > len(content):
+                break
+            if marker in sof_markers and length >= 7:
+                return (
+                    int.from_bytes(content[cursor + 5 : cursor + 7], "big"),
+                    int.from_bytes(content[cursor + 3 : cursor + 5], "big"),
+                )
+            cursor += length
+        raise RuntimeError("JPEG 图片缺少尺寸信息")
+
+    @staticmethod
+    def _webp_dimensions(content: bytes) -> tuple[int, int]:
+        if len(content) < 30:
+            raise RuntimeError("WebP 图片缺少尺寸信息")
+        chunk = content[12:16]
+        if chunk == b"VP8X":
+            return (int.from_bytes(content[24:27], "little") + 1, int.from_bytes(content[27:30], "little") + 1)
+        if chunk == b"VP8L" and len(content) >= 25 and content[20] == 0x2F:
+            value = int.from_bytes(content[21:25], "little")
+            return ((value & 0x3FFF) + 1, ((value >> 14) & 0x3FFF) + 1)
+        if chunk == b"VP8 ":
+            marker = content.find(b"\x9d\x01\x2a")
+            if marker >= 0 and marker + 7 <= len(content):
+                return (
+                    int.from_bytes(content[marker + 3 : marker + 5], "little") & 0x3FFF,
+                    int.from_bytes(content[marker + 5 : marker + 7], "little") & 0x3FFF,
+                )
+        raise RuntimeError("WebP 图片缺少尺寸信息")
+
+
 def _chat_completions_url(api_base_url: str) -> str:
     """兼容填写根地址、/v1 地址或完整 chat/completions 地址三种配置方式。"""
 
@@ -773,7 +1331,7 @@ def _post_multipart(
         with urlopen(request, timeout=timeout) as response:
             response_payload = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace")[:500]
+        error_body = sanitize_error_summary(exc.read().decode("utf-8", errors="replace"), max_length=500)
         raise RuntimeError(f"语音转写请求失败（HTTP {exc.code}）：{error_body}") from exc
     except URLError as exc:
         raise RuntimeError("无法连接语音转写服务，请检查 api_base_url 或网络") from exc
@@ -820,9 +1378,9 @@ def _authorized_json_request(
         with urlopen(request, timeout=timeout) as response:
             response_payload = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace")[:500]
+        error_body = sanitize_error_summary(exc.read().decode("utf-8", errors="replace"), max_length=500)
         raise RuntimeError(f"中转站请求失败（HTTP {exc.code}）：{error_body}") from exc
-    except URLError as exc:
+    except (URLError, OSError) as exc:
         raise RuntimeError("无法连接中转站，请检查 api_base_url 或网络") from exc
     except json.JSONDecodeError as exc:
         raise RuntimeError("中转站返回的不是 JSON 响应") from exc
@@ -882,6 +1440,10 @@ class VideoGenerationInput:
     end_shot_number: int
     prompt: str
     image_urls: list[str]
+    # 单机部署的本地关键帧不能由方舟云端直接读取。Commerce Worker 可在调用期间
+    # 传入经过 LocalAssetStorage 校验的内存参考图；该对象不允许进入任何 JSON
+    # 快照、日志或持久化模型。
+    reference_images: list[LocalImageReference] = field(default_factory=list)
 
 
 class VideoGenerationProvider(Protocol):
@@ -964,7 +1526,7 @@ class VolcengineArkVideoProvider:
     def submit(self, request: VideoGenerationInput) -> VideoTaskResult:
         """以视频提示词和首帧图片创建方舟异步视频任务。"""
 
-        first_frame_url = self._public_image_url(request.image_urls[0])
+        first_frame_url = self._first_frame_url(request)
         content: list[dict[str, Any]] = [
             {"type": "text", "text": request.prompt},
             {
@@ -983,14 +1545,17 @@ class VolcengineArkVideoProvider:
             )
 
         payload: dict[str, Any] = {"model": self.model_key, "content": content}
-        # 只映射 SDK 明确支持、且不会泄露密钥的固定生产参数。
-        for option in ("ratio", "duration", "resolution", "generate_audio", "watermark", "return_last_frame", "seed"):
+        # Seedance 对含 ``first_frame`` 的图生视频从首帧本身推导画幅。真实方舟会
+        # 拒绝同发 ``ratio``（InvalidParameter.TaskTypeConstraint），因此此处只
+        # 映射其余固定生产参数。保留 Profile 中的 ratio 是为了历史快照兼容，不能
+        # 把它作为首帧图生视频请求字段发给供应商。
+        for option in ("duration", "resolution", "generate_audio", "watermark", "return_last_frame", "seed"):
             value = self.provider_config.get(option)
             if value is not None:
                 payload[option] = value
 
         response_payload = _post_json(
-            f"{self._BASE_URL}/contents/generations/tasks",
+            self._endpoint(),
             self._api_key(),
             payload,
             _request_timeout_seconds(self.provider_config),
@@ -1023,7 +1588,7 @@ class VolcengineArkVideoProvider:
             if not isinstance(video_url, str) or not video_url.startswith(("https://", "http://")):
                 raise RuntimeError("火山方舟任务已成功但未返回可访问的视频地址")
             return VideoTaskResult(provider_task_id=stable_task_id, status="SUCCEEDED", video_url=video_url)
-        if normalized_status in {"failed", "cancelled", "canceled"}:
+        if normalized_status in {"failed", "cancelled", "canceled", "expired"}:
             error = response_payload.get("error")
             message = error.get("message") if isinstance(error, dict) else None
             return VideoTaskResult(
@@ -1031,15 +1596,38 @@ class VolcengineArkVideoProvider:
                 status="FAILED",
                 error_message=message if isinstance(message, str) and message else f"火山方舟任务状态：{raw_status}",
             )
-        # queued、running 等非终态都由 Worker 按固定间隔继续轮询。
-        return VideoTaskResult(provider_task_id=stable_task_id, status="PENDING")
+        if normalized_status in {"queued", "running"}:
+            # queued、running 等非终态都由 Worker 按固定间隔继续轮询。
+            return VideoTaskResult(provider_task_id=stable_task_id, status="PENDING")
+        raise RuntimeError("火山方舟任务返回未知状态")
+
+    def _endpoint(self) -> str:
+        configured = self.provider_config.get("api_base_url")
+        if not isinstance(configured, str) or configured.rstrip("/") != self._BASE_URL:
+            raise RuntimeError("火山方舟视频模型 API 地址必须为 https://ark.cn-beijing.volces.com/api/v3")
+        return f"{configured.rstrip('/')}/contents/generations/tasks"
+
+    @staticmethod
+    def _first_frame_url(request: VideoGenerationInput) -> str:
+        """选取唯一首帧；本地资产仅能以短暂 Data URL 交给方舟。"""
+
+        if request.reference_images:
+            if len(request.reference_images) != 1:
+                raise RuntimeError("方舟视频最小验收只支持一张首帧参考图")
+            first_frame = request.reference_images[0]
+            if first_frame.role != "first_frame" or not first_frame.data_url.startswith("data:image/"):
+                raise RuntimeError("方舟视频首帧必须是经过本地资产校验的图片")
+            return first_frame.data_url
+        if not request.image_urls:
+            raise RuntimeError("豆包图生视频缺少首帧图片")
+        return VolcengineArkVideoProvider._public_image_url(request.image_urls[0])
 
     def _api_key(self) -> str:
         """只从服务器环境读取 ARK Key，不保存或回显真实密钥。"""
 
-        secret_env_name = self.provider_config.get("secret_env_name", "ARK_API_KEY")
-        if not isinstance(secret_env_name, str) or not secret_env_name:
-            raise RuntimeError("火山方舟视频配置缺少密钥环境变量名称")
+        secret_env_name = self.provider_config.get("secret_env_name")
+        if secret_env_name != "ARK_API_KEY":
+            raise RuntimeError("火山方舟视频必须使用 ARK_API_KEY")
         api_key = os.getenv(secret_env_name)
         if not api_key:
             raise RuntimeError(f"服务器环境变量 {secret_env_name} 未设置")

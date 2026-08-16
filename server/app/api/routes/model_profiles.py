@@ -24,6 +24,7 @@ from app.services.model_profile_service import (
     list_model_profiles,
     preflight_model_profile,
 )
+from app.services.provider_config_security import redact_provider_config
 
 
 router = APIRouter(prefix="/api/v1/model-profiles", tags=["模型配置"])
@@ -38,7 +39,7 @@ def _response(profile) -> ModelProfileResponse:
         provider_key=profile.provider_key,
         model_key=profile.model_key,
         version=profile.version,
-        provider_config=profile.provider_config,
+        provider_config=redact_provider_config(profile.provider_config),
         is_active=profile.is_active,
         adapter_available=is_adapter_available(
             profile.step_key,

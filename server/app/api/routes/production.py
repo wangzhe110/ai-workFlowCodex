@@ -22,8 +22,11 @@ from app.models import (
     ShotKeyframe,
     ShotAssetBinding,
     ShotPlan,
+    StoryGenerationBatch,
     StoryProposal,
     VideoClip,
+    ProductAssetVersion,
+    StoryRunMode,
 )
 from app.schemas import (
     CharacterReferenceImageV1Response,
@@ -39,6 +42,11 @@ from app.schemas import (
     VideoClipV1Response,
     V1GenerationRunRequest,
     WorkflowRunResponse,
+    CommerceCreativeBatchResponse,
+    CommerceCreativeIdeaResponse,
+    CommerceCreativeIdeaSelectRequest,
+    CommerceProductConfirmRequest,
+    CommerceReferenceIntakeResponse,
 )
 from app.api.routes.projects import _run_response
 from app.services.worker_runtime import dispatch_v1_video_children, dispatch_workflow
@@ -57,6 +65,14 @@ from app.services.v1_production_service import (
     select_story_proposal,
 )
 from app.services.v1_trace_service import list_project_invocation_traces
+from app.services.commerce_mainline_service import (
+    confirm_and_freeze_product_draft,
+    list_creative_batches,
+    list_reference_intakes,
+    select_creative_idea,
+)
+from app.services.commerce_workflow_service import start_story_run
+from app.services.sensitive_data import redact_sensitive_data
 
 
 router = APIRouter(prefix="/api/v1/production", tags=["V1 生产台"])
@@ -66,6 +82,13 @@ def _enum_value(value) -> str:
     """兼容 SQLAlchemy 枚举和旧表字符串字段。"""
 
     return value.value if hasattr(value, "value") else str(value)
+
+
+def _safe_snapshot(value):
+    """防御历史异常数据，避免 Data URL 或敏感值随审核接口回显。"""
+
+    redacted = redact_sensitive_data(value or {})
+    return redacted if isinstance(redacted, dict) else {}
 
 
 def _state_response(state) -> ProductionStateResponse:
@@ -94,7 +117,7 @@ def _analysis_response(item: ReferenceAnalysis) -> ReferenceAnalysisResponse:
         creative_brief=item.creative_brief,
         generation_status=_enum_value(item.generation_status),
         review_status=_enum_value(item.review_status),
-        locked_snapshot=item.locked_snapshot,
+        locked_snapshot=_safe_snapshot(item.locked_snapshot),
         locked_at=item.locked_at,
         created_at=item.created_at,
         updated_at=item.updated_at,
@@ -112,6 +135,45 @@ def _story_response(item: StoryProposal) -> StoryProposalV1Response:
         status=_enum_value(item.status),
         created_at=item.created_at,
     )
+
+
+def _commerce_intake_response(item) -> CommerceReferenceIntakeResponse:
+    product = item.product_asset_version_id
+    # 状态来自 intake 快照不可靠；使用被 intake 指向的版本实体，且只用于显示。
+    # 路由会在调用处提供同一 Session，无需再次回读任何“当前产品”指针。
+    return CommerceReferenceIntakeResponse(
+        id=item.id, project_id=item.project_id, reference_analysis_id=item.reference_analysis_id,
+        script_asset_id=item.script_asset_id, script_analysis_version_id=item.script_analysis_version_id,
+        product_asset_id=item.product_asset_id, product_analysis_version_id=item.product_analysis_version_id,
+        product_asset_version_id=product, product_status=getattr(item, "_product_status", "DRAFT"),
+        product_frozen_at=getattr(item, "_product_frozen_at", None), input_snapshot=_safe_snapshot(item.input_snapshot),
+        created_at=item.created_at, updated_at=item.updated_at,
+    )
+
+
+def _commerce_batch_response(item) -> CommerceCreativeBatchResponse:
+    return CommerceCreativeBatchResponse(
+        id=item.id, project_id=item.project_id, reference_intake_id=item.reference_intake_id,
+        workflow_run_id=item.workflow_run_id, batch_number=item.batch_number, status=_enum_value(item.status),
+        input_snapshot=_safe_snapshot(item.input_snapshot), model_snapshot=_safe_snapshot(item.model_snapshot), prompt_snapshot=_safe_snapshot(item.prompt_snapshot),
+        error_message=item.error_message, created_at=item.created_at, finished_at=item.finished_at,
+        ideas=[
+            CommerceCreativeIdeaResponse(
+                id=idea.id, batch_id=idea.batch_id, project_id=idea.project_id,
+                candidate_number=idea.candidate_number, content=idea.content, status=_enum_value(idea.status),
+                topic_candidate_id=idea.topic_candidate_id, created_at=idea.created_at,
+            ) for idea in item.ideas
+        ],
+    )
+
+
+def _attach_product_state(db: Session, item):
+    product = db.get(ProductAssetVersion, item.product_asset_version_id)
+    if product is None:
+        raise RuntimeError("Commerce 商品版本不存在")
+    setattr(item, "_product_status", _enum_value(product.status))
+    setattr(item, "_product_frozen_at", product.frozen_at)
+    return item
 
 
 def _director_plan_response(db: Session, plan: DirectorPlan) -> DirectorPlanV1Response:
@@ -256,6 +318,97 @@ def list_reference_analyses_endpoint(
     return [_analysis_response(item) for item in items]
 
 
+@router.get(
+    "/projects/{project_id}/commerce-reference-intakes",
+    response_model=list[CommerceReferenceIntakeResponse],
+)
+def list_commerce_reference_intakes_endpoint(
+    project_id: str, db: Session = Depends(get_db)
+) -> list[CommerceReferenceIntakeResponse]:
+    """读取由成功视频分析自动生成的脚本版本与商品草稿。"""
+
+    get_project_production_state(db, project_id)
+    return [_commerce_intake_response(_attach_product_state(db, item)) for item in list_reference_intakes(db, project_id)]
+
+
+@router.post(
+    "/commerce-reference-intakes/{intake_id}/confirm-product",
+    response_model=CommerceReferenceIntakeResponse,
+)
+def confirm_commerce_product_endpoint(
+    intake_id: str,
+    payload: CommerceProductConfirmRequest,
+    db: Session = Depends(get_db),
+) -> CommerceReferenceIntakeResponse:
+    """人工确认草稿商品并冻结该版本；后续创意只能采用这个具体版本。"""
+
+    changes = payload.model_dump(
+        exclude={"reviewer_label", "note"}, exclude_none=True
+    )
+    item = confirm_and_freeze_product_draft(
+        db,
+        intake_id=intake_id,
+        reviewer_label=payload.reviewer_label,
+        note=payload.note,
+        changes=changes,
+    )
+    return _commerce_intake_response(_attach_product_state(db, item))
+
+
+@router.get(
+    "/projects/{project_id}/commerce-creative-batches",
+    response_model=list[CommerceCreativeBatchResponse],
+)
+def list_commerce_creative_batches_endpoint(
+    project_id: str, db: Session = Depends(get_db)
+) -> list[CommerceCreativeBatchResponse]:
+    """返回所有十创意历史批次；前端默认突出最新成功批次，不隐藏审计历史。"""
+
+    get_project_production_state(db, project_id)
+    return [_commerce_batch_response(item) for item in list_creative_batches(db, project_id)]
+
+
+@router.post(
+    "/commerce-creative-ideas/{idea_id}/select",
+    response_model=dict,
+    status_code=status.HTTP_201_CREATED,
+)
+def select_commerce_creative_idea_endpoint(
+    idea_id: str,
+    payload: CommerceCreativeIdeaSelectRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+) -> dict:
+    """选择一个创意并建立/冻结现有 Commerce StoryRun 的输入证据链。"""
+
+    try:
+        mode = StoryRunMode(payload.mode)
+    except ValueError as exc:  # schema 已校验，保留防御性错误语义。
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="运行模式仅支持 STEPWISE 或 AUTO") from exc
+    story_run = select_creative_idea(
+        db,
+        idea_id=idea_id,
+        reviewer_label=payload.reviewer_label,
+        note=payload.note,
+        mode=mode,
+    )
+    # 选择即把现有 Commerce StoryRun 推进到 OUTLINE；继续使用同一个父工作流和
+    # Worker 分发器，而不是在生产台创建第三套“大纲任务”。
+    story_run, workflow_run, created = start_story_run(db, story_run.id)
+    if created:
+        dispatch_workflow(background_tasks, workflow_run.workflow_key, workflow_run.id)
+    return {
+        "story_run_id": story_run.id,
+        "project_id": story_run.project_id,
+        "topic_candidate_id": story_run.topic_candidate_id,
+        "product_asset_version_id": story_run.product_asset_version_id,
+        "current_stage": story_run.state.current_stage.value,
+        "current_status": story_run.state.status.value,
+    }
+
+
 @router.post("/reference-analyses/{analysis_id}/lock", response_model=ReferenceAnalysisResponse)
 def lock_reference_analysis_endpoint(
     analysis_id: str,
@@ -293,10 +446,21 @@ def list_story_proposals_endpoint(
     """列出多模型并行生成的原创故事候选，不混入旧故事包。"""
 
     get_project_production_state(db, project_id)
+    # V1 只展示传统 ``StoryGenerationBatch`` 的当前候选。Commerce 十创意写入的是
+    # 独立 ``CommerceCreativeBatch``，即使同一项目随后又走 V1 故事生成，也不能让
+    # 它们污染旧故事候选接口。
+    latest_batch_id = db.scalar(
+        select(StoryGenerationBatch.id)
+        .where(StoryGenerationBatch.project_id == project_id)
+        .order_by(StoryGenerationBatch.created_at.desc())
+        .limit(1)
+    )
+    if latest_batch_id is None:
+        return []
     items = db.scalars(
         select(StoryProposal)
-        .where(StoryProposal.project_id == project_id)
-        .order_by(StoryProposal.created_at.desc(), StoryProposal.candidate_number)
+        .where(StoryProposal.project_id == project_id, StoryProposal.batch_id == latest_batch_id)
+        .order_by(StoryProposal.candidate_number)
     ).all()
     return [_story_response(item) for item in items]
 
@@ -535,7 +699,7 @@ def list_shot_keyframes_endpoint(
             image_url=item.image_url,
             generation_status=_enum_value(item.generation_status),
             review_status=_enum_value(item.review_status),
-            input_asset_snapshot=item.input_asset_snapshot,
+            input_asset_snapshot=_safe_snapshot(item.input_asset_snapshot),
             created_at=item.created_at,
         )
         for item, shot in rows
@@ -564,7 +728,7 @@ def lock_shot_keyframe_endpoint(
         image_url=item.image_url,
         generation_status=_enum_value(item.generation_status),
         review_status=_enum_value(item.review_status),
-        input_asset_snapshot=item.input_asset_snapshot,
+        input_asset_snapshot=_safe_snapshot(item.input_asset_snapshot),
         created_at=item.created_at,
     )
 
@@ -646,6 +810,6 @@ def _video_clip_response(db: Session, clip: VideoClip, shot: ShotPlan) -> VideoC
         generation_status=clip.generation_status,
         review_status=clip.review_status,
         review_note=clip.review_note,
-        input_asset_snapshot=clip.input_asset_snapshot,
+        input_asset_snapshot=_safe_snapshot(clip.input_asset_snapshot),
         created_at=clip.created_at,
     )

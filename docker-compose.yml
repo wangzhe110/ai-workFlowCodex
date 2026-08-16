@@ -10,8 +10,9 @@ x-backend-environment: &backend-environment
   RQ_QUEUE_NAME: ai_drama
   LOCAL_STORAGE_PATH: /var/lib/ai-drama/assets
   SOURCE_VIDEO_STORAGE_MODE: local
-  GENERATED_IMAGE_DELIVERY_MODE: direct
-  FINAL_VIDEO_DELIVERY_MODE: local
+  # 这两个值特意不在 environment 块硬编码：它们从未提交的
+  # infra/backend.env 注入。未配置时应用 Settings 默认 direct/local；真实图生
+  # 视频验收则可设为 s3，向供应商提供稳定的公网 HTTPS 图片和成片地址。
   CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
   MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-524288000}
   WORKER_JOB_TIMEOUT_SECONDS: ${WORKER_JOB_TIMEOUT_SECONDS:-1800}

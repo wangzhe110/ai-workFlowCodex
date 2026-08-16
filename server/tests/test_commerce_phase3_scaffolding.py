@@ -609,7 +609,6 @@ def test_0016_usage_event_trigger_blocks_orm_and_core_updates_but_allows_reversa
     finally:
         migration_engine.dispose()
 
-
 def _migration_runner(database_url: str, revision: str, *, downgrade: bool = False) -> None:
     server_root = Path(__file__).resolve().parents[1]
     config = Config(str(server_root / "alembic.ini"))
@@ -625,20 +624,19 @@ def _migration_runner(database_url: str, revision: str, *, downgrade: bool = Fal
     finally:
         migration_engine.dispose()
 
-
 def test_0016_empty_sqlite_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
-    """场景 #23：空库升级 head，0016→0015→0016 会准确移除/恢复 trigger。"""
+    """场景 #23：空库升级当前 head，0016 trigger 与 Slice 2 表在往返后仍准确恢复。"""
 
     database_url = f"sqlite:///{tmp_path / 'empty-0016.db'}"
     server_root = Path(__file__).resolve().parents[1]
     config = Config(str(server_root / "alembic.ini"))
     config.set_main_option("script_location", str(server_root / "migrations"))
-    assert ScriptDirectory.from_config(config).get_heads() == ["0016_commerce_phase3_integrity_hardening"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["0020_phase4_asset_center_foreign_key_repair"]
     _migration_runner(database_url, "head")
     migration_engine = create_engine(database_url)
     try:
         tables = set(inspect(migration_engine).get_table_names())
-        assert {"viral_cases", "viral_patterns", "knowledge_chunks", "retrieval_calls", "generation_tasks", "generation_invocations", "project_members", "saas_plans", "project_subscriptions", "usage_events"}.issubset(tables)
+        assert {"viral_cases", "viral_patterns", "knowledge_chunks", "retrieval_calls", "generation_tasks", "generation_invocations", "project_members", "saas_plans", "project_subscriptions", "usage_events", "commerce_reference_intakes", "commerce_creative_batches", "commerce_creative_ideas", "commerce_story_run_inputs", "commerce_character_design_versions", "commerce_final_videos"}.issubset(tables)
         with migration_engine.connect() as connection:
             assert "trg_usage_events_immutable_update_0016" in {
                 row[0] for row in connection.exec_driver_sql("SELECT name FROM sqlite_master WHERE type = 'trigger'")
@@ -665,6 +663,83 @@ def test_0016_empty_sqlite_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
     finally:
         migration_engine.dispose()
 
+
+def test_0003_uses_frozen_v1_foundation_metadata_and_0009_installs_asset_foreign_keys(tmp_path) -> None:
+    """历史 0003 不得随着当前 ORM 提前引用 0009 资产中心表。
+
+    SQLite 可以接受指向尚未创建表的外键，因此这里同时直接检查 0003 的本地快照，
+    并从空库跑至 0009，确认资产字段和约束只在正确 revision 出现。
+    """
+
+    database_url = f"sqlite:///{tmp_path / 'frozen-v1-foundation.db'}"
+    _migration_runner(database_url, "0003_v1_production_foundation")
+    migration_engine = create_engine(database_url)
+    try:
+        inspector = inspect(migration_engine)
+        assert "character_assets" not in inspector.get_table_names()
+        assert "asset_library_character_id" not in {
+            column["name"] for column in inspector.get_columns("character_definitions")
+        }
+        assert "asset_library_scene_id" not in {
+            column["name"] for column in inspector.get_columns("scene_definitions")
+        }
+        assert "asset_version_id" not in {
+            column["name"] for column in inspector.get_columns("character_reference_images")
+        }
+        assert "story_proposal_id" not in {
+            column["name"] for column in inspector.get_columns("character_definitions")
+        }
+        assert "quality_score" not in {
+            column["name"] for column in inspector.get_columns("review_decisions")
+        }
+        assert "currency" not in {
+            column["name"] for column in inspector.get_columns("model_quality_evaluations")
+        }
+        # 继续逐项防回归：0004 只做回填；0005--0009 对 *0003 新表* 的字段、
+        # 索引和状态都不得因当前 ORM 定义而提前出现。workflow_runs、
+        # workflow_steps 和 model_profiles 是 0001 初始表，不在本次 0003 修复范围。
+        assert "selected_video_clip_id" not in {
+            column["name"] for column in inspector.get_columns("shot_plans")
+        }
+        assert "emotion" not in {
+            column["name"] for column in inspector.get_columns("shot_plans")
+        }
+        assert "ix_character_definitions_asset_library_character_id" not in {
+            index["name"] for index in inspector.get_indexes("character_definitions")
+        }
+    finally:
+        migration_engine.dispose()
+
+    _migration_runner(database_url, "0009_phase4_asset_center_and_structured_shots")
+    migration_engine = create_engine(database_url)
+    try:
+        inspector = inspect(migration_engine)
+        assert {"asset_libraries", "character_assets", "character_asset_versions", "scene_assets", "scene_asset_versions"} <= set(
+            inspector.get_table_names()
+        )
+        expected = (
+            ("character_definitions", "asset_library_character_id", "character_assets"),
+            ("scene_definitions", "asset_library_scene_id", "scene_assets"),
+            ("character_reference_images", "asset_version_id", "character_asset_versions"),
+            ("scene_reference_images", "asset_version_id", "scene_asset_versions"),
+            ("shot_asset_bindings", "character_asset_version_id", "character_asset_versions"),
+            ("shot_asset_bindings", "scene_asset_version_id", "scene_asset_versions"),
+            ("video_clip_asset_bindings", "character_asset_version_id", "character_asset_versions"),
+            ("video_clip_asset_bindings", "scene_asset_version_id", "scene_asset_versions"),
+        )
+        for table_name, column_name, referent_table in expected:
+            matches = [
+                foreign_key
+                for foreign_key in inspector.get_foreign_keys(table_name)
+                if foreign_key["constrained_columns"] == [column_name]
+                and foreign_key["referred_table"] == referent_table
+                and foreign_key["referred_columns"] == ["id"]
+            ]
+            assert len(matches) == 1
+        with migration_engine.connect() as connection:
+            assert connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        migration_engine.dispose()
 
 def _insert_nonempty_phase12_graph(database_url: str) -> dict[str, str]:
     """在真实 0014 schema 写入完整 Commerce Phase 1/2 有效关系图。"""

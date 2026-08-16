@@ -60,6 +60,23 @@ def _invalid(message: str, row_id: object) -> None:
     raise RuntimeError(f"0014 Commerce legacy integrity check failed: {message}: {row_id}")
 
 
+def _workflow_step_status_mismatch(
+    workflow_steps: sa.Table,
+    commerce_steps: sa.Table,
+) -> sa.ColumnElement[bool]:
+    """Compare the current enum value with the legacy VARCHAR sidecar safely.
+
+    ``commerce_workflow_steps.status`` was deliberately introduced as a
+    VARCHAR column in 0012, whereas the pre-existing ``workflow_steps.status``
+    column is PostgreSQL's native ``runstatus`` enum.  Casting the enum to text
+    keeps the same value comparison and lets legacy invalid strings be reported
+    by the migration's integrity guard instead of failing PostgreSQL's enum
+    input conversion before that guard can run.
+    """
+
+    return sa.cast(workflow_steps.c.status, sa.Text()) != commerce_steps.c.status
+
+
 def _validate_existing_sidecars(bind: sa.Connection, table: dict[str, sa.Table]) -> None:
     """Fail rather than silently bless legacy link/sidecar rows outside 0013 scope."""
 
@@ -114,7 +131,7 @@ def _validate_existing_sidecars(bind: sa.Connection, table: dict[str, sa.Table])
                 workflow_steps.c.workflow_run_id != commerce_steps.c.workflow_run_id,
                 workflow_steps.c.step_key != commerce_steps.c.stage,
                 workflow_steps.c.attempt != commerce_steps.c.attempt,
-                workflow_steps.c.status != commerce_steps.c.status,
+                _workflow_step_status_mismatch(workflow_steps, commerce_steps),
             )
         )
         .limit(1)

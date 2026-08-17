@@ -1277,6 +1277,14 @@ def _post_json(url: str, api_key: str, payload: dict[str, Any], timeout: float) 
     )
 
 
+class ProviderTransportError(RuntimeError):
+    """供应商 HTTP 传输暂时不可用，消息不包含 URL、请求头或鉴权信息。"""
+
+
+class ProviderPollNetworkError(ProviderTransportError):
+    """已创建供应商任务后的 GET 轮询暂时失败，可安全恢复同一任务号。"""
+
+
 def _post_multipart(
     *,
     url: str,
@@ -1379,13 +1387,15 @@ def _authorized_json_request(
             response_payload = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         error_body = sanitize_error_summary(exc.read().decode("utf-8", errors="replace"), max_length=500)
-        raise RuntimeError(f"中转站请求失败（HTTP {exc.code}）：{error_body}") from exc
+        raise RuntimeError(f"供应商请求失败（HTTP {exc.code}）：{error_body}") from exc
     except (URLError, OSError) as exc:
-        raise RuntimeError("无法连接中转站，请检查 api_base_url 或网络") from exc
+        # 不在异常内携带底层 URL、请求头或系统网络信息。调用方根据是在创建还是
+        # 轮询阶段进一步投影为安全、可恢复的领域错误码。
+        raise ProviderTransportError("供应商接口暂时无法连接，请检查网络后重试") from exc
     except json.JSONDecodeError as exc:
-        raise RuntimeError("中转站返回的不是 JSON 响应") from exc
+        raise RuntimeError("供应商返回的不是 JSON 响应") from exc
     if not isinstance(response_payload, dict):
-        raise RuntimeError("中转站返回的 JSON 顶层必须是对象")
+        raise RuntimeError("供应商返回的 JSON 顶层必须是对象")
     return response_payload
 
 
@@ -1571,11 +1581,18 @@ class VolcengineArkVideoProvider:
 
         if not provider_task_id:
             raise RuntimeError("视频任务缺少火山方舟任务 ID")
-        response_payload = _get_json(
-            f"{self._BASE_URL}/contents/generations/tasks/{quote(provider_task_id, safe='')}",
-            self._api_key(),
-            _request_timeout_seconds(self.provider_config),
-        )
+        try:
+            response_payload = _get_json(
+                f"{self._BASE_URL}/contents/generations/tasks/{quote(provider_task_id, safe='')}",
+                self._api_key(),
+                _request_timeout_seconds(self.provider_config),
+            )
+        except ProviderTransportError as exc:
+            # 已有 task ID 的 GET 网络波动不等同于供应商已失败，更不允许调用方
+            # 因此再次 POST。上层可保留任务号，并在人工恢复时只继续查询同一任务。
+            raise ProviderPollNetworkError(
+                "供应商任务轮询暂时无法连接，可使用已保存的任务号恢复查询"
+            ) from exc
         raw_status = response_payload.get("status")
         if not isinstance(raw_status, str) or not raw_status:
             raise RuntimeError("火山方舟任务查询响应缺少 status")

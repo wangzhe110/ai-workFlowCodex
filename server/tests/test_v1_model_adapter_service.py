@@ -2,7 +2,7 @@
 
 import pytest
 
-from app.services.analysis_provider import VideoTaskResult
+from app.services.analysis_provider import ProviderPollNetworkError, VideoTaskResult
 from app.services.storage import LocalImageReference
 from app.services.v1_model_adapter_service import assert_supported, create_video_request, wait_for_video_result
 
@@ -51,6 +51,35 @@ def test_v1_video_waiter_polls_to_terminal_state(monkeypatch) -> None:
     assert provider.task_ids == ["task-1"]
     assert result.status == "SUCCEEDED"
     assert result.video_url == "https://cdn.example/clip.mp4"
+
+
+def test_v1_video_waiter_retries_only_get_after_transient_poll_network_error(monkeypatch) -> None:
+    """轮询网络波动只重试同一任务号的 poll；等待器本身没有 submit 能力。"""
+
+    class RecoveringPollProvider:
+        def __init__(self) -> None:
+            self.poll_ids: list[str] = []
+
+        def poll(self, provider_task_id: str) -> VideoTaskResult:
+            self.poll_ids.append(provider_task_id)
+            if len(self.poll_ids) == 1:
+                raise ProviderPollNetworkError("temporary")
+            return VideoTaskResult(
+                provider_task_id=provider_task_id,
+                status="SUCCEEDED",
+                video_url="https://cdn.example/clip.mp4",
+            )
+
+    monkeypatch.setattr("app.services.v1_model_adapter_service.time.sleep", lambda _seconds: None)
+    provider = RecoveringPollProvider()
+    result = wait_for_video_result(
+        provider,
+        {"provider_config": {"poll_interval_seconds": 1, "max_poll_seconds": 10, "poll_network_retry_count": 1}},
+        VideoTaskResult(provider_task_id="already-created-task", status="PENDING"),
+    )
+
+    assert provider.poll_ids == ["already-created-task", "already-created-task"]
+    assert result.status == "SUCCEEDED"
 
 
 def test_video_request_accepts_verified_in_memory_first_frame_without_public_url() -> None:

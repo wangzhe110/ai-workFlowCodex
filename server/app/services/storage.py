@@ -289,6 +289,51 @@ class LocalAssetStorage:
             raise RuntimeError("本地生成媒体文件不存在或不在允许目录")
         return candidate
 
+    def clone_generated_image(
+        self,
+        *,
+        source_media_url: str,
+        target_project_id: str,
+        asset_kind: str,
+        asset_id: str,
+        version: int,
+    ) -> tuple[str, dict[str, object]]:
+        """复制一张已受控的本地生成图，并返回新项目可安全引用的元数据。
+
+        这个入口用于项目内采用既有媒体的场景。它不接受本机绝对路径、外部 URL 或
+        Base64；源文件必须先通过 :meth:`generated_media_path` 的媒体根目录校验。
+        内容只在复制期间保留于内存，返回的元数据可写入审计快照但不含路径或字节。
+        """
+
+        source = self.generated_media_path(source_media_url)
+        content = source.read_bytes()
+        max_bytes = 30 * 1024 * 1024
+        if not content or len(content) > max_bytes:
+            raise RuntimeError("受控参考图为空或超过 30MB 限制")
+        mime_type = self._image_mime_from_magic(content)
+        suffix_by_mime = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
+        if source.suffix.lower() != suffix_by_mime[mime_type]:
+            raise RuntimeError("受控参考图文件扩展名与 MIME 类型不一致")
+        width, height = self._image_dimensions(content, mime_type)
+        if width > 8192 or height > 8192:
+            raise RuntimeError("受控参考图尺寸超过 8192 像素限制")
+
+        media_url = self.save_generated_image_bytes(
+            project_id=target_project_id,
+            asset_kind=asset_kind,
+            asset_id=asset_id,
+            version=version,
+            content=content,
+            content_type=mime_type,
+        )
+        return media_url, {
+            "mime_type": mime_type,
+            "width": width,
+            "height": height,
+            "byte_size": len(content),
+            "sha256": sha256(content).hexdigest(),
+        }
+
     def load_generated_image_reference(
         self,
         *,

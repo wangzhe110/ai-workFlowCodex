@@ -625,13 +625,13 @@ def _migration_runner(database_url: str, revision: str, *, downgrade: bool = Fal
         migration_engine.dispose()
 
 def test_0016_empty_sqlite_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
-    """场景 #23：空库升级当前 head，0016 trigger 与 Slice 2 表在往返后仍准确恢复。"""
+    """场景 #23：空库升级当前 head，0016 trigger 与后续 Commerce 表在往返后仍准确恢复。"""
 
     database_url = f"sqlite:///{tmp_path / 'empty-0016.db'}"
     server_root = Path(__file__).resolve().parents[1]
     config = Config(str(server_root / "alembic.ini"))
     config.set_main_option("script_location", str(server_root / "migrations"))
-    assert ScriptDirectory.from_config(config).get_heads() == ["0020_phase4_asset_center_foreign_key_repair"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["0021_commerce_story_run_rerun"]
     _migration_runner(database_url, "head")
     migration_engine = create_engine(database_url)
     try:

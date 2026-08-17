@@ -52,6 +52,7 @@ from app.models import (
 )
 from app.services.commerce_configuration_service import ensure_commerce_foundation
 from app.services.final_video_service import _compose_real_video
+from app.services.analysis_provider import ProviderPollNetworkError
 from app.services.storage import LocalImageReference, local_asset_storage
 from app.services.v1_configuration_service import enabled_profiles_for_slot
 from app.services.v1_model_adapter_service import (
@@ -89,6 +90,14 @@ OPERATION_SPECS: dict[str, tuple[str | None, str | None]] = {
 }
 
 TERMINAL = {"LOCKED", "SUPERSEDED", "STALE", "REJECTED", "APPROVED", "FAILED"}
+
+
+class ProviderTaskTerminalError(RuntimeError):
+    """供应商已明确将一个异步任务置为失败终态。"""
+
+
+class VideoResultDownloadError(RuntimeError):
+    """供应商已成功，但临时媒体下载未能安全完成。"""
 
 
 def utcnow() -> datetime:
@@ -416,6 +425,183 @@ def create_production_run(
     return run_row, True
 
 
+def _provider_task_recovery(snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    """读取恢复快照；该快照只能由服务端根据一个失败片段创建。"""
+
+    recovery = snapshot.get("provider_task_recovery") if isinstance(snapshot, dict) else None
+    if recovery is None:
+        return None
+    if not isinstance(recovery, dict):
+        raise RuntimeError("视频任务恢复快照无效")
+    required = (
+        "execution_mode",
+        "recovered_provider_task_id",
+        "provider_create_post_count",
+        "recovered_from_video_clip_id",
+        "source_video_prompt_version_id",
+        "source_keyframe_version_id",
+    )
+    if any(key not in recovery for key in required):
+        raise RuntimeError("视频任务恢复快照缺少必要字段")
+    if recovery["execution_mode"] != "resume_provider_task":
+        raise RuntimeError("视频任务恢复模式无效")
+    if not isinstance(recovery["recovered_provider_task_id"], str) or not recovery["recovered_provider_task_id"]:
+        raise RuntimeError("视频任务恢复快照缺少供应商任务号")
+    if recovery["provider_create_post_count"] != 0:
+        raise RuntimeError("视频任务恢复不得创建新的供应商任务")
+    return recovery
+
+
+def _recovery_runs_for_clip(db: Session, *, source_clip_id: str) -> list[WorkflowRun]:
+    """查找一个失败视频片段的所有本地恢复尝试，不依赖可变的当前模型配置。"""
+
+    candidates = db.scalars(
+        select(WorkflowRun)
+        .where(WorkflowRun.workflow_key == f"{WORKFLOW_PREFIX}video_render")
+        .order_by(WorkflowRun.created_at.desc())
+    ).all()
+    matches: list[WorkflowRun] = []
+    for candidate in candidates:
+        recovery = ((candidate.input_snapshot or {}).get("provider_task_recovery") or {})
+        if isinstance(recovery, dict) and recovery.get("recovered_from_video_clip_id") == source_clip_id:
+            matches.append(candidate)
+    return matches
+
+
+def resume_video_clip_provider_task(
+    db: Session, *, story_run_id: str, source_clip_id: str
+) -> tuple[WorkflowRun, bool]:
+    """为已失败但已有任务号的视频创建本地恢复尝试。
+
+    新 ``WorkflowRun`` 只是新的本地审计与下载执行边界；它冻结复制原任务的模型、
+    Prompt、关键帧与 ``provider_task_id``。Worker 看到该恢复快照后只能 GET，绝不
+    能转入 ``submit`` 分支，因此不会产生第二次付费视频创建。
+    """
+
+    story_run = _story_run(db, story_run_id)
+    source = db.get(CommerceVideoClipVersion, source_clip_id)
+    if source is None or source.story_run_id != story_run.id:
+        _error("待恢复的视频片段不属于当前 StoryRun", status.HTTP_404_NOT_FOUND)
+    if source.status != "FAILED" or not source.provider_task_id or source.video_url:
+        _error("只有已失败且保留供应商任务号的视频片段可以恢复", status.HTTP_409_CONFLICT)
+
+    original_run = db.get(WorkflowRun, source.workflow_run_id)
+    if original_run is None or original_run.workflow_key != f"{WORKFLOW_PREFIX}video_render" or original_run.status != RunStatus.FAILED:
+        _error("来源视频片段没有可验证的失败生产运行", status.HTTP_409_CONFLICT)
+    original_step = db.scalar(
+        select(WorkflowStep).where(WorkflowStep.workflow_run_id == original_run.id).order_by(WorkflowStep.position)
+    )
+    original_invocation = db.get(ModelInvocation, source.model_invocation_id)
+    if (
+        original_step is None
+        or original_step.status != RunStatus.FAILED
+        or original_step.provider_task_id != source.provider_task_id
+        or original_invocation is None
+        or original_invocation.status != RunStatus.FAILED
+        or original_invocation.provider_task_id != source.provider_task_id
+    ):
+        _error("来源视频片段的失败审计与供应商任务号不一致", status.HTTP_409_CONFLICT)
+
+    original_snapshot = deepcopy(original_run.input_snapshot or {})
+    context = original_snapshot.get("commerce_production")
+    binding = original_snapshot.get("model_binding")
+    prompt_template = original_snapshot.get("prompt_template")
+    if not isinstance(context, dict) or not isinstance(binding, dict) or not isinstance(prompt_template, dict):
+        _error("来源视频任务的冻结快照不完整", status.HTTP_409_CONFLICT)
+    if context.get("story_run_id") != story_run.id or context.get("operation") != "VIDEO_RENDER":
+        _error("来源视频任务不属于当前 StoryRun 的视频生产阶段", status.HTTP_409_CONFLICT)
+    if context.get("target_id") != source.shot_id:
+        _error("来源视频任务的镜头与视频片段不一致", status.HTTP_409_CONFLICT)
+    storyboard_snapshot = context.get("storyboard") if isinstance(context.get("storyboard"), dict) else {}
+    if storyboard_snapshot.get("id") != source.storyboard_version_id:
+        _error("来源视频任务的导演分镜与视频片段不一致", status.HTTP_409_CONFLICT)
+    profile_snapshot = binding.get("profile_snapshot") if isinstance(binding, dict) else None
+    if not isinstance(profile_snapshot, dict):
+        _error("来源视频任务缺少冻结模型 Profile", status.HTTP_409_CONFLICT)
+    if adapter_key(profile_snapshot) not in {"volcengine_ark_video", "configurable_async_video"}:
+        _error("来源片段不是可恢复的异步视频模型任务", status.HTTP_409_CONFLICT)
+    if original_invocation.model_profile_id != binding.get("model_profile_id"):
+        _error("来源调用审计与冻结模型 Profile 不一致", status.HTTP_409_CONFLICT)
+    if db.get(ModelProfile, original_invocation.model_profile_id) is None:
+        _error("来源视频模型 Profile 已不存在，无法安全恢复", status.HTTP_409_CONFLICT)
+
+    storyboard = db.get(CommerceStoryboardVersion, source.storyboard_version_id)
+    video_prompt = db.get(CommerceVideoPromptVersion, source.video_prompt_version_id)
+    keyframe = db.get(CommerceShotKeyframeVersion, source.keyframe_version_id)
+    if (
+        storyboard is None
+        or storyboard.story_run_id != story_run.id
+        or storyboard.status != "LOCKED"
+        or video_prompt is None
+        or video_prompt.story_run_id != story_run.id
+        or video_prompt.status != "LOCKED"
+        or video_prompt.storyboard_version_id != storyboard.id
+        or video_prompt.shot_id != source.shot_id
+        or video_prompt.keyframe_version_id != source.keyframe_version_id
+        or keyframe is None
+        or keyframe.story_run_id != story_run.id
+        or keyframe.storyboard_version_id != storyboard.id
+        or keyframe.shot_id != source.shot_id
+        or keyframe.status != "LOCKED"
+        or not keyframe.image_url
+    ):
+        _error("来源视频片段的镜头、关键帧或视频 Prompt 已失效，不能恢复", status.HTTP_409_CONFLICT)
+
+    for existing in _recovery_runs_for_clip(db, source_clip_id=source.id):
+        if existing.status in {RunStatus.PENDING, RunStatus.RUNNING, RunStatus.SUCCEEDED}:
+            return existing, False
+    prior_failures = sum(1 for item in _recovery_runs_for_clip(db, source_clip_id=source.id) if item.status == RunStatus.FAILED)
+    recovery_attempt = prior_failures + 1
+    recovery = {
+        "execution_mode": "resume_provider_task",
+        "recovered_provider_task_id": source.provider_task_id,
+        "provider_create_post_count": 0,
+        "recovered_from_video_clip_id": source.id,
+        "source_workflow_run_id": original_run.id,
+        "source_workflow_step_id": original_step.id,
+        "source_model_invocation_id": original_invocation.id,
+        "source_video_prompt_version_id": source.video_prompt_version_id,
+        "source_keyframe_version_id": source.keyframe_version_id,
+        "source_storyboard_version_id": source.storyboard_version_id,
+        "source_shot_id": source.shot_id,
+        "recovery_attempt": recovery_attempt,
+    }
+    snapshot = deepcopy(original_snapshot)
+    snapshot["frozen_at"] = utcnow().isoformat()
+    snapshot["provider_task_recovery"] = recovery
+    key = f"commerce-video-recovery:{source.id}:{recovery_attempt}"
+    idempotency_key = f"run:{sha256(key.encode()).hexdigest()}"
+    run_row = WorkflowRun(
+        project_id=story_run.project_id,
+        workflow_key=f"{WORKFLOW_PREFIX}video_render",
+        workflow_definition_id=original_run.workflow_definition_id,
+        workflow_version=original_run.workflow_version,
+        idempotency_key=idempotency_key,
+        input_snapshot=snapshot,
+        status=RunStatus.PENDING,
+    )
+    step = WorkflowStep(
+        workflow_run=run_row,
+        step_key="COMMERCE_VIDEO_RENDER",
+        position=1,
+        attempt=1,
+        input_payload=deepcopy(snapshot),
+        model_profile_snapshot={"binding": deepcopy(binding), "prompt_template": deepcopy(prompt_template)},
+        idempotency_key=f"step:{sha256((idempotency_key + ':step').encode()).hexdigest()}",
+    )
+    db.add_all([run_row, step])
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        for existing in _recovery_runs_for_clip(db, source_clip_id=source.id):
+            if existing.status in {RunStatus.PENDING, RunStatus.RUNNING, RunStatus.SUCCEEDED}:
+                return existing, False
+        raise
+    db.refresh(run_row)
+    return run_row, True
+
+
 def _start_invocation(
     db: Session,
     *,
@@ -446,6 +632,15 @@ def _start_invocation(
     safe_profile_snapshot["provider_config"] = redact_provider_config(
         profile_snapshot.get("provider_config")
     )
+    input_snapshot = deepcopy((run_row.input_snapshot or {}).get("commerce_production") or {})
+    recovery = _provider_task_recovery(run_row.input_snapshot or {})
+    if recovery is not None:
+        input_snapshot["provider_task_recovery"] = {
+            "execution_mode": recovery["execution_mode"],
+            "recovered_provider_task_id": recovery["recovered_provider_task_id"],
+            "provider_create_post_count": 0,
+            "recovered_from_video_clip_id": recovery["recovered_from_video_clip_id"],
+        }
     invocation = ModelInvocation(
         project_id=run_row.project_id,
         workflow_run_id=run_row.id,
@@ -456,7 +651,7 @@ def _start_invocation(
         task_type=task_type,
         model_profile_snapshot=safe_profile_snapshot,
         prompt_snapshot=deepcopy(prompt),
-        input_snapshot=deepcopy((run_row.input_snapshot or {}).get("commerce_production") or {}),
+        input_snapshot=input_snapshot,
         # 一个图片批任务可能在同一 WorkflowStep 中生成多个角色或场景参考图。
         # 每个资产仍须有自己的可追溯、可去重调用键，不能共用 step 的唯一键。
         idempotency_key=invocation_key,
@@ -481,14 +676,45 @@ def _finish_invocation(
     invocation.finished_at = utcnow()
 
 
-def _fail_invocation(invocation: ModelInvocation | None, message: str, *, started: float | None = None, provider_task_id: str | None = None) -> None:
+def _fail_invocation(
+    invocation: ModelInvocation | None,
+    message: str,
+    *,
+    started: float | None = None,
+    provider_task_id: str | None = None,
+    error_code: str = "COMMERCE_PRODUCTION_FAILED",
+) -> None:
+    """结束失败调用，只持久化安全错误码和已脱敏摘要。
+
+    视频轮询、供应商终态失败、下载失败三者都有不同的人工处理方式，不能再用一个
+    笼统错误码掩盖。错误正文仍经统一脱敏后才允许进入审计快照。
+    """
+
     if invocation is None:
         return
     invocation.status = RunStatus.FAILED
-    invocation.error_code = "COMMERCE_PRODUCTION_FAILED"
+    invocation.error_code = error_code
+    invocation.output_reference = {
+        "failure": {
+            "code": error_code,
+            "message": sanitize_error_summary(message, max_length=500),
+        }
+    }
     invocation.provider_task_id = provider_task_id
     invocation.latency_ms = max(0, int((perf_counter() - started) * 1000)) if started is not None else None
     invocation.finished_at = utcnow()
+
+
+def _failure_code_for_exception(exc: Exception) -> str:
+    """将可公开的失败类别写入审计，而不保存底层网络或供应商敏感细节。"""
+
+    if isinstance(exc, ProviderPollNetworkError):
+        return "PROVIDER_POLL_NETWORK_ERROR"
+    if isinstance(exc, ProviderTaskTerminalError):
+        return "PROVIDER_TASK_FAILED"
+    if isinstance(exc, VideoResultDownloadError):
+        return "VIDEO_DOWNLOAD_FAILED"
+    return "COMMERCE_PRODUCTION_FAILED"
 
 
 def _next_version(db: Session, model, *, story_run_id: str, extra_column: str | None = None, extra_value: str | None = None) -> int:
@@ -1149,16 +1375,51 @@ def _probe_remote_mp4(url: str) -> dict[str, Any]:
 def _execute_video_render(db: Session, run_row: WorkflowRun, step: WorkflowStep, context: dict[str, Any]) -> dict[str, Any]:
     shot = _shot_for_target(context)
     storyboard = context["storyboard"]
-    prompt = db.scalars(select(CommerceVideoPromptVersion).where(CommerceVideoPromptVersion.storyboard_version_id == storyboard["id"], CommerceVideoPromptVersion.shot_id == shot["shot_id"], CommerceVideoPromptVersion.status == "LOCKED").order_by(CommerceVideoPromptVersion.version.desc())).first()
+    recovery = _provider_task_recovery(run_row.input_snapshot or {})
+    if recovery is not None:
+        # 恢复必须使用原失败片段冻结的 Prompt / 关键帧，而不是当前页面刚选中的新版。
+        prompt = db.get(CommerceVideoPromptVersion, recovery["source_video_prompt_version_id"])
+        if (
+            prompt is None
+            or prompt.status != "LOCKED"
+            or prompt.storyboard_version_id != storyboard["id"]
+            or prompt.shot_id != shot["shot_id"]
+        ):
+            raise RuntimeError("恢复视频任务引用的冻结视频 Prompt 已失效")
+    else:
+        prompt = db.scalars(select(CommerceVideoPromptVersion).where(CommerceVideoPromptVersion.storyboard_version_id == storyboard["id"], CommerceVideoPromptVersion.shot_id == shot["shot_id"], CommerceVideoPromptVersion.status == "LOCKED").order_by(CommerceVideoPromptVersion.version.desc())).first()
     if prompt is None:
         _error("必须使用当前已锁定的视频 Prompt 生成视频")
     keyframe = db.get(CommerceShotKeyframeVersion, prompt.keyframe_version_id)
-    if keyframe is None or keyframe.status != "LOCKED" or not keyframe.image_url:
+    if keyframe is None or keyframe.status != "LOCKED" or not keyframe.image_url or (recovery is not None and keyframe.id != recovery["source_keyframe_version_id"]):
         _error("视频 Prompt 引用的关键帧未锁定或已失效")
     existing = db.scalars(select(CommerceVideoClipVersion).where(CommerceVideoClipVersion.workflow_run_id == run_row.id)).first()
     if existing is None:
         version = _next_version(db, CommerceVideoClipVersion, story_run_id=context["story_run_id"], extra_column="shot_id", extra_value=shot["shot_id"])
-        existing = CommerceVideoClipVersion(story_run_id=context["story_run_id"], storyboard_version_id=storyboard["id"], shot_id=shot["shot_id"], shot_number=shot["shot_number"], keyframe_version_id=keyframe.id, video_prompt_version_id=prompt.id, workflow_run_id=run_row.id, version=version, idempotency_key=f"clip:{step.idempotency_key}", input_asset_snapshot=deepcopy(keyframe.input_asset_snapshot), status="RUNNING")
+        input_assets = deepcopy(keyframe.input_asset_snapshot)
+        if recovery is not None:
+            source_clip = db.get(CommerceVideoClipVersion, recovery["recovered_from_video_clip_id"])
+            if (
+                source_clip is None
+                or source_clip.status != "FAILED"
+                or source_clip.provider_task_id != recovery["recovered_provider_task_id"]
+                or source_clip.story_run_id != context["story_run_id"]
+                or source_clip.shot_id != shot["shot_id"]
+                or source_clip.keyframe_version_id != keyframe.id
+                or source_clip.video_prompt_version_id != prompt.id
+            ):
+                raise RuntimeError("恢复视频任务的来源片段已改变，拒绝继续执行")
+            input_assets = deepcopy(source_clip.input_asset_snapshot)
+            input_assets["provider_task_recovery"] = {
+                "execution_mode": recovery["execution_mode"],
+                "recovered_provider_task_id": recovery["recovered_provider_task_id"],
+                "provider_create_post_count": 0,
+                "recovered_from_video_clip_id": recovery["recovered_from_video_clip_id"],
+            }
+        existing = CommerceVideoClipVersion(story_run_id=context["story_run_id"], storyboard_version_id=storyboard["id"], shot_id=shot["shot_id"], shot_number=shot["shot_number"], keyframe_version_id=keyframe.id, video_prompt_version_id=prompt.id, workflow_run_id=run_row.id, version=version, idempotency_key=f"clip:{step.idempotency_key}", input_asset_snapshot=input_assets, status="RUNNING")
+        if recovery is not None:
+            existing.provider_task_id = recovery["recovered_provider_task_id"]
+            step.provider_task_id = existing.provider_task_id
         db.add(existing); db.flush()
     started = perf_counter()
     invocation = _start_invocation(db, run_row=run_row, step=step, task_type="VIDEO_GENERATE")
@@ -1167,6 +1428,8 @@ def _execute_video_render(db: Session, run_row: WorkflowRun, step: WorkflowStep,
     profile = binding.get("profile_snapshot") if isinstance(binding, dict) else None
     if not isinstance(profile, dict):
         raise RuntimeError("视频任务缺少冻结模型")
+    if recovery is not None and is_mock_adapter(profile):
+        raise RuntimeError("恢复视频任务不能使用 Mock Adapter")
     if is_mock_adapter(profile):
         existing.status = "SUCCEEDED"; existing.provider_task_id = f"mock-commerce-video-{existing.id[:8]}"; existing.video_url = f"mock://commerce-video/{existing.id}"; existing.duration_ms = shot["duration_ms"]; existing.media_metadata = {"mode": "mock", "not_a_real_mp4": True}
         _finish_invocation(invocation, output_reference={"commerce_video_clip_version_id": existing.id}, started=started, media_units={"video_clips": 1, "mode": "mock"}, provider_task_id=existing.provider_task_id)
@@ -1177,6 +1440,10 @@ def _execute_video_render(db: Session, run_row: WorkflowRun, step: WorkflowStep,
     if existing.provider_task_id:
         # 任务号一旦落库，此次 Worker 领取只负责恢复查询。即便本机原首帧文件
         # 暂时不可读取，也绝不能因为重新加载首帧而走到第二次付费 POST。
+        if recovery is not None:
+            # 新恢复 attempt 的 Clip、Step、Invocation 和原任务号要在第一个 GET 前
+            # 同时提交；进程中断后也只会从该任务号恢复，不会走 submit 分支。
+            db.commit()
         first = provider.poll(existing.provider_task_id)
     else:
         first_frame = local_asset_storage.load_generated_image_reference(
@@ -1211,7 +1478,7 @@ def _execute_video_render(db: Session, run_row: WorkflowRun, step: WorkflowStep,
             existing.status = "FAILED"
             existing.error_message = message
             existing.finished_at = utcnow()
-            _fail_invocation(invocation, message, started=started)
+            _fail_invocation(invocation, message, started=started, error_code="PROVIDER_CREATE_FAILED")
             db.commit()
             raise
         existing.provider_task_id = submitted.provider_task_id
@@ -1222,8 +1489,11 @@ def _execute_video_render(db: Session, run_row: WorkflowRun, step: WorkflowStep,
     existing.provider_task_id = result.provider_task_id or existing.provider_task_id
     step.provider_task_id = existing.provider_task_id
     if result.status != "SUCCEEDED" or not result.video_url:
-        raise RuntimeError(result.error_message or "视频供应商任务失败")
-    content_type, content = local_asset_storage.download_generated_video(result.video_url)
+        raise ProviderTaskTerminalError(result.error_message or "视频供应商任务失败")
+    try:
+        content_type, content = local_asset_storage.download_generated_video(result.video_url)
+    except Exception as exc:
+        raise VideoResultDownloadError("供应商视频结果下载失败，请使用已保存任务号重新恢复") from exc
     local_video_url = local_asset_storage.save_generated_video_bytes(
         project_id=run_row.project_id,
         asset_kind="commerce-video",
@@ -1340,13 +1610,24 @@ def execute_commerce_production_workflow(run_id: str) -> None:
         db.commit()
     except Exception as exc:
         db.rollback()
-        error_message = sanitize_error_summary(exc, max_length=2000)
+        failure_code = _failure_code_for_exception(exc)
+        error_message = (
+            "供应商任务轮询暂时无法连接，可使用已保存的任务号恢复查询"
+            if failure_code == "PROVIDER_POLL_NETWORK_ERROR"
+            else sanitize_error_summary(exc, max_length=2000)
+        )
         run_row = db.get(WorkflowRun, run_id)
         if run_row is not None:
             step = db.scalars(select(WorkflowStep).where(WorkflowStep.workflow_run_id == run_id).order_by(WorkflowStep.position)).first()
             if step is not None:
                 invocation = db.scalars(select(ModelInvocation).where(ModelInvocation.workflow_step_id == step.id, ModelInvocation.status == RunStatus.RUNNING)).first()
-                _fail_invocation(invocation, error_message, started=started, provider_task_id=step.provider_task_id)
+                _fail_invocation(
+                    invocation,
+                    error_message,
+                    started=started,
+                    provider_task_id=step.provider_task_id,
+                    error_code=failure_code,
+                )
                 step.status = RunStatus.FAILED; step.error_message = error_message; step.finished_at = utcnow()
                 # 已创建的片段保留 FAILED 版本，让前端可定位重试，而不是丢失供应商任务号。
                 clip = db.scalars(select(CommerceVideoClipVersion).where(CommerceVideoClipVersion.workflow_run_id == run_id)).first()

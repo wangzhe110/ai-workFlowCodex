@@ -11,17 +11,23 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
+from time import sleep
 from typing import Any, Protocol
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal
 from app.models import (
     ChapterPlan,
     CommerceChapterAttemptChapter,
+    CommerceCreativeBatch,
+    CommerceCreativeIdea,
+    CommerceCreativeIdeaStatus,
+    CommerceReferenceIntake,
+    CommerceStoryRunInput,
     CommerceWorkflowLink,
     CommerceWorkflowStep,
     DialogueLine,
@@ -32,6 +38,7 @@ from app.models import (
     ProductPlacementPlan,
     ProductPlacementStrength,
     ProductAssetVersion,
+    ProductAssetVersionStatus,
     Project,
     ProjectProductSelection,
     PromptTemplate,
@@ -323,6 +330,163 @@ def create_next_story_run(
         raise exc  # pragma: no cover
     db.refresh(story_run)
     return story_run
+
+
+def _locked_rerun_source(db: Session, source_story_run_id: str) -> tuple[StoryRun, CommerceStoryRunInput, CommerceCreativeIdea]:
+    """读取并锁定可重跑的 Commerce 主线输入。
+
+    ``CommerceCreativeIdea`` 也必须行锁：PostgreSQL 中所有从同一创意发起的重跑
+    都会在此处串行，从而在计算 ``max(run_number) + 1`` 前避免竞争。SQLite 不支持
+    行锁时，0021 的复合唯一约束仍是最终并发兜底，调用方会在受控事务里重新分配。
+    """
+
+    source = _locked_story_run(db, source_story_run_id)
+    if source.state.status == StoryRunStatus.CANCELLED:
+        _error("已取消的 StoryRun 不能作为重跑来源")
+    source_input = db.scalars(
+        select(CommerceStoryRunInput)
+        .where(CommerceStoryRunInput.story_run_id == source.id)
+        .with_for_update()
+    ).first()
+    if source_input is None:
+        _error("源 StoryRun 缺少冻结创意输入，不能重跑")
+    if source_input.run_number != source.run_number:
+        _error("源 StoryRun 的冻结输入编号不一致，不能重跑")
+
+    idea = db.scalars(
+        select(CommerceCreativeIdea)
+        .where(CommerceCreativeIdea.id == source_input.creative_idea_id)
+        .with_for_update()
+    ).first()
+    if idea is None or idea.status != CommerceCreativeIdeaStatus.SELECTED:
+        _error("源 StoryRun 没有关联有效的已选创意，不能重跑")
+    if idea.project_id != source.project_id or idea.topic_candidate_id != source.topic_candidate_id:
+        _error("源 StoryRun 的创意归属不一致，不能重跑")
+
+    batch = db.get(CommerceCreativeBatch, source_input.creative_batch_id)
+    intake = db.get(CommerceReferenceIntake, batch.reference_intake_id) if batch is not None else None
+    product = db.get(ProductAssetVersion, source_input.product_asset_version_id)
+    selection = db.get(ProjectProductSelection, source.project_product_selection_id)
+    frozen = source_input.input_snapshot if isinstance(source_input.input_snapshot, dict) else {}
+    expected_snapshot_ids = {
+        "reference_analysis": source_input.reference_analysis_id,
+        "script_analysis": source_input.script_analysis_version_id,
+        "product_asset_version": source_input.product_asset_version_id,
+        "creative_idea": source_input.creative_idea_id,
+    }
+    if (
+        batch is None
+        or intake is None
+        or product is None
+        or selection is None
+        or source.product_asset_version_id != source_input.product_asset_version_id
+        or selection.product_asset_version_id != source.product_asset_version_id
+        or batch.project_id != source.project_id
+        or product.status != ProductAssetVersionStatus.CONFIRMED
+        or product.frozen_at is None
+        or any(
+            not isinstance(frozen.get(key), dict) or frozen[key].get("id") != value
+            for key, value in expected_snapshot_ids.items()
+        )
+        or not isinstance(frozen.get("creative_batch"), dict)
+        or frozen["creative_batch"].get("id") != batch.id
+    ):
+        _error("源 StoryRun 的冻结输入不完整或已失效，不能重跑")
+    return source, source_input, idea
+
+
+def _next_creative_rerun_number(db: Session, creative_idea_id: str) -> int:
+    """从已持久化的创意运行输入计算下一个编号。
+
+    编号权威仍然是 ``StoryRun.run_number``。0021 仅在输入快照上维护经过触发器
+    校验的同值镜像，使这一查询与复合唯一约束能覆盖 PostgreSQL 和 SQLite。
+    """
+
+    return int(
+        db.scalar(
+            select(func.max(CommerceStoryRunInput.run_number)).where(
+                CommerceStoryRunInput.creative_idea_id == creative_idea_id
+            )
+        )
+        or 0
+    ) + 1
+
+
+def rerun_story_run(db: Session, *, source_story_run_id: str) -> tuple[StoryRun, WorkflowRun]:
+    """用同一已选创意的新编号创建完全独立的 StoryRun。
+
+    此操作只复制冻结业务输入并创建长期 Commerce 父 ``WorkflowRun``。它绝不创建
+    ``WorkflowStep``、ModelInvocation、下游资产或队列投递；新 Run 保持正常的
+    ``TOPIC/PENDING`` 初始状态，后续由用户显式 start/continue 触发。
+    """
+
+    # PostgreSQL 的创意行锁让正常并发请求顺序分配。SQLite 的 SELECT FOR UPDATE
+    # 是无操作，因此在唯一冲突时只回滚本次未提交事务并重新读取编号；不会留下
+    # 半成品 StoryRun、输入快照或父 WorkflowRun。
+    for retry_index in range(3):
+        try:
+            source, source_input, idea = _locked_rerun_source(db, source_story_run_id)
+            run_number = _next_creative_rerun_number(db, idea.id)
+            new_run = create_story_run(
+                db,
+                project_id=source.project_id,
+                topic_candidate_id=source.topic_candidate_id,
+                project_product_selection_id=source.project_product_selection_id,
+                product_asset_version_id=source.product_asset_version_id,
+                run_number=run_number,
+                mode=source.mode,
+            )
+            frozen_input = deepcopy(source_input.input_snapshot)
+            frozen_input["rerun"] = {
+                "source_story_run_id": source.id,
+                "source_run_number": source.run_number,
+                "created_at": utcnow().isoformat(),
+            }
+            db.add(
+                CommerceStoryRunInput(
+                    story_run_id=new_run.id,
+                    creative_batch_id=source_input.creative_batch_id,
+                    creative_idea_id=source_input.creative_idea_id,
+                    run_number=run_number,
+                    reference_analysis_id=source_input.reference_analysis_id,
+                    script_analysis_version_id=source_input.script_analysis_version_id,
+                    product_asset_version_id=source_input.product_asset_version_id,
+                    input_snapshot=frozen_input,
+                )
+            )
+            # 先 flush 输入复合唯一约束，再创建父运行。冲突时不会产生父运行或
+            # 下游资产；成功路径中二者与 StoryRun 同一事务提交。
+            db.flush()
+            workflow_run, created = _ensure_commerce_workflow(db, new_run)
+            if not created:
+                raise RuntimeError("新 StoryRun 未能创建独立 Commerce 父工作流")
+            db.commit()
+            db.refresh(new_run)
+            return new_run, workflow_run
+        except IntegrityError:
+            db.rollback()
+            if retry_index == 2:
+                _error("同一创意的 StoryRun 重跑并发冲突，请稍后重试")
+        except OperationalError as exc:
+            # SQLite 没有行锁；两个写事务恰好重叠时可能短暂返回 database is
+            # locked。该分支只重试尚未提交的本地事务，绝不重复提交已成功创建的 Run。
+            db.rollback()
+            if "locked" not in str(exc).lower() or retry_index == 2:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="创建重跑 StoryRun 时数据库暂不可用，请稍后重试",
+                ) from exc
+            sleep(0.02 * (retry_index + 1))
+        except HTTPException:
+            db.rollback()
+            raise
+        except Exception as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="无法创建重跑的 Commerce 父工作流，请检查工作流基础设施后重试",
+            ) from exc
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _active_run(db: Session, story_run_id: str) -> WorkflowRun | None:

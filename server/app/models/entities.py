@@ -801,9 +801,22 @@ class CommerceCreativeIdea(Base):
 
 
 class CommerceStoryRunInput(Base):
-    """StoryRun 所采用创意及全套上游冻结证据链的一对一快照。"""
+    """StoryRun 所采用创意及全套上游冻结证据链的一对一快照。
+
+    ``run_number`` 是父 ``StoryRun.run_number`` 的受数据库触发器保护的镜像。它只
+    用于让数据库能直接对 ``(creative_idea_id, run_number)`` 建立唯一约束；父
+    StoryRun 仍是编号的唯一权威来源，二者不允许漂移。
+    """
 
     __tablename__ = "commerce_story_run_inputs"
+    __table_args__ = (
+        UniqueConstraint(
+            "creative_idea_id",
+            "run_number",
+            name="uq_commerce_story_run_input_idea_run_number",
+        ),
+        Index("ix_commerce_story_run_inputs_creative_idea_id", "creative_idea_id"),
+    )
 
     story_run_id: Mapped[str] = mapped_column(
         ForeignKey("story_runs.id", ondelete="CASCADE"), primary_key=True
@@ -812,8 +825,9 @@ class CommerceStoryRunInput(Base):
         ForeignKey("commerce_creative_batches.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     creative_idea_id: Mapped[str] = mapped_column(
-        ForeignKey("commerce_creative_ideas.id", ondelete="RESTRICT"), nullable=False, unique=True, index=True
+        ForeignKey("commerce_creative_ideas.id", ondelete="RESTRICT"), nullable=False
     )
+    run_number: Mapped[int] = mapped_column(Integer, nullable=False)
     reference_analysis_id: Mapped[str] = mapped_column(
         ForeignKey("reference_analyses.id", ondelete="RESTRICT"), nullable=False, index=True
     )

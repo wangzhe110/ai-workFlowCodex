@@ -2,8 +2,15 @@
 
 from pathlib import Path
 
+import pytest
+
 from app.services import analysis_provider
-from app.services.analysis_provider import VideoGenerationInput, VolcengineArkVideoProvider
+from app.services.analysis_provider import (
+    ProviderPollNetworkError,
+    ProviderTransportError,
+    VideoGenerationInput,
+    VolcengineArkVideoProvider,
+)
 from app.services.storage import LocalImageReference, local_asset_storage
 
 
@@ -133,6 +140,20 @@ def test_ark_provider_reads_succeeded_video_url(monkeypatch) -> None:
 
     assert result.status == "SUCCEEDED"
     assert result.video_url == "https://cdn.example/generated.mp4"
+
+
+def test_ark_provider_maps_existing_task_transport_failure_to_recoverable_poll_error(monkeypatch) -> None:
+    """已有任务号的 GET 连接波动必须有专属语义，不能被误判为创建失败。"""
+
+    monkeypatch.setenv("ARK_API_KEY", "test-key")
+    monkeypatch.setattr(
+        analysis_provider,
+        "_get_json",
+        lambda *_args: (_ for _ in ()).throw(ProviderTransportError("safe transport failure")),
+    )
+
+    with pytest.raises(ProviderPollNetworkError, match="恢复查询"):
+        VolcengineArkVideoProvider(_snapshot()).poll("ark-existing-task")
 
 
 def test_ark_provider_treats_expired_as_terminal_failure(monkeypatch) -> None:

@@ -506,7 +506,7 @@ def test_render_batch_reuses_existing_workflow_run(commerce_db) -> None:
 
 
 def test_alembic_commerce_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
-    """验证 Commerce 迁移链可往返，且最终只有当前 Slice 2 head。"""
+    """验证 Commerce 迁移链可往返，且最终只有当前 0021 head。"""
 
     server_root = Path(__file__).resolve().parents[1]
     database_path = tmp_path / "commerce-migration.db"
@@ -528,7 +528,7 @@ def test_alembic_commerce_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
 
     config = Config(str(server_root / "alembic.ini"))
     config.set_main_option("script_location", str(server_root / "migrations"))
-    assert ScriptDirectory.from_config(config).get_heads() == ["0020_phase4_asset_center_foreign_key_repair"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["0021_commerce_story_run_rerun"]
 
     run_revision("upgrade", "0010_commerce_domain_foundation")
     run_revision("upgrade", "head")
@@ -546,6 +546,9 @@ def test_alembic_commerce_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
             inspect(migration_engine).get_table_names()
         )
         assert "story_run_id" not in {column["name"] for column in inspect(migration_engine).get_columns("workflow_runs")}
+        assert "run_number" in {
+            column["name"] for column in inspect(migration_engine).get_columns("commerce_story_run_inputs")
+        }
     finally:
         migration_engine.dispose()
 
@@ -578,6 +581,9 @@ def test_alembic_commerce_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
             column["name"] for column in inspect(migration_engine).get_columns("product_analysis_versions")
         }
         assert "commerce_final_videos" in inspect(migration_engine).get_table_names()
+        assert "run_number" in {
+            column["name"] for column in inspect(migration_engine).get_columns("commerce_story_run_inputs")
+        }
     finally:
         migration_engine.dispose()
 

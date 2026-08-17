@@ -590,6 +590,7 @@ def select_creative_idea(
             story_run_id=story_run.id,
             creative_batch_id=batch.id,
             creative_idea_id=idea.id,
+            run_number=story_run.run_number,
             reference_analysis_id=analysis_id,
             script_analysis_version_id=script_id,
             product_asset_version_id=product.id,

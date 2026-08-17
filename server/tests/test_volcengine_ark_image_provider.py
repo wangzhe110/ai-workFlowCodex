@@ -188,7 +188,7 @@ def test_ark_seedream_post_does_not_retry_and_rejects_untrusted_reference_urls(m
 
     monkeypatch.setenv("ARK_API_KEY", "unit-test-ark-key")
     monkeypatch.setattr(analysis_provider, "urlopen", fail_once)
-    with pytest.raises(RuntimeError, match="无法连接中转站"):
+    with pytest.raises(RuntimeError, match="供应商接口暂时无法连接"):
         VolcengineArkImageProvider(_snapshot()).generate("测试产品图")
     assert calls == 1
 

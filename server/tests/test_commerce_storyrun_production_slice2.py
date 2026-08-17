@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from base64 import b64decode, b64encode
+from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
 from subprocess import CalledProcessError
@@ -36,7 +37,10 @@ from app.models import (
     WorkflowStep,
 )
 from app.services import commerce_production_service
-from app.services.commerce_production_service import create_production_run
+from app.services.commerce_production_service import (
+    create_production_run,
+    resume_video_clip_provider_task,
+)
 
 
 def _video() -> bytes:
@@ -781,3 +785,388 @@ def test_slice2_failed_shot_retries_only_that_shot_without_restarting_story_run(
         clips = [item for item in assets["clips"] if item["shot_id"] == shot["shot_id"]]
         assert len(clips) == 1 and clips[0]["status"] == "SUCCEEDED"
         assert all(item["shot_id"] == shot["shot_id"] for item in clips)
+
+
+def _prepare_failed_ark_video_clip(client: TestClient) -> dict[str, str]:
+    """创建一条已有方舟任务号、但因本地轮询失败的历史片段，完全不调用真实供应商。"""
+
+    story_run_id, _ = _make_story_run(client)
+    _operation(client, story_run_id, "CHARACTER_DESIGN")
+    character = _assets(client, story_run_id)["character_designs"][0]
+    _lock(client, f"/api/v1/commerce/story-runs/{story_run_id}/character-designs/{character['id']}/lock")
+    _operation(client, story_run_id, "SCENE_DESIGN")
+    scene = _assets(client, story_run_id)["scene_designs"][0]
+    _lock(client, f"/api/v1/commerce/story-runs/{story_run_id}/scene-designs/{scene['id']}/lock")
+    _operation(client, story_run_id, "STORYBOARD")
+    board = _assets(client, story_run_id)["storyboards"][0]
+    _lock(client, f"/api/v1/commerce/story-runs/{story_run_id}/storyboards/{board['id']}/lock")
+    _operation(client, story_run_id, "CHARACTER_IMAGES")
+    for image in _assets(client, story_run_id)["character_images"]:
+        _lock(client, f"/api/v1/commerce/story-runs/{story_run_id}/images/CHARACTER/{image['id']}/lock")
+    _operation(client, story_run_id, "SCENE_IMAGES")
+    for image in _assets(client, story_run_id)["scene_images"]:
+        _lock(client, f"/api/v1/commerce/story-runs/{story_run_id}/images/SCENE/{image['id']}/lock")
+    shot = board["content"]["shots"][0]
+    _operation(client, story_run_id, "SHOT_KEYFRAME", target_id=shot["shot_id"])
+    keyframe = _assets(client, story_run_id)["keyframes"][0]
+    _lock(client, f"/api/v1/commerce/story-runs/{story_run_id}/images/KEYFRAME/{keyframe['id']}/lock")
+    _operation(client, story_run_id, "VIDEO_PROMPT", target_id=shot["shot_id"])
+
+    db = SessionLocal()
+    try:
+        story = db.get(StoryRun, story_run_id)
+        slot = db.scalar(select(ModelSlot).where(ModelSlot.slot_key == "VIDEO_GENERATE"))
+        assert story is not None and slot is not None
+        profile = ModelProfile(
+            step_key="VIDEO_GENERATE",
+            provider_key="volcengine_ark_video",
+            adapter_key="volcengine_ark_video",
+            model_key="doubao-seedance-2-5-260628",
+            model_version="resume-test",
+            display_name="Resume existing Ark task",
+            version=9100,
+            provider_config={
+                "api_base_url": "https://ark.cn-beijing.volces.com/api/v3",
+                "secret_env_name": "ARK_API_KEY",
+                "duration": 5,
+                "resolution": "480p",
+                "generate_audio": False,
+                "poll_interval_seconds": 1,
+                "poll_network_retry_count": 0,
+            },
+            is_active=False,
+            profile_status="ACTIVE",
+        )
+        db.add(profile)
+        db.flush()
+        source_run, created = create_production_run(
+            db, story_run_id=story_run_id, operation="VIDEO_RENDER", target_id=shot["shot_id"]
+        )
+        assert created is True
+        source_step = db.scalar(select(WorkflowStep).where(WorkflowStep.workflow_run_id == source_run.id))
+        context = source_run.input_snapshot["commerce_production"]
+        prompt = db.scalar(
+            select(CommerceVideoPromptVersion).where(
+                CommerceVideoPromptVersion.storyboard_version_id == context["storyboard"]["id"],
+                CommerceVideoPromptVersion.shot_id == shot["shot_id"],
+                CommerceVideoPromptVersion.status == "LOCKED",
+            )
+        )
+        assert source_step is not None and prompt is not None
+        binding = {
+            "slot_id": slot.id,
+            "slot_key": "VIDEO_GENERATE",
+            "model_profile_id": profile.id,
+            "profile_snapshot": {
+                "profile_id": profile.id,
+                "adapter_key": "volcengine_ark_video",
+                "provider_key": "volcengine_ark_video",
+                "model_key": "doubao-seedance-2-5-260628",
+                "model_version": "resume-test",
+                "version": profile.version,
+                "provider_config": dict(profile.provider_config),
+            },
+        }
+        source_snapshot = dict(source_run.input_snapshot)
+        source_snapshot["model_binding"] = binding
+        source_run.input_snapshot = source_snapshot
+        source_step.model_profile_snapshot = {
+            "binding": binding,
+            "prompt_template": source_snapshot["prompt_template"],
+        }
+        source_run.status = RunStatus.FAILED
+        source_step.status = RunStatus.FAILED
+        source_step.provider_task_id = "existing-ark-task"
+        invocation = ModelInvocation(
+            project_id=story.project_id,
+            workflow_run_id=source_run.id,
+            workflow_step_id=source_step.id,
+            model_slot_id=slot.id,
+            model_profile_id=profile.id,
+            prompt_template_id=source_snapshot["prompt_template"]["id"],
+            task_type="VIDEO_GENERATE",
+            model_profile_snapshot=dict(binding["profile_snapshot"]),
+            prompt_snapshot=dict(source_snapshot["prompt_template"]),
+            input_snapshot={"first_frame_asset": {"asset_id": keyframe["id"], "role": "first_frame"}},
+            output_reference={"failure": {"code": "PROVIDER_POLL_NETWORK_ERROR"}},
+            provider_task_id="existing-ark-task",
+            idempotency_key=f"source-video-invocation:{source_step.id}",
+            status=RunStatus.FAILED,
+            error_code="PROVIDER_POLL_NETWORK_ERROR",
+        )
+        db.add(invocation)
+        db.flush()
+        clip = CommerceVideoClipVersion(
+            story_run_id=story.id,
+            storyboard_version_id=context["storyboard"]["id"],
+            shot_id=shot["shot_id"],
+            shot_number=shot["shot_number"],
+            keyframe_version_id=prompt.keyframe_version_id,
+            video_prompt_version_id=prompt.id,
+            workflow_run_id=source_run.id,
+            model_invocation_id=invocation.id,
+            version=1,
+            idempotency_key=f"source-video-clip:{source_step.id}",
+            provider_task_id="existing-ark-task",
+            input_asset_snapshot={"first_frame_asset": {"asset_id": keyframe["id"], "role": "first_frame"}},
+            status="FAILED",
+            error_message="供应商任务轮询暂时无法连接，可使用已保存的任务号恢复查询",
+        )
+        db.add(clip)
+        db.commit()
+        return {
+            "story_run_id": story.id,
+            "source_run_id": source_run.id,
+            "source_step_id": source_step.id,
+            "source_invocation_id": invocation.id,
+            "source_clip_id": clip.id,
+            "profile_id": profile.id,
+        }
+    finally:
+        db.close()
+
+
+def test_resume_existing_provider_task_never_submits_again_and_preserves_old_failure(monkeypatch) -> None:
+    """恢复已有方舟成功任务只 GET/下载，且新旧本地 attempt 与审计清晰隔离。"""
+
+    with TestClient(app) as client:
+        source = _prepare_failed_ark_video_clip(client)
+        db = SessionLocal()
+        try:
+            resumed, created = resume_video_clip_provider_task(
+                db, story_run_id=source["story_run_id"], source_clip_id=source["source_clip_id"]
+            )
+            duplicate, duplicate_created = resume_video_clip_provider_task(
+                db, story_run_id=source["story_run_id"], source_clip_id=source["source_clip_id"]
+            )
+            assert created is True
+            assert duplicate_created is False
+            assert duplicate.id == resumed.id
+            recovery = resumed.input_snapshot["provider_task_recovery"]
+            assert recovery["execution_mode"] == "resume_provider_task"
+            assert recovery["recovered_provider_task_id"] == "existing-ark-task"
+            assert recovery["provider_create_post_count"] == 0
+            assert recovery["recovered_from_video_clip_id"] == source["source_clip_id"]
+            assert recovery["source_workflow_run_id"] == source["source_run_id"]
+            assert recovery["source_workflow_step_id"] == source["source_step_id"]
+            assert recovery["source_model_invocation_id"] == source["source_invocation_id"]
+            assert recovery["source_video_prompt_version_id"]
+            assert recovery["source_keyframe_version_id"]
+            assert recovery["source_storyboard_version_id"]
+            assert recovery["source_shot_id"]
+            assert recovery["recovery_attempt"] == 1
+            resumed_id = resumed.id
+        finally:
+            db.close()
+
+        calls: list[str] = []
+
+        class ExistingTaskProvider:
+            def submit(self, _request):  # pragma: no cover - 调用即代表违反“恢复不得 POST”。
+                raise AssertionError("恢复已有 provider_task_id 时不得创建新视频任务")
+
+            def poll(self, task_id: str) -> VideoTaskResult:
+                calls.append(task_id)
+                if len(calls) == 1:
+                    return VideoTaskResult(provider_task_id=task_id, status="PENDING")
+                return VideoTaskResult(
+                    provider_task_id=task_id,
+                    status="SUCCEEDED",
+                    video_url="https://cdn.example.invalid/recovered.mp4?signature=temporary",
+                )
+
+        monkeypatch.setattr(commerce_production_service, "video_provider", lambda _snapshot: ExistingTaskProvider())
+        monkeypatch.setattr("app.services.v1_model_adapter_service.time.sleep", lambda _seconds: None)
+        monkeypatch.setattr(
+            commerce_production_service.local_asset_storage,
+            "download_generated_video",
+            lambda _url: ("video/mp4", b"\x00\x00\x00\x18ftypisomtest-mp4"),
+        )
+        monkeypatch.setattr(
+            commerce_production_service.local_asset_storage,
+            "save_generated_video_bytes",
+            lambda **_kwargs: "/media/generated/projects/project-1/commerce-video/recovered/v2.mp4",
+        )
+        monkeypatch.setattr(
+            commerce_production_service.local_asset_storage,
+            "generated_media_path",
+            lambda _url: Path("/tmp/recovered-video.mp4"),
+        )
+        monkeypatch.setattr(
+            commerce_production_service,
+            "_probe_mp4",
+            lambda _path: {"duration_ms": 5000, "width": 854, "height": 480, "frame_rate": 24.0, "video_codec": "h264", "audio_track_count": 0},
+        )
+
+        commerce_production_service.execute_commerce_production_workflow(resumed_id)
+        assert calls == ["existing-ark-task", "existing-ark-task"]
+        db = SessionLocal()
+        try:
+            old_run = db.get(WorkflowRun, source["source_run_id"])
+            old_step = db.get(WorkflowStep, source["source_step_id"])
+            old_invocation = db.get(ModelInvocation, source["source_invocation_id"])
+            old_clip = db.get(CommerceVideoClipVersion, source["source_clip_id"])
+            resumed_run = db.get(WorkflowRun, resumed_id)
+            resumed_step = db.scalar(select(WorkflowStep).where(WorkflowStep.workflow_run_id == resumed_id))
+            resumed_invocation = db.scalar(select(ModelInvocation).where(ModelInvocation.workflow_run_id == resumed_id))
+            resumed_clip = db.scalar(select(CommerceVideoClipVersion).where(CommerceVideoClipVersion.workflow_run_id == resumed_id))
+            assert old_run.status == RunStatus.FAILED
+            assert old_step.status == RunStatus.FAILED
+            assert old_invocation.status == RunStatus.FAILED
+            assert old_clip.status == "FAILED" and old_clip.video_url is None
+            assert resumed_run.status == RunStatus.SUCCEEDED
+            assert resumed_step.status == RunStatus.SUCCEEDED
+            assert resumed_invocation.status == RunStatus.SUCCEEDED
+            assert resumed_clip.status == "SUCCEEDED"
+            assert resumed_clip.id != old_clip.id
+            assert resumed_clip.provider_task_id == old_clip.provider_task_id == "existing-ark-task"
+            assert resumed_clip.input_asset_snapshot["provider_task_recovery"]["provider_create_post_count"] == 0
+            assert resumed_invocation.input_snapshot["provider_task_recovery"]["recovered_from_video_clip_id"] == old_clip.id
+            assert "data:image" not in str(resumed_run.input_snapshot)
+            assert "signature=" not in str(resumed_clip.media_metadata)
+            same, same_created = resume_video_clip_provider_task(
+                db, story_run_id=source["story_run_id"], source_clip_id=source["source_clip_id"]
+            )
+            assert same_created is False and same.id == resumed_id
+        finally:
+            db.close()
+        repeated_endpoint = client.post(
+            f"/api/v1/commerce/story-runs/{source['story_run_id']}/clips/{source['source_clip_id']}/resume-provider-task"
+        )
+        assert repeated_endpoint.status_code == 202, repeated_endpoint.text
+        assert repeated_endpoint.json()["id"] == resumed_id
+
+
+def test_poll_network_failure_uses_recoverable_error_code_without_second_submit(monkeypatch) -> None:
+    """全部 GET 重试失败时保留 task ID，标记可人工恢复的安全错误码。"""
+
+    from app.services.analysis_provider import ProviderPollNetworkError
+
+    with TestClient(app) as client:
+        source = _prepare_failed_ark_video_clip(client)
+        db = SessionLocal()
+        try:
+            resumed, created = resume_video_clip_provider_task(
+                db, story_run_id=source["story_run_id"], source_clip_id=source["source_clip_id"]
+            )
+            assert created is True
+            resumed_id = resumed.id
+        finally:
+            db.close()
+
+        class NetworkFailureProvider:
+            def submit(self, _request):  # pragma: no cover - 再次 POST 必须立即暴露。
+                raise AssertionError("恢复不得调用 submit")
+
+            def poll(self, task_id: str) -> VideoTaskResult:
+                assert task_id == "existing-ark-task"
+                raise ProviderPollNetworkError("temporary")
+
+        monkeypatch.setattr(commerce_production_service, "video_provider", lambda _snapshot: NetworkFailureProvider())
+        monkeypatch.setattr("app.services.v1_model_adapter_service.time.sleep", lambda _seconds: None)
+        commerce_production_service.execute_commerce_production_workflow(resumed_id)
+
+        db = SessionLocal()
+        try:
+            run = db.get(WorkflowRun, resumed_id)
+            step = db.scalar(select(WorkflowStep).where(WorkflowStep.workflow_run_id == resumed_id))
+            invocation = db.scalar(select(ModelInvocation).where(ModelInvocation.workflow_run_id == resumed_id))
+            clip = db.scalar(select(CommerceVideoClipVersion).where(CommerceVideoClipVersion.workflow_run_id == resumed_id))
+            assert run.status == RunStatus.FAILED
+            assert step.status == RunStatus.FAILED and step.provider_task_id == "existing-ark-task"
+            assert invocation.status == RunStatus.FAILED
+            assert invocation.error_code == "PROVIDER_POLL_NETWORK_ERROR"
+            assert invocation.provider_task_id == "existing-ark-task"
+            assert clip.status == "FAILED" and clip.provider_task_id == "existing-ark-task"
+            assert "恢复查询" in (step.error_message or "")
+        finally:
+            db.close()
+
+
+@pytest.mark.parametrize(
+    ("provider_result", "download_fails", "expected_code"),
+    [
+        (VideoTaskResult(provider_task_id="existing-ark-task", status="FAILED", error_message="supplier terminal failure"), False, "PROVIDER_TASK_FAILED"),
+        (VideoTaskResult(provider_task_id="existing-ark-task", status="SUCCEEDED", video_url="https://cdn.example.invalid/result.mp4?signature=temporary"), True, "VIDEO_DOWNLOAD_FAILED"),
+    ],
+)
+def test_resume_distinguishes_supplier_terminal_failure_from_download_failure(
+    monkeypatch, provider_result: VideoTaskResult, download_fails: bool, expected_code: str
+) -> None:
+    """已提交任务的供应商终态失败与后续下载失败必须在审计中可区分。"""
+
+    with TestClient(app) as client:
+        source = _prepare_failed_ark_video_clip(client)
+        db = SessionLocal()
+        try:
+            resumed, created = resume_video_clip_provider_task(
+                db, story_run_id=source["story_run_id"], source_clip_id=source["source_clip_id"]
+            )
+            assert created is True
+            resumed_id = resumed.id
+        finally:
+            db.close()
+
+        class ResultProvider:
+            def submit(self, _request):  # pragma: no cover - 恢复路径不允许 POST。
+                raise AssertionError("恢复不得调用 submit")
+
+            def poll(self, task_id: str) -> VideoTaskResult:
+                assert task_id == "existing-ark-task"
+                return provider_result
+
+        monkeypatch.setattr(commerce_production_service, "video_provider", lambda _snapshot: ResultProvider())
+        if download_fails:
+            monkeypatch.setattr(
+                commerce_production_service.local_asset_storage,
+                "download_generated_video",
+                lambda _url: (_ for _ in ()).throw(RuntimeError("download transport error")),
+            )
+        commerce_production_service.execute_commerce_production_workflow(resumed_id)
+
+        db = SessionLocal()
+        try:
+            invocation = db.scalar(select(ModelInvocation).where(ModelInvocation.workflow_run_id == resumed_id))
+            clip = db.scalar(select(CommerceVideoClipVersion).where(CommerceVideoClipVersion.workflow_run_id == resumed_id))
+            assert invocation is not None and invocation.error_code == expected_code
+            assert clip is not None and clip.status == "FAILED"
+            assert clip.provider_task_id == "existing-ark-task"
+        finally:
+            db.close()
+
+
+def test_concurrent_resume_requests_share_one_active_recovery_attempt() -> None:
+    """两个并发恢复请求只能预留同一个本地 attempt，尚未执行时也不会有重复 Clip。"""
+
+    with TestClient(app) as client:
+        source = _prepare_failed_ark_video_clip(client)
+
+        def request_resume() -> tuple[str, bool]:
+            db = SessionLocal()
+            try:
+                run, created = resume_video_clip_provider_task(
+                    db, story_run_id=source["story_run_id"], source_clip_id=source["source_clip_id"]
+                )
+                return run.id, created
+            finally:
+                db.close()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            responses = list(executor.map(lambda _index: request_resume(), range(2)))
+        assert {run_id for run_id, _created in responses}.__len__() == 1
+        assert sum(1 for _run_id, created in responses if created) == 1
+
+        db = SessionLocal()
+        try:
+            recovery_runs = commerce_production_service._recovery_runs_for_clip(
+                db, source_clip_id=source["source_clip_id"]
+            )
+            assert len(recovery_runs) == 1
+            assert recovery_runs[0].status == RunStatus.PENDING
+            assert not db.scalars(
+                select(CommerceVideoClipVersion).where(
+                    CommerceVideoClipVersion.workflow_run_id == recovery_runs[0].id
+                )
+            ).all()
+        finally:
+            db.close()

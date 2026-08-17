@@ -25,6 +25,10 @@ from app.schemas import (
     CommerceProductionActionRequest,
     CommerceProductionAssetsResponse,
     CommerceProductionImageResponse,
+    CommerceInternalSmokeBootstrapResponse,
+    CommerceInternalSmokeConfirmRequest,
+    CommerceInternalSmokeVideoPromptRequest,
+    CommerceInternalSmokeVideoPromptResponse,
     CommerceProductionReviewRequest,
     CommerceProductionVersionResponse,
     CommerceVideoClipResponse,
@@ -44,6 +48,7 @@ from app.services.commerce_workflow_service import (
     resume_story_run,
     retry_step,
     review_stage,
+    rerun_story_run,
     reviews_for_story_run,
     start_story_run,
     workflow_for_story_run,
@@ -56,7 +61,12 @@ from app.services.commerce_production_service import (
     lock_image,
     lock_scene_design,
     lock_storyboard,
+    resume_video_clip_provider_task,
     review_video_clip,
+)
+from app.services.commerce_internal_smoke_service import (
+    bootstrap_internal_smoke,
+    create_internal_smoke_video_prompt,
 )
 from app.services.storage import local_asset_storage
 from app.services.sensitive_data import redact_sensitive_data
@@ -202,8 +212,15 @@ def _story_run_response(db: Session, story_run) -> CommerceStoryRunResponse:
             if isinstance(artifacts, dict):
                 refs[step.step_key] = artifacts
     state = story_run.state
+    mainline_snapshot = (story_run.mainline_input.input_snapshot if story_run.mainline_input else {}) or {}
+    rerun_metadata = mainline_snapshot.get("rerun") if isinstance(mainline_snapshot, dict) else {}
+    source_story_run_id = rerun_metadata.get("source_story_run_id") if isinstance(rerun_metadata, dict) else None
+    parent_workflow_run_id = runs[0].id if runs else None
     return CommerceStoryRunResponse(
         id=story_run.id, project_id=story_run.project_id, topic_candidate_id=story_run.topic_candidate_id,
+        creative_idea_id=story_run.mainline_input.creative_idea_id if story_run.mainline_input else None,
+        workflow_run_id=parent_workflow_run_id,
+        source_story_run_id=source_story_run_id if isinstance(source_story_run_id, str) else None,
         project_product_selection_id=story_run.project_product_selection_id,
         product_asset_version_id=story_run.product_asset_version_id, run_number=story_run.run_number,
         mode=story_run.mode.value, current_stage=state.current_stage.value, current_status=state.status.value,
@@ -249,6 +266,14 @@ def list_story_runs_endpoint(project_id: str, db: Session = Depends(get_db)) -> 
 @router.get("/story-runs/{story_run_id}", response_model=CommerceStoryRunResponse)
 def get_story_run_endpoint(story_run_id: str, db: Session = Depends(get_db)) -> CommerceStoryRunResponse:
     return _story_run_response(db, get_story_run(db, story_run_id))
+
+
+@router.post("/story-runs/{story_run_id}/rerun", response_model=CommerceStoryRunResponse, status_code=status.HTTP_201_CREATED)
+def rerun_story_run_endpoint(story_run_id: str, db: Session = Depends(get_db)) -> CommerceStoryRunResponse:
+    """从已选创意的冻结输入创建独立新 Run；不启动或投递任何模型任务。"""
+
+    story_run, _workflow_run = rerun_story_run(db, source_story_run_id=story_run_id)
+    return _story_run_response(db, story_run)
 
 
 @router.post("/story-runs/{story_run_id}/start", response_model=CommerceStoryRunResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -360,6 +385,40 @@ def production_assets_endpoint(story_run_id: str, db: Session = Depends(get_db))
     )
 
 
+@router.post(
+    "/story-runs/{story_run_id}/internal-smoke/bootstrap",
+    response_model=CommerceInternalSmokeBootstrapResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def bootstrap_internal_smoke_endpoint(
+    story_run_id: str, payload: CommerceInternalSmokeConfirmRequest, db: Session = Depends(get_db)
+) -> CommerceInternalSmokeBootstrapResponse:
+    """建立固定非真人内部验收输入；不读取模型配置也不投递 Worker。"""
+
+    return CommerceInternalSmokeBootstrapResponse(
+        story_run_id=story_run_id,
+        **bootstrap_internal_smoke(db, story_run_id=story_run_id, confirm=payload.confirm),
+    )
+
+
+@router.post(
+    "/story-runs/{story_run_id}/internal-smoke/video-prompt",
+    response_model=CommerceInternalSmokeVideoPromptResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def internal_smoke_video_prompt_endpoint(
+    story_run_id: str, payload: CommerceInternalSmokeVideoPromptRequest, db: Session = Depends(get_db)
+) -> CommerceInternalSmokeVideoPromptResponse:
+    """只为已锁定的内部关键帧创建固定 Prompt；不调用导演文本模型。"""
+
+    return CommerceInternalSmokeVideoPromptResponse(
+        story_run_id=story_run_id,
+        **create_internal_smoke_video_prompt(
+            db, story_run_id=story_run_id, keyframe_id=payload.keyframe_id, confirm=payload.confirm
+        ),
+    )
+
+
 @router.post("/story-runs/{story_run_id}/production/{operation}", response_model=CommerceWorkflowRunResponse, status_code=status.HTTP_202_ACCEPTED)
 def create_production_action_endpoint(
     story_run_id: str,
@@ -370,6 +429,27 @@ def create_production_action_endpoint(
 ) -> CommerceWorkflowRunResponse:
     run, created = create_production_run(
         db, story_run_id=story_run_id, operation=operation, target_id=payload.target_id, retry=payload.retry
+    )
+    if created:
+        _dispatch_or_service_unavailable(background_tasks, run)
+    return _workflow_response(run)
+
+
+@router.post(
+    "/story-runs/{story_run_id}/clips/{clip_id}/resume-provider-task",
+    response_model=CommerceWorkflowRunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def resume_video_clip_provider_task_endpoint(
+    story_run_id: str,
+    clip_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+) -> CommerceWorkflowRunResponse:
+    """只恢复一个已失败、已有供应商任务号的片段；服务端不接受外部 task ID。"""
+
+    run, created = resume_video_clip_provider_task(
+        db, story_run_id=story_run_id, source_clip_id=clip_id
     )
     if created:
         _dispatch_or_service_unavailable(background_tasks, run)

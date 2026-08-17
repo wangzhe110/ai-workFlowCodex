@@ -23,6 +23,7 @@ from app.services.analysis_provider import (
     OpenAICompatibleImageProvider,
     OpenAICompatibleJsonProvider,
     OpenAICompatibleVisionAnalysisProvider,
+    ProviderPollNetworkError,
     VideoAnalysisInput,
     VideoGenerationInput,
     VideoGenerationProvider,
@@ -341,6 +342,16 @@ def wait_for_video_result(
         raise RuntimeError("poll_interval_seconds 和 max_poll_seconds 必须为数字") from exc
     interval = min(max(interval, 1), 60)
     maximum_wait = min(max(maximum_wait, 10), 1800)
+    # 只对已持久化任务号的 GET 查询做极小、受限的网络重试。视频创建 POST 永远
+    # 不在这个函数内发生，因此连接抖动不会带来第二次付费提交。
+    try:
+        network_retry_limit = int(config.get("poll_network_retry_count", 2))
+        network_retry_backoff = float(config.get("poll_network_retry_backoff_seconds", 1))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("视频轮询网络重试配置必须为数字") from exc
+    network_retry_limit = min(max(network_retry_limit, 0), 3)
+    network_retry_backoff = min(max(network_retry_backoff, 0.1), 5.0)
+    network_failures = 0
     deadline = time.monotonic() + maximum_wait
     result = first_result
     while result.status == "PENDING":
@@ -351,7 +362,14 @@ def wait_for_video_result(
                 error_message="等待视频供应商结果超时；请检查任务号和模型配置后重新生成",
             )
         time.sleep(interval)
-        result = provider.poll(task_id)
+        try:
+            result = provider.poll(task_id)
+        except ProviderPollNetworkError:
+            network_failures += 1
+            if network_failures > network_retry_limit or time.monotonic() >= deadline:
+                raise
+            time.sleep(min(network_retry_backoff * network_failures, 5.0))
+            continue
         task_id = result.provider_task_id or task_id
     return result
 

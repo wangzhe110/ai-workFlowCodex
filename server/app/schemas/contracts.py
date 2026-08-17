@@ -832,6 +832,12 @@ class CommerceStoryRunResponse(BaseModel):
     id: str
     project_id: str
     topic_candidate_id: str
+    # 这两个字段让重跑 API 的调用方无需从安全快照或嵌套工作流对象反查来源。
+    # 它们均为既有冻结关联的只读投影，不引入第二套关联关系。
+    creative_idea_id: Optional[str] = None
+    workflow_run_id: Optional[str] = None
+    # 仅重跑创建的运行携带来源；普通首次选择创意的运行保持为空。
+    source_story_run_id: Optional[str] = None
     project_product_selection_id: str
     product_asset_version_id: str
     run_number: int
@@ -878,6 +884,46 @@ class CommerceProductionActionRequest(BaseModel):
 class CommerceProductionReviewRequest(BaseModel):
     reviewer_label: str = Field(default="制作人", min_length=1, max_length=120)
     note: Optional[str] = Field(default=None, max_length=4000)
+
+
+class CommerceInternalSmokeConfirmRequest(BaseModel):
+    """内网单机技术验收的显式确认语。接口不接受路径、URL 或 Base64。"""
+
+    confirm: str = Field(min_length=1, max_length=80)
+
+
+class CommerceInternalSmokeVideoPromptRequest(CommerceInternalSmokeConfirmRequest):
+    """只允许为已锁定的内部关键帧追加固定视频 Prompt。"""
+
+    keyframe_id: str = Field(min_length=1, max_length=36)
+
+
+class CommerceInternalSmokeBootstrapResponse(BaseModel):
+    story_run_id: str
+    workflow_run_id: Optional[str]
+    workflow_step_id: Optional[str]
+    outline_id: str
+    character_design_id: str
+    scene_design_id: str
+    storyboard_id: str
+    character_image_id: str
+    scene_image_id: str
+    shot_id: str
+    current_stage: str
+    current_status: str
+    idempotent: bool
+
+
+class CommerceInternalSmokeVideoPromptResponse(BaseModel):
+    story_run_id: str
+    workflow_run_id: Optional[str]
+    workflow_step_id: Optional[str]
+    video_prompt_id: str
+    keyframe_id: str
+    shot_id: str
+    current_stage: str
+    current_status: str
+    idempotent: bool
 
 
 class CommerceProductionVersionResponse(BaseModel):

@@ -926,6 +926,63 @@ def _prepare_failed_ark_video_clip(client: TestClient) -> dict[str, str]:
         db.close()
 
 
+def test_production_assets_expose_safe_provider_task_recovery_affordance() -> None:
+    """生产台只接收后端给出的恢复资格和脱敏错误码，浏览器不需推断任务号语义。"""
+
+    with TestClient(app) as client:
+        source = _prepare_failed_ark_video_clip(client)
+        assets = _assets(client, source["story_run_id"])
+        clip = next(item for item in assets["clips"] if item["id"] == source["source_clip_id"])
+        assert clip["status"] == "FAILED"
+        assert clip["can_resume_provider_task"] is True
+        assert clip["error_code"] == "PROVIDER_POLL_NETWORK_ERROR"
+        assert clip["file_size_bytes"] is None
+        assert clip["provider_task_id"] == "existing-ark-task"
+        assert "data:image" not in str(clip)
+        assert "authorization" not in str(clip).lower()
+
+        # 没有已持久化供应商任务号时，普通重试仍是唯一入口，不能误显示“恢复”。
+        db = SessionLocal()
+        try:
+            row = db.get(CommerceVideoClipVersion, source["source_clip_id"])
+            assert row is not None
+            row.provider_task_id = None
+            db.commit()
+        finally:
+            db.close()
+        refreshed = _assets(client, source["story_run_id"])
+        without_task = next(item for item in refreshed["clips"] if item["id"] == source["source_clip_id"])
+        assert without_task["can_resume_provider_task"] is False
+
+
+def test_production_assets_do_not_expose_signed_video_urls_or_provider_identifiers() -> None:
+    """历史异常记录即使有供应商临时 URL，也不能回显到生产工作台。"""
+
+    with TestClient(app) as client:
+        source = _prepare_failed_ark_video_clip(client)
+        db = SessionLocal()
+        try:
+            clip = db.get(CommerceVideoClipVersion, source["source_clip_id"])
+            assert clip is not None
+            provider_url = "https://provider.example/video.mp4"
+            signed_url = f"{provider_url}?X-Amz-Signature={'test-signature'}&X-Amz-Credential={'temporary'}"
+            clip.video_url = signed_url
+            clip.error_message = (
+                f"video download failed: {signed_url} "
+                "Your account 123456 Request id: abc-123"
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        assets = _assets(client, source["story_run_id"])
+        item = next(value for value in assets["clips"] if value["id"] == source["source_clip_id"])
+        assert item["video_url"] is None
+        assert "X-Amz-Signature" not in (item["error_message"] or "")
+        assert "123456" not in (item["error_message"] or "")
+        assert "abc-123" not in (item["error_message"] or "")
+
+
 def test_resume_existing_provider_task_never_submits_again_and_preserves_old_failure(monkeypatch) -> None:
     """恢复已有方舟成功任务只 GET/下载，且新旧本地 attempt 与审计清晰隔离。"""
 

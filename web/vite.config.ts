@@ -21,6 +21,11 @@ export default defineConfig({
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
+      // 与生产 Nginx 保持一致：本地受控图片/视频均通过 API 静态挂载读取。
+      '/media': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
     },
   },
 })

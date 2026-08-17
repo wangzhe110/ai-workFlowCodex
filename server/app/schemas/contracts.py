@@ -983,9 +983,14 @@ class CommerceVideoClipResponse(BaseModel):
     provider_task_id: Optional[str]
     video_url: Optional[str]
     status: str
+    # 前端只据此展示恢复入口；真正的冻结输入与归属验证仍在恢复服务内完成。
+    can_resume_provider_task: bool
+    error_code: Optional[str]
     error_message: Optional[str]
     retry_count: int
     duration_ms: Optional[int]
+    # 本机媒体卷可安全读取时返回；远端对象存储或历史丢失文件则保持为空。
+    file_size_bytes: Optional[int]
     media_metadata: dict[str, Any]
     reviewed_at: Optional[datetime]
     review_note: Optional[str]

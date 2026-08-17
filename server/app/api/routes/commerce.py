@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.models import StoryRunMode, StoryRunStage, StoryRunStatus, WorkflowRun, WorkflowStep
+from app.models import ModelInvocation, StoryRunMode, StoryRunStage, StoryRunStatus, WorkflowRun, WorkflowStep
 from app.schemas import (
     CommerceOutlineCreateRequest,
     CommerceOutlinePatchRequest,
@@ -69,10 +71,48 @@ from app.services.commerce_internal_smoke_service import (
     create_internal_smoke_video_prompt,
 )
 from app.services.storage import local_asset_storage
-from app.services.sensitive_data import redact_sensitive_data
+from app.services.sensitive_data import redact_sensitive_data, sanitize_error_summary
 
 
 router = APIRouter(prefix="/api/v1/commerce", tags=["Commerce 带货短剧"])
+
+
+# 供应商生成 URL 常带时效性签名。它们只能在 Worker 下载阶段短暂使用，不能成为
+# 正常用户接口的媒体地址或错误摘要的一部分。
+_SIGNED_MEDIA_QUERY_KEYS = frozenset(
+    {"signature", "sig", "token", "access_token", "credential", "expires", "policy"}
+)
+_SIGNED_MEDIA_URL = re.compile(r"https?://[^\s\"']+", re.IGNORECASE)
+_PROVIDER_ACCOUNT_REFERENCE = re.compile(r"(?i)\b(?:your\s+)?account\s+\d+")
+_PROVIDER_REQUEST_REFERENCE = re.compile(r"(?i)\brequest\s+id\s*:\s*[a-z0-9_-]+")
+
+
+def _safe_clip_media_url(value: object) -> str | None:
+    """只对页面公开持久化本地媒体或无签名 HTTPS 媒体。"""
+
+    if not isinstance(value, str) or not value:
+        return None
+    if value.startswith("/media/generated/"):
+        return value
+    # Mock URL 仅用于既有自动化测试；前端安全加载器仍会拒绝它，不能当作真实媒体展示。
+    if value.startswith("mock://"):
+        return value
+    parsed = urlsplit(value)
+    if parsed.scheme != "https" or not parsed.netloc:
+        return None
+    query_names = {name.casefold() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+    if any(name in _SIGNED_MEDIA_QUERY_KEYS or name.startswith("x-amz-") for name in query_names):
+        return None
+    return value
+
+
+def _safe_clip_error_summary(value: object) -> str:
+    """保留可行动的错误摘要，但不回显供应商 URL、账户或请求追踪标识。"""
+
+    sanitized = sanitize_error_summary(value, max_length=500)
+    sanitized = _SIGNED_MEDIA_URL.sub("[链接已隐藏]", sanitized)
+    sanitized = _PROVIDER_ACCOUNT_REFERENCE.sub("当前账户", sanitized)
+    return _PROVIDER_REQUEST_REFERENCE.sub("供应商请求标识已隐藏", sanitized)
 
 
 def _safe_snapshot(value):
@@ -110,13 +150,35 @@ def _video_prompt_response(item) -> CommerceVideoPromptResponse:
     )
 
 
-def _clip_response(item) -> CommerceVideoClipResponse:
+def _clip_response(item, db: Session) -> CommerceVideoClipResponse:
+    """编码视频片段的普通用户视图，不让页面重建恢复资格或读取供应商私有字段。"""
+
+    invocation = db.get(ModelInvocation, item.model_invocation_id) if item.model_invocation_id else None
+    file_size_bytes: int | None = None
+    if isinstance(item.video_url, str) and item.video_url.startswith("/media/generated/"):
+        try:
+            file_size_bytes = local_asset_storage.generated_media_path(item.video_url).stat().st_size
+        except (OSError, RuntimeError):
+            # 已删除或尚未落盘的历史文件只显示“不可用”，不能因为只读展示接口报 500。
+            file_size_bytes = None
+    can_resume_provider_task = bool(
+        item.status == "FAILED"
+        and item.provider_task_id
+        and not item.video_url
+        and item.workflow_run_id
+        and item.model_invocation_id
+    )
+    safe_video_url = _safe_clip_media_url(item.video_url)
     return CommerceVideoClipResponse(
         id=item.id, story_run_id=item.story_run_id, storyboard_version_id=item.storyboard_version_id,
         shot_id=item.shot_id, shot_number=item.shot_number, keyframe_version_id=item.keyframe_version_id,
         video_prompt_version_id=item.video_prompt_version_id, version=item.version, provider_task_id=item.provider_task_id,
-        video_url=item.video_url, status=item.status, error_message=item.error_message, retry_count=item.retry_count,
-        duration_ms=item.duration_ms, media_metadata=item.media_metadata, reviewed_at=item.reviewed_at,
+        video_url=safe_video_url, status=item.status,
+        can_resume_provider_task=can_resume_provider_task,
+        error_code=invocation.error_code if invocation is not None else None,
+        error_message=_safe_clip_error_summary(item.error_message) if item.error_message else None,
+        retry_count=item.retry_count, duration_ms=item.duration_ms, file_size_bytes=file_size_bytes,
+        media_metadata=_safe_snapshot(item.media_metadata), reviewed_at=item.reviewed_at,
         review_note=item.review_note, stale_at=item.stale_at, created_at=item.created_at, finished_at=item.finished_at,
     )
 
@@ -380,7 +442,7 @@ def production_assets_endpoint(story_run_id: str, db: Session = Depends(get_db))
         scene_images=[_production_image_response(item) for item in rows["scene_images"]],
         keyframes=[_production_image_response(item) for item in rows["keyframes"]],
         video_prompts=[_video_prompt_response(item) for item in rows["video_prompts"]],
-        clips=[_clip_response(item) for item in rows["clips"]],
+        clips=[_clip_response(item, db) for item in rows["clips"]],
         finals=[_final_response(item) for item in rows["finals"]],
     )
 
@@ -478,7 +540,7 @@ def lock_production_image_endpoint(story_run_id: str, image_kind: str, image_id:
 
 @router.post("/story-runs/{story_run_id}/clips/{clip_id}/review", response_model=CommerceVideoClipResponse)
 def review_production_clip_endpoint(story_run_id: str, clip_id: str, decision: str, payload: CommerceProductionReviewRequest, db: Session = Depends(get_db)) -> CommerceVideoClipResponse:
-    return _clip_response(review_video_clip(db, story_run_id=story_run_id, clip_id=clip_id, decision=decision, reviewer_label=payload.reviewer_label, note=payload.note))
+    return _clip_response(review_video_clip(db, story_run_id=story_run_id, clip_id=clip_id, decision=decision, reviewer_label=payload.reviewer_label, note=payload.note), db)
 
 
 @router.get("/story-runs/{story_run_id}/final-videos/{final_id}/download")

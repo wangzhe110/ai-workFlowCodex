@@ -40,9 +40,11 @@ import {
   selectCommerceCreativeIdea,
   confirmCommerceStage,
   reviewCommerceVideoClip,
+  resumeCommerceProviderTask,
   startCommerceProduction,
   startProductionRun,
 } from '@/api/production'
+import { apiDownloadUrl } from '@/api/http'
 import { getCharacterAssets, getSceneAssets } from '@/api/asset-library'
 import { deleteSourceVideo, getProject, getWorkflowRun, uploadSourceVideo } from '@/api/projects'
 import type {
@@ -75,6 +77,7 @@ const stories = ref<StoryProposalV1[]>([])
 const commerceIntakes = ref<CommerceReferenceIntake[]>([])
 const commerceCreativeBatches = ref<CommerceCreativeBatch[]>([])
 const commerceStoryRuns = ref<CommerceStoryRun[]>([])
+const selectedCommerceStoryRunId = ref('')
 const commerceOutlines = ref<CommerceOutline[]>([])
 const commerceAssets = ref<CommerceProductionAssets | null>(null)
 const characterImages = ref<CharacterReferenceImageV1[]>([])
@@ -96,6 +99,7 @@ const uploading = ref(false)
 const deletingSourceAssetId = ref('')
 const actionId = ref('')
 const generatingKey = ref('')
+const recoveringClipId = ref('')
 const error = ref('')
 const backgroundNotice = ref('')
 
@@ -120,8 +124,12 @@ const hasSourceVideo = computed(() => sourceVideos.value.length > 0)
 const latestCommerceIntake = computed(() => commerceIntakes.value[0] ?? null)
 const latestSuccessfulCreativeBatch = computed(() => commerceCreativeBatches.value.find((item) => item.status === 'SUCCEEDED') ?? null)
 const commerceProductReady = computed(() => latestCommerceIntake.value?.product_status === 'CONFIRMED' && Boolean(latestCommerceIntake.value.product_frozen_at))
-/** Slice 1 可能保留多个历史运行；生产台默认聚焦最近更新的一条。 */
-const activeCommerceStoryRun = computed(() => commerceStoryRuns.value[0] ?? null)
+/** Slice 1 可能保留多个历史运行；默认最近一条，但制作人可切换查看，不会混用资产。 */
+const activeCommerceStoryRun = computed(() => (
+  commerceStoryRuns.value.find((item) => item.id === selectedCommerceStoryRunId.value)
+  ?? commerceStoryRuns.value[0]
+  ?? null
+))
 const activeCommerceStoryboard = computed(() => commerceAssets.value?.storyboards.find((item) => item.status === 'LOCKED') ?? null)
 /**
  * 页面只负责把后端前置条件提前说明给制作人；真正的放行仍由 StoryRun 服务端用冻结
@@ -188,7 +196,10 @@ async function loadWorkbench() {
     commerceIntakes.value = nextCommerceIntakes
     commerceCreativeBatches.value = nextCommerceCreativeBatches
     commerceStoryRuns.value = nextCommerceStoryRuns
-    const currentStoryRun = nextCommerceStoryRuns[0]
+    if (!nextCommerceStoryRuns.some((item) => item.id === selectedCommerceStoryRunId.value)) {
+      selectedCommerceStoryRunId.value = nextCommerceStoryRuns[0]?.id ?? ''
+    }
+    const currentStoryRun = nextCommerceStoryRuns.find((item) => item.id === selectedCommerceStoryRunId.value)
     if (currentStoryRun) {
       const [nextOutlines, nextCommerceAssets] = await Promise.all([
         getCommerceOutlines(currentStoryRun.id),
@@ -209,6 +220,30 @@ async function loadWorkbench() {
     sceneLibraryAssets.value = nextSceneLibraryAssets
   } catch (caught) {
     error.value = caught instanceof Error ? caught.message : '加载生产台失败，请刷新后重试'
+  } finally {
+    loading.value = false
+  }
+}
+
+/** 切换时只重新读取该 StoryRun 的冻结资产；不会改变任何项目或工作流状态。 */
+async function selectCommerceStoryRun() {
+  const storyRun = activeCommerceStoryRun.value
+  if (!storyRun) {
+    commerceOutlines.value = []
+    commerceAssets.value = null
+    return
+  }
+  loading.value = true
+  error.value = ''
+  try {
+    const [nextOutlines, nextAssets] = await Promise.all([
+      getCommerceOutlines(storyRun.id),
+      getCommerceProductionAssets(storyRun.id),
+    ])
+    commerceOutlines.value = nextOutlines
+    commerceAssets.value = nextAssets
+  } catch (caught) {
+    error.value = caught instanceof Error ? caught.message : '切换 StoryRun 失败，请刷新后重试'
   } finally {
     loading.value = false
   }
@@ -392,6 +427,42 @@ async function reviewCommerceClip(clip: CommerceVideoClip, decision: 'APPROVED' 
   await review(`commerce-clip-${decision}-${clip.id}`, () => reviewCommerceVideoClip(storyRun.id, clip.id, decision, reviewPayload()))
 }
 
+/**
+ * 只请求后端的“恢复已有任务”入口。浏览器不持有、也不传入供应商任务号；后端会冻结
+ * 原片段并只查询同一 task ID，因此不会重新提交 Seedance 创建请求。
+ */
+async function resumeCommerceClip(clip: CommerceVideoClip) {
+  const storyRun = activeCommerceStoryRun.value
+  if (!storyRun || !clip.can_resume_provider_task) return
+  recoveringClipId.value = clip.id
+  error.value = ''
+  backgroundNotice.value = '将继续查询原供应商任务，不会重新生成视频，也不会重复提交付费任务。'
+  try {
+    const run = await resumeCommerceProviderTask(storyRun.id, clip.id)
+    let latest = run
+    // 复用生产台已有的短时轮询策略；前端停止等待不改变后台任务状态。
+    for (let attempt = 0; attempt < 15 && ['PENDING', 'RUNNING'].includes(latest.status); attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 2000))
+      latest = await getWorkflowRun(run.id)
+    }
+    if (latest.status === 'FAILED') {
+      throw new Error(latest.steps.find((item) => item.error_message)?.error_message || '恢复原供应商任务未完成')
+    }
+    if (['PENDING', 'RUNNING'].includes(latest.status)) {
+      backgroundNotice.value = '恢复任务仍在后台查询原供应商结果。刷新页面不会取消任务，也不会再次提交视频生成。'
+    }
+    await loadWorkbench()
+  } catch (caught) {
+    error.value = caught instanceof Error
+      ? caught.message
+      : '供应商任务已经创建，但查询或下载时发生临时网络错误。可以恢复原任务，不会重复扣费。'
+    // 即使恢复任务再次失败，也读取源片段的最新状态，让后端决定恢复按钮是否继续可用。
+    await loadWorkbench()
+  } finally {
+    recoveringClipId.value = ''
+  }
+}
+
 /** 角色/场景资产分别由“文字设计”和“参考图生成”两个模型槽位完成，页面为小白合并成一个按钮。 */
 async function startAssetGeneration(kind: 'character' | 'scene') {
   const label = kind === 'character' ? '角色资产' : '场景资产'
@@ -407,15 +478,56 @@ function formatTime(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value))
 }
 
-function safeExternalUrl(value: string | null): string | null {
-  return value && /^(https?:|data:image\/)/.test(value) ? value : null
+/**
+ * 只允许 API 返回的 HTTPS 媒体或本机受控生成目录。拒绝 data:、任意本机路径和
+ * 供应商临时 URL 以外的协议，避免页面把工作流快照误当作可加载资源。
+ */
+function safeMediaUrl(value: string | null): string | null {
+  if (!value) return null
+  if (value.startsWith('/media/generated/')) return apiDownloadUrl(value)
+  try {
+    const parsed = new URL(value)
+    const sensitiveQuery = [...parsed.searchParams.keys()].some((key) => {
+      const normalized = key.toLowerCase()
+      return ['signature', 'sig', 'token', 'access_token', 'credential', 'expires', 'policy'].includes(normalized)
+        || normalized.startsWith('x-amz-')
+    })
+    return parsed.protocol === 'https:' && !sensitiveQuery ? value : null
+  } catch {
+    return null
+  }
 }
 
 /** 本地交付的成片只有受控下载/预览 API；S3 则直接给 HTTPS 地址。两种交付方式都
  * 可以在浏览器内播放，且不会把 mock:// 当作真实媒体 URL。 */
 function safeFinalVideoUrl(outputUrl: string | null, downloadUrl: string | null): string | null {
   const candidate = outputUrl || downloadUrl
-  return candidate && (/^https?:/.test(candidate) || candidate.startsWith('/api/')) ? candidate : null
+  if (!candidate) return null
+  if (candidate.startsWith('/api/')) return apiDownloadUrl(candidate)
+  return safeMediaUrl(candidate)
+}
+
+function clipStatusLabel(status: string): string {
+  return ({ PENDING: '等待处理', RUNNING: '生成中', SUCCEEDED: '生成成功', APPROVED: '审核通过', REJECTED: '已驳回', FAILED: '生成失败', STALE: '已失效' } as Record<string, string>)[status] || status
+}
+
+function shortenedProviderTaskId(value: string | null): string {
+  if (!value) return '未保存'
+  return value.length > 18 ? `${value.slice(0, 12)}…${value.slice(-5)}` : value
+}
+
+function formatDuration(durationMs: number | null): string {
+  return durationMs === null ? '时长待获取' : `${(durationMs / 1000).toFixed(2)} 秒`
+}
+
+function formatBytes(value: number | null): string {
+  if (value === null) return '文件大小待获取'
+  return value >= 1024 * 1024 ? `${(value / 1024 / 1024).toFixed(2)} MB` : `${Math.ceil(value / 1024)} KB`
+}
+
+function mediaText(metadata: Record<string, unknown>, key: string, fallback = '待获取'): string {
+  const value = metadata[key]
+  return typeof value === 'string' || typeof value === 'number' ? String(value) : fallback
 }
 
 const characterLibraryVersions = computed(() => characterLibraryAssets.value.flatMap((asset) => asset.versions.map((version) => ({
@@ -610,6 +722,13 @@ watch(() => props.projectId, () => void loadWorkbench())
         <div><h2>带货短剧生产线</h2><p class="muted">StoryRun {{ activeCommerceStoryRun.id }} · 商品冻结版本 {{ activeCommerceStoryRun.product_asset_version_id }}</p></div>
         <span class="status" :class="activeCommerceStoryRun.current_status === 'COMPLETED' ? 'SUCCEEDED' : 'RUNNING'">{{ activeCommerceStoryRun.current_stage }} · {{ activeCommerceStoryRun.current_status }}</span>
       </div>
+      <label v-if="commerceStoryRuns.length > 1" class="field story-run-picker">查看哪一条 StoryRun
+        <select v-model="selectedCommerceStoryRunId" @change="selectCommerceStoryRun">
+          <option v-for="run in commerceStoryRuns" :key="run.id" :value="run.id">
+            第 {{ run.run_number }} 次运行 · {{ run.current_stage }} · {{ run.current_status }}
+          </option>
+        </select>
+      </label>
       <p v-if="activeCommerceStoryRun.blocked_reason" class="notice info">当前闸门：{{ activeCommerceStoryRun.blocked_reason }}</p>
       <p v-if="activeCommerceStoryRun.latest_error" class="notice error">最近工作流错误：{{ activeCommerceStoryRun.latest_error }}</p>
 
@@ -669,11 +788,11 @@ watch(() => props.projectId, () => void loadWorkbench())
           <button class="button secondary" :disabled="Boolean(generatingKey) || !hasLockedCommerceScene" @click="startCommerceOperation('SCENE_IMAGES', '场景基础图')">生成场景基础图</button>
         </div>
         <div v-for="image in commerceAssets?.character_images || []" :key="image.id" class="media-row">
-          <a v-if="safeExternalUrl(image.image_url)" :href="safeExternalUrl(image.image_url) || undefined" target="_blank" rel="noreferrer"><img :src="safeExternalUrl(image.image_url) || undefined" alt="角色参考图" /></a>
+          <a v-if="safeMediaUrl(image.image_url)" :href="safeMediaUrl(image.image_url) || undefined" target="_blank" rel="noreferrer"><img :src="safeMediaUrl(image.image_url) || undefined" alt="角色参考图" /></a>
           <div><strong>角色 {{ image.logical_id }} · v{{ image.version }}</strong><p class="muted">{{ image.status }}</p><button v-if="image.status === 'READY'" class="button" :disabled="Boolean(actionId)" @click="lockCommerceImage('CHARACTER', image.id)">锁定角色图</button></div>
         </div>
         <div v-for="image in commerceAssets?.scene_images || []" :key="image.id" class="media-row">
-          <a v-if="safeExternalUrl(image.image_url)" :href="safeExternalUrl(image.image_url) || undefined" target="_blank" rel="noreferrer"><img :src="safeExternalUrl(image.image_url) || undefined" alt="场景基础图" /></a>
+          <a v-if="safeMediaUrl(image.image_url)" :href="safeMediaUrl(image.image_url) || undefined" target="_blank" rel="noreferrer"><img :src="safeMediaUrl(image.image_url) || undefined" alt="场景基础图" /></a>
           <div><strong>场景 {{ image.logical_id }} · v{{ image.version }}</strong><p class="muted">{{ image.status }}</p><button v-if="image.status === 'READY'" class="button" :disabled="Boolean(actionId)" @click="lockCommerceImage('SCENE', image.id)">锁定场景图</button></div>
         </div>
         <div v-for="shot in commerceShots" :key="String(shot.shot_id)" class="shot-production-card stack">
@@ -681,7 +800,7 @@ watch(() => props.projectId, () => void loadWorkbench())
           <p class="muted">商品节点：{{ String(shot.product_integration_node_id || '') }} · 动作：{{ String(shot.action || '') }}</p>
           <button class="button secondary" :disabled="Boolean(generatingKey) || !hasLockedCommerceCharacterImages || !hasLockedCommerceSceneImages" @click="startCommerceOperation('SHOT_KEYFRAME', `镜头 ${String(shot.shot_number)} 关键帧`, String(shot.shot_id))">生成/重生此镜关键帧</button>
           <div v-for="frame in (commerceAssets?.keyframes || []).filter((item) => item.logical_id === String(shot.shot_id))" :key="frame.id" class="media-row">
-            <a v-if="safeExternalUrl(frame.image_url)" :href="safeExternalUrl(frame.image_url) || undefined" target="_blank" rel="noreferrer"><img :src="safeExternalUrl(frame.image_url) || undefined" :alt="`镜头 ${String(shot.shot_number)} 关键帧`" /></a>
+            <a v-if="safeMediaUrl(frame.image_url)" :href="safeMediaUrl(frame.image_url) || undefined" target="_blank" rel="noreferrer"><img :src="safeMediaUrl(frame.image_url) || undefined" :alt="`镜头 ${String(shot.shot_number)} 关键帧`" /></a>
             <div><strong>关键帧 v{{ frame.version }}</strong><p class="muted">{{ frame.status }}</p><button v-if="frame.status === 'READY'" class="button" :disabled="Boolean(actionId)" @click="lockCommerceImage('KEYFRAME', frame.id)">确认并锁定关键帧</button></div>
           </div>
         </div>
@@ -695,10 +814,13 @@ watch(() => props.projectId, () => void loadWorkbench())
           <div v-for="prompt in (commerceAssets?.video_prompts || []).filter((item) => item.shot_id === String(shot.shot_id))" :key="prompt.id" class="sub-card"><strong>Prompt v{{ prompt.version }} · {{ prompt.status }}</strong><p>{{ prompt.prompt }}</p></div>
           <button class="button" :disabled="Boolean(generatingKey) || !hasLockedVideoPrompt(String(shot.shot_id))" @click="startCommerceOperation('VIDEO_RENDER', `镜头 ${String(shot.shot_number)} MP4`, String(shot.shot_id))">生成此镜 MP4</button>
           <div v-for="clip in (commerceAssets?.clips || []).filter((item) => item.shot_id === String(shot.shot_id))" :key="clip.id" class="media-row">
-            <video v-if="safeExternalUrl(clip.video_url)" controls preload="metadata" :src="safeExternalUrl(clip.video_url) || undefined" />
-            <div class="stack"><strong>视频 v{{ clip.version }} · {{ clip.status }}</strong><small class="muted">供应商任务：{{ clip.provider_task_id || '尚未提交' }}</small><small v-if="clip.error_message" class="notice error">{{ clip.error_message }}</small>
+            <video v-if="safeMediaUrl(clip.video_url)" controls preload="metadata" :src="safeMediaUrl(clip.video_url) || undefined" />
+            <div class="stack"><strong>视频 v{{ clip.version }} · {{ clipStatusLabel(clip.status) }}</strong><small class="muted">版本 v{{ clip.version }} · 已记录重试 {{ clip.retry_count }} 次</small><small class="muted">供应商任务：{{ shortenedProviderTaskId(clip.provider_task_id) }} · {{ clip.can_resume_provider_task ? '已保存，可恢复查询' : (clip.provider_task_id ? '已保存' : '尚未创建') }}</small><small class="muted">创建：{{ formatTime(clip.created_at) }}<template v-if="clip.finished_at"> · 完成：{{ formatTime(clip.finished_at) }}</template></small><small v-if="clip.video_url" class="muted">{{ formatDuration(clip.duration_ms) }} · {{ mediaText(clip.media_metadata, 'width') }}×{{ mediaText(clip.media_metadata, 'height') }} · {{ mediaText(clip.media_metadata, 'video_codec') }} · {{ formatBytes(clip.file_size_bytes) }}</small><small v-if="clip.error_code" class="muted">错误代码：{{ clip.error_code }}</small><small v-if="clip.error_message" class="notice error">{{ clip.error_message }}</small>
+              <div v-if="safeMediaUrl(clip.video_url)" class="action-row"><a class="button secondary" :href="safeMediaUrl(clip.video_url) || undefined" download>下载本地 MP4</a></div>
               <div v-if="clip.status === 'SUCCEEDED'" class="action-row"><button class="button" :disabled="Boolean(actionId)" @click="reviewCommerceClip(clip, 'APPROVED')">审核通过</button><button class="button danger" :disabled="Boolean(actionId)" @click="reviewCommerceClip(clip, 'REJECTED')">驳回</button></div>
-              <button v-if="clip.status === 'FAILED' || clip.status === 'REJECTED'" class="button secondary" :disabled="Boolean(generatingKey)" @click="startCommerceOperation('VIDEO_RENDER', `镜头 ${String(shot.shot_number)} 重试`, String(shot.shot_id), true)">仅重试此镜</button>
+              <p v-if="clip.can_resume_provider_task" class="notice info">供应商任务已经创建。可以继续查询其当前状态，不会重新生成视频或重复提交付费任务。</p>
+              <button v-if="clip.can_resume_provider_task" class="button secondary" :disabled="Boolean(recoveringClipId) || Boolean(generatingKey)" @click="resumeCommerceClip(clip)">{{ recoveringClipId === clip.id ? '正在恢复…' : '恢复已有视频任务' }}</button>
+              <button v-else-if="clip.status === 'FAILED' || clip.status === 'REJECTED'" class="button secondary" :disabled="Boolean(generatingKey) || Boolean(recoveringClipId)" @click="startCommerceOperation('VIDEO_RENDER', `镜头 ${String(shot.shot_number)} 重试`, String(shot.shot_id), true)">仅重试此镜</button>
             </div>
           </div>
         </div>
@@ -730,7 +852,7 @@ watch(() => props.projectId, () => void loadWorkbench())
     <section v-if="characterImages.length" class="panel stack review-panel">
       <div class="meta-row"><h2>角色参考图锁定</h2><span>{{ characterImages.length }} 个版本</span></div>
       <article v-for="image in characterImages" :key="image.id" class="asset-card asset-preview">
-        <a v-if="safeExternalUrl(image.image_url)" :href="safeExternalUrl(image.image_url) || undefined" target="_blank" rel="noreferrer"><img :src="safeExternalUrl(image.image_url) || undefined" :alt="`${image.character_name} 角色参考图`" /></a>
+        <a v-if="safeMediaUrl(image.image_url)" :href="safeMediaUrl(image.image_url) || undefined" target="_blank" rel="noreferrer"><img :src="safeMediaUrl(image.image_url) || undefined" :alt="`${image.character_name} 角色参考图`" /></a>
         <div class="stack"><div class="meta-row"><strong>{{ image.character_name }} · v{{ image.version }}</strong><span class="status" :class="image.review_status === 'LOCKED' ? 'SUCCEEDED' : 'PENDING'">{{ image.review_status }}</span></div><small class="muted">{{ image.character_code }} · {{ formatTime(image.created_at) }}<template v-if="image.asset_version_id"> · 资产中心版本已绑定</template></small>
           <div v-if="state?.active_stage === 'CHARACTER_ASSETS' && characterLibraryVersions.length" class="library-adopt-row"><el-select v-model="selectedCharacterLibraryVersion[image.character_id]" placeholder="或采用资产中心角色版本" size="small" filterable><el-option v-for="option in characterLibraryVersions" :key="option.id" :label="option.label" :value="option.id" /></el-select><el-button size="small" plain type="primary" :disabled="Boolean(actionId) || !selectedCharacterLibraryVersion[image.character_id]" @click="adoptLibraryCharacter(image)">采用为候选</el-button></div>
           <button v-if="image.review_status === 'PENDING_REVIEW' && state?.active_stage === 'CHARACTER_ASSETS'" class="button" :disabled="Boolean(actionId)" @click="review(`character-${image.id}`, () => lockCharacterReferenceImage(image.id, reviewPayload()))">{{ actionId === `character-${image.id}` ? '正在锁定…' : '锁定此角色图版本' }}</button>
@@ -741,7 +863,7 @@ watch(() => props.projectId, () => void loadWorkbench())
     <section v-if="sceneImages.length" class="panel stack review-panel">
       <div class="meta-row"><h2>场景参考图锁定</h2><span>{{ sceneImages.length }} 个版本</span></div>
       <article v-for="image in sceneImages" :key="image.id" class="asset-card asset-preview">
-        <a v-if="safeExternalUrl(image.image_url)" :href="safeExternalUrl(image.image_url) || undefined" target="_blank" rel="noreferrer"><img :src="safeExternalUrl(image.image_url) || undefined" :alt="`${image.scene_name} 场景参考图`" /></a>
+        <a v-if="safeMediaUrl(image.image_url)" :href="safeMediaUrl(image.image_url) || undefined" target="_blank" rel="noreferrer"><img :src="safeMediaUrl(image.image_url) || undefined" :alt="`${image.scene_name} 场景参考图`" /></a>
         <div class="stack"><div class="meta-row"><strong>{{ image.scene_name }} · v{{ image.version }}</strong><span class="status" :class="image.review_status === 'LOCKED' ? 'SUCCEEDED' : 'PENDING'">{{ image.review_status }}</span></div><small class="muted">{{ image.scene_code }} · {{ formatTime(image.created_at) }}<template v-if="image.asset_version_id"> · 资产中心版本已绑定</template></small>
           <div v-if="state?.active_stage === 'SCENE_ASSETS' && sceneLibraryVersions.length" class="library-adopt-row"><el-select v-model="selectedSceneLibraryVersion[image.scene_id]" placeholder="或采用资产中心场景版本" size="small" filterable><el-option v-for="option in sceneLibraryVersions" :key="option.id" :label="option.label" :value="option.id" /></el-select><el-button size="small" plain type="primary" :disabled="Boolean(actionId) || !selectedSceneLibraryVersion[image.scene_id]" @click="adoptLibraryScene(image)">采用为候选</el-button></div>
           <button v-if="image.review_status === 'PENDING_REVIEW' && state?.active_stage === 'SCENE_ASSETS'" class="button" :disabled="Boolean(actionId)" @click="review(`scene-${image.id}`, () => lockSceneReferenceImage(image.id, reviewPayload()))">{{ actionId === `scene-${image.id}` ? '正在锁定…' : '锁定此场景图版本' }}</button>
@@ -765,7 +887,7 @@ watch(() => props.projectId, () => void loadWorkbench())
     <section v-if="keyframes.length" class="panel stack review-panel">
       <div class="meta-row"><h2>分镜关键帧锁定</h2><span>{{ keyframes.length }} 个版本</span></div>
       <article v-for="frame in keyframes" :key="frame.id" class="asset-card asset-preview">
-        <a v-if="safeExternalUrl(frame.image_url)" :href="safeExternalUrl(frame.image_url) || undefined" target="_blank" rel="noreferrer"><img :src="safeExternalUrl(frame.image_url) || undefined" :alt="`镜头 ${frame.shot_number} 关键帧`" /></a>
+        <a v-if="safeMediaUrl(frame.image_url)" :href="safeMediaUrl(frame.image_url) || undefined" target="_blank" rel="noreferrer"><img :src="safeMediaUrl(frame.image_url) || undefined" :alt="`镜头 ${frame.shot_number} 关键帧`" /></a>
         <div class="stack"><div class="meta-row"><strong>镜头 {{ frame.shot_number }} · v{{ frame.version }}</strong><span class="status" :class="frame.review_status === 'LOCKED' ? 'SUCCEEDED' : 'PENDING'">{{ frame.review_status }}</span></div>
           <button v-if="frame.review_status === 'PENDING_REVIEW' && state?.active_stage === 'SHOT_KEYFRAMES'" class="button" :disabled="Boolean(actionId)" @click="review(`keyframe-${frame.id}`, () => lockShotKeyframe(frame.id, reviewPayload()))">{{ actionId === `keyframe-${frame.id}` ? '正在锁定…' : '锁定此关键帧版本' }}</button>
         </div>
@@ -776,7 +898,7 @@ watch(() => props.projectId, () => void loadWorkbench())
       <div class="meta-row"><h2>视频片段审核</h2><span>{{ videoClips.length }} 个版本</span></div>
       <article v-for="clip in videoClips" :key="clip.id" class="asset-card stack">
         <div class="meta-row"><strong>镜头 {{ clip.shot_number }} · 视频 v{{ clip.version }}<template v-if="clip.is_current">（当前采用）</template></strong><span class="status" :class="clip.review_status === 'APPROVED' ? 'SUCCEEDED' : 'PENDING'">{{ clip.review_status || '等待生成' }}</span></div>
-        <a v-if="safeExternalUrl(clip.video_url)" class="button secondary" :href="safeExternalUrl(clip.video_url) || undefined" target="_blank" rel="noreferrer">打开视频预览</a>
+        <a v-if="safeMediaUrl(clip.video_url)" class="button secondary" :href="safeMediaUrl(clip.video_url) || undefined" target="_blank" rel="noreferrer">打开视频预览</a>
         <small class="muted">生成任务：{{ clip.task_status || 'PENDING' }}<template v-if="clip.provider_task_id"> · 供应商任务号：{{ clip.provider_task_id }}</template></small>
         <small v-if="clip.review_note" class="muted">上次审核备注：{{ clip.review_note }}</small>
         <div v-if="clip.review_status === 'PENDING_REVIEW' && state?.active_stage === 'VIDEO_REVIEW'" class="action-row"><button class="button" :disabled="Boolean(actionId)" @click="review(`video-approve-${clip.id}`, () => approveV1VideoClip(clip.id, reviewPayload()))">{{ actionId === `video-approve-${clip.id}` ? '正在确认…' : '通过此视频片段' }}</button><button class="button danger" :disabled="Boolean(actionId)" @click="review(`video-reject-${clip.id}`, () => rejectV1VideoClip(clip.id, reviewPayload()))">驳回并生成新版本</button></div>

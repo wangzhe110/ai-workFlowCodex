@@ -326,9 +326,13 @@ export interface CommerceVideoClip {
   provider_task_id: string | null
   video_url: string | null
   status: 'RUNNING' | 'SUCCEEDED' | 'APPROVED' | 'REJECTED' | 'FAILED' | 'STALE' | string
+  /** 后端根据已保存的本地审计提供；点击后只恢复同一个供应商任务号。 */
+  can_resume_provider_task: boolean
+  error_code: string | null
   error_message: string | null
   retry_count: number
   duration_ms: number | null
+  file_size_bytes: number | null
   media_metadata: Record<string, unknown>
   reviewed_at: string | null
   review_note: string | null

@@ -152,6 +152,17 @@ export function reviewCommerceVideoClip(
   return jsonPost<CommerceVideoClip>(`/commerce/story-runs/${storyRunId}/clips/${clipId}/review?decision=${decision}`, payload)
 }
 
+/**
+ * 只恢复后端已保存任务号的失败视频。接口没有请求体，浏览器不能传入或替换供应商任务号。
+ * 恢复 Worker 只会查询原任务并下载结果，绝不会走普通视频创建路径。
+ */
+export function resumeCommerceProviderTask(storyRunId: string, clipId: string): Promise<WorkflowRun> {
+  return request<WorkflowRun>(
+    `/commerce/story-runs/${encodeURIComponent(storyRunId)}/clips/${encodeURIComponent(clipId)}/resume-provider-task`,
+    { method: 'POST' },
+  )
+}
+
 export function commerceFinalDownloadUrl(finalVideo: CommerceFinalVideo): string | null {
   return finalVideo.download_url || (finalVideo.output_url?.startsWith('https://') ? finalVideo.output_url : null)
 }

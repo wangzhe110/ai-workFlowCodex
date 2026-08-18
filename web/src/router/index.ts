@@ -41,6 +41,7 @@ const router = createRouter({
     { path: '/model-profiles', name: 'model-profiles', component: () => import('@/views/V1ModelCenterView.vue') },
     { path: '/model-quality', name: 'model-quality', component: () => import('@/views/V1QualityReportView.vue') },
     { path: '/prompt-templates', name: 'prompt-templates', component: () => import('@/views/V1PromptTemplatesView.vue') },
+    { path: '/model-lab', name: 'model-lab', component: () => import('@/views/ModelLabView.vue') },
     { path: '/model-profiles/legacy', name: 'legacy-model-profiles', component: () => import('@/views/ModelProfilesView.vue') },
     {
       path: '/creative-library',

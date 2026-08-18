@@ -296,7 +296,7 @@ def test_0024_sqlite_upgrade_downgrade_and_reupgrade(tmp_path: Path) -> None:
     database_url = f"sqlite:///{tmp_path / 'commerce-workflow-presets.db'}"
     config = Config(str(server_root / "alembic.ini"))
     config.set_main_option("script_location", str(server_root / "migrations"))
-    assert ScriptDirectory.from_config(config).get_heads() == ["0024_commerce_workflow_presets"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["0025_model_lab"]
 
     def migrate(action: str, revision: str) -> None:
         engine = create_engine(database_url)

@@ -1449,5 +1449,94 @@ class GenerationTaskResponse(BaseModel):
     finished_at: Optional[datetime]
 
 
+# ---------------------------------------------------------------------------
+# Model Lab：内部模型对比实验。这里的请求只表达受控业务输入与已存在版本 ID，
+# 绝不接受 Adapter、Header、URL、路径或任意供应商请求 JSON。
+# ---------------------------------------------------------------------------
+
+
+class ModelLabVariantRequest(BaseModel):
+    label: str = Field(min_length=1, max_length=120)
+    model_profile_id: str = Field(min_length=1, max_length=64)
+    prompt_template_version_id: str = Field(min_length=1, max_length=64)
+    parameter_preset: str = Field(default="standard", pattern="^(preview|standard|high)$")
+    requested_overrides: dict[str, Any] = Field(default_factory=dict)
+
+
+class ModelLabExperimentCreateRequest(BaseModel):
+    project_id: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=160)
+    description: str = Field(default="", max_length=2000)
+    operation_key: str = Field(min_length=1, max_length=120)
+    model_slot_key: str = Field(min_length=1, max_length=80)
+    capability: str = Field(pattern="^(text|image|video)$")
+    comparison_mode: str = Field(pattern="^(MODEL_ONLY|PROMPT_ONLY|PARAMETER_ONLY|CUSTOM|NATIVE_PRESET)$")
+    input_source_type: str = Field(min_length=1, max_length=40)
+    input_payload: dict[str, Any]
+    prompt_variables: dict[str, Any] = Field(default_factory=dict)
+    variants: list[ModelLabVariantRequest] = Field(min_length=2, max_length=4)
+    repeat: int = Field(default=1, ge=1, le=3)
+    max_create_calls: int = Field(ge=1, le=12)
+
+
+class ModelLabPreflightResponse(BaseModel):
+    valid: bool
+    experiment_id: Optional[str] = None
+    preflight_hash: Optional[str] = None
+    variant_config_hash: Optional[str] = None
+    checked_at: Optional[datetime] = None
+    variant_count: int
+    repeat: int
+    estimated_create_calls: int
+    expected_create_call_count: int
+    max_create_calls: int
+    text_calls: int
+    image_create_calls: int
+    video_create_calls: int
+    differing_dimensions: list[str]
+    key_checks: list[dict[str, str]]
+    parameters: list[dict[str, Any]]
+
+
+class ModelLabStartRequest(BaseModel):
+    confirmed_create_calls: int = Field(ge=1, le=12)
+    preflight_hash: str = Field(min_length=64, max_length=64)
+
+
+class ModelLabEvaluationRequest(BaseModel):
+    scores: dict[str, int]
+    notes: str = Field(default="", max_length=2000)
+    is_winner: bool = False
+
+
+class ModelLabPromotionRequest(BaseModel):
+    confirmed: bool = False
+    replace_profile_id: Optional[str] = Field(default=None, min_length=1, max_length=64)
+
+
+class ModelLabExperimentResponse(BaseModel):
+    id: str
+    project_id: str
+    name: str
+    description: str
+    operation_key: str
+    model_slot_key: str
+    capability: str
+    comparison_mode: str
+    input_source_type: str
+    input_hash: str
+    max_create_calls: int
+    preflight: Optional[ModelLabPreflightResponse] = None
+    status: str
+    workflow_run_id: Optional[str]
+    winner_variant_id: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+    archived_at: Optional[datetime]
+    slot_selection_mode: Optional[str] = None
+    production_profiles: list[dict[str, Any]] = Field(default_factory=list)
+    variants: list[dict[str, Any]]
+
+
 # Pydantic 需要在全部类型声明后解析前向引用。
 ProjectDetailResponse.model_rebuild()

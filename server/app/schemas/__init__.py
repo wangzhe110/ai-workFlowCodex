@@ -114,6 +114,13 @@ from app.schemas.contracts import (
     GenerationTaskCreateRequest,
     GenerationCallbackRequest,
     GenerationTaskResponse,
+    ModelLabVariantRequest,
+    ModelLabExperimentCreateRequest,
+    ModelLabPreflightResponse,
+    ModelLabStartRequest,
+    ModelLabEvaluationRequest,
+    ModelLabPromotionRequest,
+    ModelLabExperimentResponse,
 )
 
 __all__ = [
@@ -230,4 +237,11 @@ __all__ = [
     "GenerationTaskCreateRequest",
     "GenerationCallbackRequest",
     "GenerationTaskResponse",
+    "ModelLabVariantRequest",
+    "ModelLabExperimentCreateRequest",
+    "ModelLabPreflightResponse",
+    "ModelLabStartRequest",
+    "ModelLabEvaluationRequest",
+    "ModelLabPromotionRequest",
+    "ModelLabExperimentResponse",
 ]

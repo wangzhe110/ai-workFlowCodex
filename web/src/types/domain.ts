@@ -291,6 +291,130 @@ export interface CommerceStoryRun {
   updated_at: string
 }
 
+/** Model Lab 的内部实验。结果只引用本地媒体，不公开渠道连接或鉴权配置。 */
+export interface ModelLabVariantDraft {
+  label: string
+  model_profile_id: string
+  prompt_template_version_id: string
+  parameter_preset: 'preview' | 'standard' | 'high'
+  requested_overrides?: Record<string, unknown>
+}
+
+export interface ModelLabExperimentCreatePayload {
+  project_id: string
+  name: string
+  description?: string
+  operation_key: string
+  model_slot_key: string
+  capability: 'text' | 'image' | 'video'
+  comparison_mode: 'MODEL_ONLY' | 'PROMPT_ONLY' | 'PARAMETER_ONLY' | 'CUSTOM' | 'NATIVE_PRESET'
+  input_source_type: 'text' | 'frozen_workflow' | 'image_prompt' | 'locked_keyframe'
+  input_payload: Record<string, unknown>
+  prompt_variables: Record<string, unknown>
+  variants: ModelLabVariantDraft[]
+  repeat: number
+  max_create_calls: number
+}
+
+export interface ModelLabPreflight {
+  valid: boolean
+  experiment_id: string | null
+  preflight_hash: string | null
+  variant_config_hash: string | null
+  checked_at: string | null
+  variant_count: number
+  repeat: number
+  estimated_create_calls: number
+  expected_create_call_count: number
+  max_create_calls: number
+  text_calls: number
+  image_create_calls: number
+  video_create_calls: number
+  differing_dimensions: string[]
+  key_checks: Array<{ profile_id: string; key_status: 'SET' | 'MISSING' | 'NOT_REQUIRED' }>
+  parameters: Array<{ label: string; effective_parameters: Record<string, unknown>; omitted_parameters: Array<Record<string, string>> }>
+}
+
+export interface ModelLabVariant {
+  id: string
+  label: string
+  profile_id: string
+  profile_version: number
+  prompt_template_version_id: string
+  prompt_version: number | null
+  prompt_hash: string
+  parameter_preset: string
+  effective_parameters: Record<string, unknown>
+  omitted_parameters: Array<Record<string, string>>
+  repeat_index: number
+  status: WorkflowStep['status']
+  workflow_step_id: string | null
+  model_invocation_id: string | null
+  provider_task_id_short: string | null
+  output_reference: Record<string, unknown> | null
+  metrics: Record<string, unknown>
+  error_code: string | null
+  sanitized_error_summary: string | null
+  provider_create_post_count: number
+  is_mock: boolean
+  evaluation: { scores: Record<string, number>; notes: string; is_winner: boolean } | null
+}
+
+export interface ModelLabExperiment {
+  id: string
+  project_id: string
+  name: string
+  description: string
+  operation_key: string
+  model_slot_key: string
+  capability: 'text' | 'image' | 'video'
+  comparison_mode: string
+  input_source_type: string
+  input_hash: string
+  max_create_calls: number
+  preflight: ModelLabPreflight | null
+  status: 'DRAFT' | 'READY' | 'RUNNING' | 'PAUSED' | 'COMPLETED' | 'FAILED' | 'ARCHIVED'
+  workflow_run_id: string | null
+  winner_variant_id: string | null
+  created_at: string
+  updated_at: string
+  archived_at: string | null
+  slot_selection_mode: 'SINGLE' | 'MULTI_PARALLEL' | null
+  production_profiles: Array<{
+    id: string
+    name: string
+    version: number
+  }>
+  variants: ModelLabVariant[]
+}
+
+export interface ModelLabCatalog {
+  slot_selection_mode: 'SINGLE' | 'MULTI_PARALLEL' | null
+  active_profiles: Array<{
+    id: string
+    name: string
+    version: number
+  }>
+  profiles: Array<{
+    id: string
+    name: string
+    version: number
+    model_key: string
+    profile_status: string
+    is_mock: boolean
+    supported_presets: string[]
+    supported_parameters: Record<string, unknown>
+  }>
+  prompt_versions: Array<{
+    id: string
+    prompt_key: string
+    display_name: string
+    version: number
+    content_hash: string
+    output_contract_key: string
+  }>
+}
+
 /** 已审核的大纲与商品融入策略；角色、场景、分镜任务都会冻结它的具体版本。 */
 export interface CommerceOutline {
   id: string

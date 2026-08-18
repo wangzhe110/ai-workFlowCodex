@@ -24,6 +24,7 @@ from app.services.video_service import execute_video_generation
 from app.services.v1_execution_service import execute_v1_video_child, execute_v1_workflow
 from app.services.commerce_workflow_service import execute_commerce_workflow
 from app.services.commerce_production_service import execute_commerce_production_workflow
+from app.services.model_lab_service import execute_model_lab_workflow
 from app.services.workflow_service import execute_video_analysis
 from app.services.sensitive_data import sanitize_error_summary
 
@@ -64,6 +65,9 @@ _WORKFLOW_EXECUTORS: dict[str, WorkflowExecutor] = {
     "commerce_production_video_prompt": execute_commerce_production_workflow,
     "commerce_production_video_render": execute_commerce_production_workflow,
     "commerce_production_final_compose": execute_commerce_production_workflow,
+    # Model Lab 只复用现有 WorkflowRun/WorkflowStep/Invocation 审计与投递机制；
+    # 不建立第二套 Worker 或供应商状态机。
+    "model_lab_experiment": execute_model_lab_workflow,
 }
 
 

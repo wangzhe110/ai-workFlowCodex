@@ -239,6 +239,18 @@ def test_execution_snapshot_scanner_separates_metadata_from_sensitive_values() -
     }
 
 
+def test_execution_snapshot_scanner_rejects_arbitrary_absolute_path_but_allows_local_media_reference() -> None:
+    scan = classify_execution_metadata(
+        {
+            "safe_media": "/media/generated/projects/project/image/v1.png",
+            "unsafe_path": "/private/host-only-file",
+        },
+        path="snapshot",
+    )
+    assert scan.allowed_execution_metadata == ()
+    assert scan.sensitive_findings == ("snapshot.unsafe_path",)
+
+
 @pytest.mark.parametrize(
     "message",
     [

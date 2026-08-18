@@ -749,6 +749,7 @@ def bind_profile_to_slot(
     weight: Optional[float],
     replace_existing: bool = False,
     replace_profile_id: Optional[str] = None,
+    commit: bool = True,
 ) -> ModelSlotProfileBinding:
     """把一个已存在的安全模型配置绑定到能力槽位，不在此处读取真实密钥。"""
 
@@ -840,8 +841,13 @@ def bind_profile_to_slot(
                 previous_profile.profile_status = (
                     "HISTORICAL" if profile_has_model_invocations(db, previous_profile.id) else "DRAFT"
                 )
-    db.commit()
-    db.refresh(binding)
+    # Model Lab 的“确认提升”需要把槽位切换与实验审计作为同一个事务提交。
+    # 既有调用维持默认提交行为，避免改变模型中心原有 API 语义。
+    if commit:
+        db.commit()
+        db.refresh(binding)
+    else:
+        db.flush()
     return binding
 
 

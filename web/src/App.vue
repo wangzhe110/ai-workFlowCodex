@@ -15,6 +15,7 @@ const activeNavigation = computed(() => {
   if (route.path.startsWith('/model-profiles')) return '/model-profiles'
   if (route.path.startsWith('/model-quality')) return '/model-quality'
   if (route.path.startsWith('/prompt-templates')) return '/prompt-templates'
+  if (route.path.startsWith('/model-lab')) return '/model-lab'
   return ''
 })
 </script>
@@ -29,6 +30,7 @@ const activeNavigation = computed(() => {
         <el-menu-item index="/model-profiles">模型配置</el-menu-item>
         <el-menu-item index="/model-quality">质量报表</el-menu-item>
         <el-menu-item index="/prompt-templates">Prompt 模板</el-menu-item>
+        <el-menu-item index="/model-lab">模型测试台</el-menu-item>
       </el-menu>
       <el-tag class="phase" type="info" effect="dark">V1</el-tag>
     </el-header>

@@ -15,6 +15,7 @@ from app.api.routes import (
     asset_library,
     images,
     model_profiles,
+    model_lab,
     production,
     projects,
     stories,
@@ -71,6 +72,7 @@ app.include_router(storyboards.router)
 app.include_router(images.router)
 app.include_router(videos.router)
 app.include_router(model_profiles.router)
+app.include_router(model_lab.router)
 app.include_router(production.router)
 app.include_router(v1_modeling.router)
 

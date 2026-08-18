@@ -34,6 +34,10 @@ import type {
   CommerceWorkflowPreset,
   CommerceWorkflowPresetVersion,
   CommerceVideoClip,
+  ModelLabCatalog,
+  ModelLabExperiment,
+  ModelLabExperimentCreatePayload,
+  ModelLabPreflight,
 } from '@/types/domain'
 
 const jsonPost = <T>(path: string, payload: object = {}): Promise<T> => request<T>(path, {
@@ -41,6 +45,62 @@ const jsonPost = <T>(path: string, payload: object = {}): Promise<T> => request<
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify(payload),
 })
+
+/** Model Lab 只比较冻结版本；此处没有真实供应商调用或模型连接信息。 */
+export function getModelLabCatalog(operationKey: string, modelSlotKey: string, capability: 'text' | 'image' | 'video'): Promise<ModelLabCatalog> {
+  const query = new URLSearchParams({ operation_key: operationKey, model_slot_key: modelSlotKey, capability })
+  return request<ModelLabCatalog>(`/model-lab/catalog?${query.toString()}`)
+}
+
+export function preflightModelLabExperiment(payload: ModelLabExperimentCreatePayload): Promise<ModelLabPreflight> {
+  return jsonPost<ModelLabPreflight>('/model-lab/preflight', payload)
+}
+
+/** Revalidates one frozen experiment and returns the only hash accepted by start. */
+export function preflightExistingModelLabExperiment(experimentId: string): Promise<ModelLabPreflight> {
+  return jsonPost<ModelLabPreflight>(`/model-lab/experiments/${encodeURIComponent(experimentId)}/preflight`)
+}
+
+export function createModelLabExperiment(payload: ModelLabExperimentCreatePayload): Promise<ModelLabExperiment> {
+  return jsonPost<ModelLabExperiment>('/model-lab/experiments', payload)
+}
+
+export function getModelLabExperiments(projectId?: string): Promise<ModelLabExperiment[]> {
+  return request<ModelLabExperiment[]>(`/model-lab/experiments${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''}`)
+}
+
+export function getModelLabExperiment(experimentId: string): Promise<ModelLabExperiment> {
+  return request<ModelLabExperiment>(`/model-lab/experiments/${encodeURIComponent(experimentId)}`)
+}
+
+export function startModelLabExperiment(experimentId: string, confirmedCreateCalls: number, preflightHash: string): Promise<ModelLabExperiment> {
+  return jsonPost<ModelLabExperiment>(`/model-lab/experiments/${encodeURIComponent(experimentId)}/start`, {
+    confirmed_create_calls: confirmedCreateCalls,
+    preflight_hash: preflightHash,
+  })
+}
+
+export function pauseModelLabExperiment(experimentId: string): Promise<ModelLabExperiment> {
+  return jsonPost<ModelLabExperiment>(`/model-lab/experiments/${encodeURIComponent(experimentId)}/pause`)
+}
+
+export function resumeModelLabExperiment(experimentId: string): Promise<ModelLabExperiment> {
+  return jsonPost<ModelLabExperiment>(`/model-lab/experiments/${encodeURIComponent(experimentId)}/resume`)
+}
+
+export function resumeModelLabProviderTask(experimentId: string, variantId: string): Promise<ModelLabExperiment> {
+  return jsonPost<ModelLabExperiment>(`/model-lab/experiments/${encodeURIComponent(experimentId)}/variants/${encodeURIComponent(variantId)}/resume-provider-task`)
+}
+
+export function evaluateModelLabVariant(experimentId: string, variantId: string, payload: { scores: Record<string, number>; notes: string; is_winner: boolean }): Promise<ModelLabExperiment> {
+  return request<ModelLabExperiment>(`/model-lab/experiments/${encodeURIComponent(experimentId)}/variants/${encodeURIComponent(variantId)}/evaluation`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  })
+}
+
+export function promoteModelLabWinner(experimentId: string, variantId: string, payload: { confirmed: boolean; replace_profile_id?: string }): Promise<ModelLabExperiment> {
+  return jsonPost<ModelLabExperiment>(`/model-lab/experiments/${encodeURIComponent(experimentId)}/variants/${encodeURIComponent(variantId)}/promote`, payload)
+}
 
 /** 读取唯一 V1 工作流的当前阶段和冻结对象指针。 */
 export function getProductionState(projectId: string): Promise<ProductionState> {

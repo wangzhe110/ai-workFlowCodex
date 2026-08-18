@@ -213,6 +213,11 @@ def classify_execution_metadata(value: Any, *, path: str = "snapshot") -> Execut
                 or query_names & _SENSITIVE_URL_QUERY_KEYS
                 or parsed.username is not None
                 or parsed.password is not None
+                # A controlled local media reference is the only absolute path
+                # permitted in durable execution/result snapshots.  Arbitrary
+                # filesystem paths would otherwise become a path traversal or
+                # host disclosure channel in Model Lab inputs.
+                or (item.startswith("/") and not item.startswith("/media/generated/"))
             ):
                 sensitive.append(current)
 

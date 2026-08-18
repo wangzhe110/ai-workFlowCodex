@@ -8,6 +8,7 @@ from typing import Any, Optional
 from uuid import uuid4
 
 from sqlalchemy import (
+    Boolean,
     JSON,
     CheckConstraint,
     DateTime,
@@ -229,6 +230,36 @@ class CommerceWorkflowPresetVersionStatus(str, Enum):
 
     DRAFT = "DRAFT"
     PUBLISHED = "PUBLISHED"
+
+
+class ModelExperimentCapability(str, Enum):
+    """Model Lab 明确支持的三类模型能力。"""
+
+    TEXT = "text"
+    IMAGE = "image"
+    VIDEO = "video"
+
+
+class ModelExperimentComparisonMode(str, Enum):
+    """实验的公平性声明；CUSTOM/NATIVE_PRESET 不得伪装为严格 A/B。"""
+
+    MODEL_ONLY = "MODEL_ONLY"
+    PROMPT_ONLY = "PROMPT_ONLY"
+    PARAMETER_ONLY = "PARAMETER_ONLY"
+    CUSTOM = "CUSTOM"
+    NATIVE_PRESET = "NATIVE_PRESET"
+
+
+class ModelExperimentStatus(str, Enum):
+    """实验控制面状态；归档保留所有调用审计而不物理删除。"""
+
+    DRAFT = "DRAFT"
+    READY = "READY"
+    RUNNING = "RUNNING"
+    PAUSED = "PAUSED"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    ARCHIVED = "ARCHIVED"
 
 
 # ---------------------------------------------------------------------------
@@ -2799,6 +2830,131 @@ class CommerceStoryRunWorkflowConfig(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     story_run: Mapped[StoryRun] = relationship(back_populates="workflow_config_freeze")
+
+
+class ModelExperiment(Base):
+    """内部 Model Lab 实验定义与脱敏冻结输入。"""
+
+    __tablename__ = "model_experiments"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="RESTRICT"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    operation_key: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    model_slot_key: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    capability: Mapped[ModelExperimentCapability] = mapped_column(
+        SqlEnum(ModelExperimentCapability, native_enum=False, create_constraint=True), nullable=False
+    )
+    comparison_mode: Mapped[ModelExperimentComparisonMode] = mapped_column(
+        SqlEnum(ModelExperimentComparisonMode, native_enum=False, create_constraint=True), nullable=False
+    )
+    input_source_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    sanitized_input_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    input_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    max_create_calls: Mapped[int] = mapped_column(Integer, nullable=False)
+    # A preflight is an explicit authorization to start this exact immutable
+    # experiment. It contains only fingerprints and call budgets, never media
+    # bodies or credentials.
+    preflight_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    preflight_variant_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    preflight_expected_create_calls: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    preflight_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[ModelExperimentStatus] = mapped_column(
+        SqlEnum(ModelExperimentStatus, native_enum=False, create_constraint=True),
+        default=ModelExperimentStatus.DRAFT,
+        nullable=False,
+    )
+    workflow_run_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("workflow_runs.id", ondelete="SET NULL"), nullable=True, unique=True, index=True
+    )
+    winner_variant_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
+    # 提升生产版本只能由人工显式触发。记录的是无密钥的审计元数据，绝不存放
+    # Profile 配置、Base URL 或环境变量值；历史 Workflow / Invocation 快照也不会
+    # 因一次提升而被覆盖。
+    promotion_metadata: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+    archived_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ModelExperimentVariant(Base):
+    """一个实验候选的不可变 Profile/Prompt/参数/输入冻结快照。"""
+
+    __tablename__ = "model_experiment_variants"
+    __table_args__ = (
+        UniqueConstraint("experiment_id", "label", "repeat_index", name="uq_model_experiment_variant_repeat"),
+        Index("ix_model_experiment_variant_experiment_status", "experiment_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    experiment_id: Mapped[str] = mapped_column(
+        ForeignKey("model_experiments.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    label: Mapped[str] = mapped_column(String(120), nullable=False)
+    model_profile_id: Mapped[str] = mapped_column(
+        ForeignKey("model_profiles.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    model_profile_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    prompt_template_version_id: Mapped[str] = mapped_column(
+        ForeignKey("prompt_template_versions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    parameter_preset: Mapped[str] = mapped_column(String(20), nullable=False)
+    requested_overrides: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    effective_parameters: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    model_profile_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    prompt_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    input_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    repeat_index: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    status: Mapped[RunStatus] = mapped_column(SqlEnum(RunStatus), default=RunStatus.PENDING, nullable=False)
+    workflow_step_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("workflow_steps.id", ondelete="SET NULL"), nullable=True, unique=True, index=True
+    )
+    model_invocation_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("model_invocations.id", ondelete="SET NULL"), nullable=True, unique=True, index=True
+    )
+    provider_task_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    output_reference: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    metrics: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    error_code: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    sanitized_error_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    provider_create_post_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    recovered_from_variant_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ModelExperimentEvaluation(Base):
+    """人工评分与优胜选择，和模型执行审计分离。"""
+
+    __tablename__ = "model_experiment_evaluations"
+    __table_args__ = (
+        UniqueConstraint("experiment_id", "variant_id", name="uq_model_experiment_evaluation_variant"),
+        Index(
+            "uq_model_experiment_winner",
+            "experiment_id",
+            unique=True,
+            postgresql_where=text("is_winner = true"),
+            sqlite_where=text("is_winner = 1"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    experiment_id: Mapped[str] = mapped_column(
+        ForeignKey("model_experiments.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    variant_id: Mapped[str] = mapped_column(
+        ForeignKey("model_experiment_variants.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    scores: Mapped[dict[str, int]] = mapped_column(JSON, nullable=False, default=dict)
+    notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    is_winner: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
 
 
 class ModelInvocation(Base):

@@ -342,6 +342,7 @@ class LocalAssetStorage:
         role: str,
         image_url: str,
         storage_namespace_id: Optional[str] = None,
+        include_data_url: bool = True,
     ) -> LocalImageReference:
         """以冻结资产读取已持久化图片，并在内存中转为官方 Data URL。
 
@@ -411,7 +412,10 @@ class LocalAssetStorage:
         # 之前已经完成文件头校验；此处再次验证，避免被替换后的异常媒体进入模型。
         if width > 8192 or height > 8192:
             raise RuntimeError("参考图尺寸超过 8192 像素限制")
-        encoded = b64encode(content).decode("ascii")
+        # A Model Lab preflight needs to verify bytes, MIME, dimensions and
+        # digest, but must not materialize Base64 in an API process.  Only the
+        # Worker preparing a supplier request opts into the in-memory Data URL.
+        encoded = b64encode(content).decode("ascii") if include_data_url else ""
         return LocalImageReference(
             asset_id=asset_id,
             role=role,
@@ -419,7 +423,7 @@ class LocalAssetStorage:
             width=width,
             height=height,
             sha256=sha256(content).hexdigest(),
-            data_url=f"data:{mime_type};base64,{encoded}",
+            data_url=f"data:{mime_type};base64,{encoded}" if include_data_url else "",
         )
 
     @staticmethod

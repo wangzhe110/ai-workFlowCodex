@@ -71,6 +71,15 @@ def _enum(value: Any) -> str:
     return value.value if hasattr(value, "value") else str(value)
 
 
+def _frozen_prompt_text(prompt: dict[str, Any], field: str) -> str:
+    """读取创建 WorkflowRun 时冻结的 Prompt，拒绝回退旧硬编码正文。"""
+
+    value = prompt.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"Commerce 十创意缺少冻结 Prompt 字段：{field}")
+    return value.strip()
+
+
 def _analysis_snapshot(analysis: ReferenceAnalysis) -> dict[str, Any]:
     """只复制已保存的分析结果；不从项目指针或最新素材重新推导。"""
 
@@ -423,6 +432,7 @@ def execute_creative_generation(db: Session, run: WorkflowRun, *, binding: dict[
         model_slot_id=binding.get("slot_id"),
         model_profile_id=binding.get("model_profile_id"),
         prompt_template_id=prompt.get("id"),
+        prompt_template_version_id=prompt.get("prompt_version_id"),
         task_type="STORY_GENERATE",
         model_profile_snapshot=deepcopy(model_snapshot),
         prompt_snapshot=deepcopy(prompt),
@@ -444,11 +454,8 @@ def execute_creative_generation(db: Session, run: WorkflowRun, *, binding: dict[
         raw = generate_structured_text(
             model_snapshot,
             task_type="STORY_GENERATE",
-            system_instruction=(
-                f"{prompt.get('content', '').strip()}\n\n"
-                "生成恰好十个原创带货短剧创意。只能使用冻结商品版本中的确认事实，"
-                "不得创造功效、包装、使用方法或宣传结论。"
-            ),
+            system_instruction=_frozen_prompt_text(prompt, "rendered_system_template"),
+            user_instruction=_frozen_prompt_text(prompt, "rendered_user_template"),
             user_payload={"frozen_input": deepcopy(context), "required_idea_count": IDEA_COUNT},
             output_contract=IDEA_OUTPUT_CONTRACT,
         )

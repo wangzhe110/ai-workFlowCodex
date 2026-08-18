@@ -97,7 +97,12 @@ def _frame_extraction_settings(snapshot: dict[str, Any]) -> tuple[int, float, in
     return frame_count, float(timeout_seconds), max_frame_bytes
 
 
-def analyze_reference_video(snapshot: dict[str, Any], source: MediaAsset) -> tuple[dict[str, Any], int]:
+def analyze_reference_video(
+    snapshot: dict[str, Any],
+    source: MediaAsset,
+    *,
+    prompt_snapshot: dict[str, Any],
+) -> tuple[dict[str, Any], int]:
     """通过视觉 Adapter 分析参考视频，并返回 V1 结果和实际抽帧数。
 
     视觉模型只接收临时抽样帧。原视频、帧数据和可能的受版权保护台词均不会持久化
@@ -115,13 +120,21 @@ def analyze_reference_video(snapshot: dict[str, Any], source: MediaAsset) -> tup
         timeout_seconds=timeout_seconds,
         max_frame_bytes=max_frame_bytes,
     )
+    system_instruction = prompt_snapshot.get("rendered_system_template")
+    user_instruction = prompt_snapshot.get("rendered_user_template")
+    if not isinstance(system_instruction, str) or not system_instruction.strip():
+        raise RuntimeError("参考视频分析缺少创建任务时冻结的系统 Prompt")
+    if not isinstance(user_instruction, str) or not user_instruction.strip():
+        raise RuntimeError("参考视频分析缺少创建任务时冻结的用户 Prompt")
     result = OpenAICompatibleVisionAnalysisProvider(snapshot).analyze(
         VideoAnalysisInput(
             asset_id=source.id,
             filename=source.original_filename,
             content_type=source.content_type,
             sampled_frames=frames,
-        )
+        ),
+        system_instruction=system_instruction,
+        user_instruction=user_instruction,
     )
     if not isinstance(result, dict):
         raise RuntimeError("视频分析 Adapter 返回的结果不是 JSON 对象")
@@ -133,6 +146,7 @@ def generate_structured_text(
     *,
     task_type: str,
     system_instruction: str,
+    user_instruction: str | None = None,
     user_payload: dict[str, Any],
     output_contract: str,
 ) -> dict[str, Any]:
@@ -144,6 +158,7 @@ def generate_structured_text(
         raise RuntimeError("本地模拟文本由 V1 生产服务处理，不应经过真实文本 Adapter")
     result = OpenAICompatibleJsonProvider(snapshot).generate_json(
         system_instruction=system_instruction,
+        user_instruction=user_instruction,
         user_payload=user_payload,
         output_contract=output_contract,
     )

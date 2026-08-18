@@ -8,7 +8,7 @@
 - `ProductionWorkbenchView.vue`：唯一主生产台。按固定阶段展示分析、故事、角色、场景、分镜、关键帧、镜头视频与成片；只提供合法的审核和生成入口。
 - `V1ModelCenterView.vue`：能力槽位、候选模型、人工启用和故事多模型并行；不接收 API Key。
 - `V1QualityReportView.vue`：只汇总已有调用/审核的质量与成本数据，不自动切换模型。
-- `V1PromptTemplatesView.vue`：Prompt 草稿、版本、启用和归档。
+- `V1PromptTemplatesView.vue`：系统 Prompt 目录、Draft、受控变量预览、发布、显式启用/回滚与版本正文差异；不编辑项目业务 Prompt。
 - `V1ProductionTraceView.vue`：定位项目冻结的 Workflow、模型、Prompt、调用和脱敏供应商任务号。
 - `AssetLibraryView.vue`：角色和场景资产中心。制作人只能新建资产或追加新版本；历史版本不可编辑。项目采用资产后仍须返回生产台锁图。
 

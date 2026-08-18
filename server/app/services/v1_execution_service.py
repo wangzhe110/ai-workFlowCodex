@@ -33,8 +33,6 @@ from app.models import (
     ModelProfile,
     ModelSlot,
     ProductionStage,
-    PromptTemplate,
-    PromptTemplateStatus,
     ReferenceAnalysis,
     ReviewStatus,
     RunStatus,
@@ -90,6 +88,7 @@ from app.services.model_parameter_service import profile_parameter_config, resol
 from app.services.sensitive_data import sanitize_error_summary
 from app.services.final_video_service import _compose_real_video
 from app.services.workflow_service import get_project_or_404
+from app.services.prompt_template_service import freeze_active_prompt
 
 
 V1_WORKFLOW_PREFIX = "v1_"
@@ -108,6 +107,23 @@ RUN_SPECS: dict[str, tuple[str, str, str]] = {
     "shot_keyframes": ("SHOT_KEYFRAME_GENERATE", "IMAGE_GENERATE", "分镜关键帧生成"),
     "video_generation": ("VIDEO_GENERATE", "VIDEO_GENERATE", "Seedance 视频片段生成"),
     "final_compose": ("FINAL_COMPOSE", "FINAL_COMPOSE", "审核片段合成成片"),
+}
+
+# Prompt 是业务操作而非模型槽位：同为 IMAGE_GENERATE 的角色图、场景图和关键帧
+# 各自使用不同的系统模板，但仍可共享同一个图片 ModelProfile。
+PROMPT_KEY_BY_RUN: dict[str, str | None] = {
+    "reference_analysis": "v1.reference_video_analysis",
+    "story_generation": "v1.story_generate",
+    "commerce_creative_generation": "commerce.story_ideas",
+    "character_design": "v1.character_design",
+    "character_images": "v1.character_image_prompt",
+    "scene_design": "v1.scene_design",
+    "scene_images": "v1.scene_image_prompt",
+    "director_plan": "v1.director_plan",
+    "shot_keyframes": "v1.keyframe_prompt_organize",
+    "video_generation": "v1.video_prompt_generate",
+    # 成片合成是本地 FFmpeg，不是模型 Prompt 操作。
+    "final_compose": None,
 }
 
 ALLOWED_STAGES: dict[str, set[ProductionStage]] = {
@@ -188,7 +204,7 @@ def create_v1_run(
         shot_plan_ids=shot_plan_ids,
     )
     frozen_models = _freeze_model_bindings(db, bindings, slot_key=slot_key)
-    frozen_prompt = _freeze_prompt(db, task_type)
+    frozen_prompt = _freeze_prompt(db, run_key=run_key, task_type=task_type, context=frozen_context)
     input_snapshot = {
         "frozen_at": utcnow().isoformat(),
         "stage": state.active_stage.value,
@@ -202,7 +218,7 @@ def create_v1_run(
             "definition_json": deepcopy(definition.definition_json),
         },
         "model_bindings": {slot_key: frozen_models},
-        "prompt_templates": {task_type: frozen_prompt},
+        "prompt_templates": {task_type: frozen_prompt} if frozen_prompt else {},
         "context": frozen_context,
     }
     run = WorkflowRun(
@@ -439,21 +455,55 @@ def _freeze_model_bindings(db: Session, bindings: list[Any], *, slot_key: str) -
     ]
 
 
-def _freeze_prompt(db: Session, task_type: str) -> dict[str, Any]:
-    """将整份 Prompt（包括变量定义）冻结，而不仅记录一个可变 ID。"""
+def _prompt_variables_for_run(run_key: str, context: dict[str, Any]) -> dict[str, Any]:
+    """Prompt 变量只来自已冻结的 Run 上下文，不能回读当前项目数据。"""
 
-    prompt = _active_prompt(db, task_type)
-    return {
-        "id": prompt.id,
-        "task_type": prompt.task_type,
-        "name": prompt.name,
-        "version": prompt.version,
-        "content": prompt.content,
-        "variables_schema": deepcopy(prompt.variables_schema),
-        "status": prompt.status.value,
-        "created_at": prompt.created_at.isoformat(),
-        "updated_at": prompt.updated_at.isoformat(),
-    }
+    if run_key == "reference_analysis":
+        return {"source_metadata": deepcopy(context.get("source_asset") or {})}
+    if run_key == "story_generation":
+        return {"locked_reference_analysis": deepcopy(context.get("locked_reference_analysis") or {})}
+    if run_key == "commerce_creative_generation":
+        return {
+            "frozen_input": deepcopy(context.get("commerce_mainline") or {}),
+            "required_idea_count": 10,
+        }
+    if run_key in {"character_design", "scene_design"}:
+        return {"selected_story": deepcopy(context.get("selected_story") or {})}
+    if run_key == "director_plan":
+        return {
+            "selected_story": deepcopy(context.get("selected_story") or {}),
+            "locked_characters": deepcopy(context.get("locked_character_assets") or []),
+            "locked_scenes": deepcopy(context.get("locked_scene_assets") or []),
+        }
+    if run_key in {"character_images", "scene_images"}:
+        return {"image_subject": deepcopy(context)}
+    if run_key in {"shot_keyframes", "video_generation"}:
+        return {"shot": deepcopy(context.get("shots") or [])}
+    return {}
+
+
+def _freeze_prompt(
+    db: Session,
+    *,
+    run_key: str,
+    task_type: str,
+    context: dict[str, Any],
+) -> dict[str, Any] | None:
+    """冻结 Prompt 目录/版本/渲染结果；FFmpeg 不创建伪 Prompt。"""
+
+    prompt_key = PROMPT_KEY_BY_RUN.get(run_key)
+    if prompt_key is None:
+        return None
+    prompt = freeze_active_prompt(
+        db,
+        prompt_key,
+        _prompt_variables_for_run(run_key, context),
+        legacy_task_type=task_type,
+    )
+    prompt["task_type"] = task_type
+    # 供 0023 前的只读测试/API 兼容展示；Worker 仍只读取 rendered_* 和版本 ID。
+    prompt["content"] = prompt["rendered_system_template"]
+    return prompt
 
 
 def _freeze_run_context(
@@ -736,17 +786,6 @@ def _profile_snapshot(profile_id: str, db: Session) -> dict[str, Any]:
     return snapshot
 
 
-def _active_prompt(db: Session, task_type: str) -> PromptTemplate:
-    prompt = db.scalars(
-        select(PromptTemplate)
-        .where(PromptTemplate.task_type == task_type, PromptTemplate.status == PromptTemplateStatus.ACTIVE)
-        .order_by(PromptTemplate.version.desc())
-    ).first()
-    if prompt is None:
-        raise RuntimeError(f"任务 {task_type} 没有活动 Prompt 模板")
-    return prompt
-
-
 def _frozen_bindings(run: WorkflowRun, slot_key: str) -> list[dict[str, Any]]:
     """返回创建时固化的有序模型列表；禁止 Worker 回读模型中心。"""
 
@@ -765,7 +804,21 @@ def _frozen_prompt(run: WorkflowRun, task_type: str) -> dict[str, Any]:
 
     snapshot = run.input_snapshot or {}
     prompt = ((snapshot.get("prompt_templates") or {}).get(task_type))
-    if not isinstance(prompt, dict) or not isinstance(prompt.get("content"), str) or not prompt["content"].strip():
+    # 0023 前创建的运行已冻结 legacy ``content``，允许其继续完成或恢复；这不是
+    # 对当前 ACTIVE 模板的回读。所有新 Run 都必须具备 prompt_key/version 快照。
+    if isinstance(prompt, dict) and isinstance(prompt.get("content"), str) and prompt["content"].strip() and not prompt.get("prompt_key"):
+        return {
+            **prompt,
+            "prompt_key": "legacy.frozen_snapshot",
+            "rendered_system_template": prompt["content"].strip(),
+            "rendered_user_template": "",
+        }
+    if (
+        not isinstance(prompt, dict)
+        or not isinstance(prompt.get("prompt_key"), str)
+        or not isinstance(prompt.get("rendered_system_template"), str)
+        or not prompt["rendered_system_template"].strip()
+    ):
         raise RuntimeError(f"运行 {run.id} 缺少冻结 Prompt：{task_type}")
     return prompt
 
@@ -807,7 +860,8 @@ def _invoke(
     # 这里仍做一次边界清理，保证 ModelInvocation 永远不成为明文扩散点。
     safe_profile_snapshot = deepcopy(profile_snapshot)
     safe_profile_snapshot["provider_config"] = redact_provider_config(profile_snapshot.get("provider_config"))
-    prompt = _frozen_prompt(run, task_type)
+    # FINAL_COMPOSE 是本地 FFmpeg 任务，不能凭空生成系统 Prompt 审计。
+    prompt = {} if task_type == "FINAL_COMPOSE" else _frozen_prompt(run, task_type)
     safe_input_snapshot = deepcopy(input_snapshot)
     # 与 WorkflowRun 的绑定快照保持同一份可追溯参数事实。调用审计不能通过
     # “当前 Profile”反推参数，否则模型中心切换后会失去历史可复现性。
@@ -820,7 +874,10 @@ def _invoke(
         workflow_step_id=workflow_step_id,
         model_slot_id=slot_id,
         model_profile_id=profile_id,
+        # 保留 legacy 指针供旧质量报表关联；真实模板版本由新字段精确追溯，执行
+        # 只能读取冻结的 rendered_* 内容，绝不回读 legacy ACTIVE Prompt。
         prompt_template_id=prompt.get("id"),
+        prompt_template_version_id=prompt.get("prompt_version_id"),
         task_type=task_type,
         model_profile_snapshot=safe_profile_snapshot,
         prompt_snapshot=deepcopy(prompt),
@@ -888,13 +945,31 @@ def _is_mock(profile_snapshot: dict[str, Any]) -> bool:
     return is_mock_adapter(profile_snapshot)
 
 
-def _system_instruction(invocation: ModelInvocation, extra_rules: str) -> str:
+def _system_instruction(invocation: ModelInvocation) -> str:
     """从冻结 Prompt 快照取生产指令，避免业务代码内置可变 Prompt。"""
 
-    content = invocation.prompt_snapshot.get("content")
+    content = invocation.prompt_snapshot.get("rendered_system_template")
     if not isinstance(content, str) or not content.strip():
         raise RuntimeError("本次模型调用缺少冻结 Prompt 内容")
-    return f"{content.strip()}\n\n{extra_rules.strip()}"
+    return content.strip()
+
+
+def _user_instruction(invocation: ModelInvocation) -> str:
+    """读取创建任务时已经渲染并冻结的用户 Prompt。"""
+
+    content = invocation.prompt_snapshot.get("rendered_user_template")
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("本次模型调用缺少冻结用户 Prompt 内容")
+    return content.strip()
+
+
+def _video_generation_prompt(invocation: ModelInvocation, business_prompt: str) -> str:
+    """让图生视频也消费冻结的系统模板，而不覆盖项目镜头业务 Prompt。"""
+
+    return (
+        f"{_system_instruction(invocation)}\n\n{_user_instruction(invocation)}\n\n"
+        f"<LEMONFLOW_PROJECT_PROMPT>\n{business_prompt.strip()}\n</LEMONFLOW_PROJECT_PROMPT>"
+    )
 
 
 def _frozen_source(db: Session, run: WorkflowRun) -> MediaAsset:
@@ -986,7 +1061,11 @@ def _execute_reference_analysis(db: Session, run: WorkflowRun) -> None:
         media_units = {"mode": "local_mock", "sampled_frame_count": 0}
     else:
         assert_supported(snapshot, "VIDEO_ANALYSIS")
-        adapter_result, sampled_frame_count = analyze_reference_video(snapshot, source)
+        adapter_result, sampled_frame_count = analyze_reference_video(
+            snapshot,
+            source,
+            prompt_snapshot=invocation.prompt_snapshot,
+        )
         payload = _analysis_payload_from_adapter(adapter_result)
         media_units = {"sampled_frame_count": sampled_frame_count}
     version = (db.scalar(select(func.max(ReferenceAnalysis.version)).where(ReferenceAnalysis.project_id == run.project_id)) or 0) + 1
@@ -1161,11 +1240,8 @@ def _execute_story_generation(db: Session, run: WorkflowRun) -> None:
             result = generate_structured_text(
                 snapshot,
                 task_type="STORY_GENERATE",
-                system_instruction=_system_instruction(
-                    invocation,
-                    "输出一个完全原创的短剧方案。只能使用已锁定简报中的结构和情绪机制，"
-                    "不得复制参考视频的台词、人物、画面或具体剧情。",
-                ),
+                system_instruction=_system_instruction(invocation),
+                user_instruction=_user_instruction(invocation),
                 user_payload={"locked_reference_analysis": deepcopy(locked_snapshot)},
                 output_contract=STORY_OUTPUT_CONTRACT,
             )
@@ -1302,11 +1378,8 @@ def _execute_character_design(db: Session, run: WorkflowRun) -> None:
         result = generate_structured_text(
             snapshot,
             task_type="CHARACTER_DESIGN",
-            system_instruction=_system_instruction(
-                invocation,
-                "依据已选原创故事设计可长期复用的角色资产。角色必须是原创，"
-                "并将外貌、服装和性格写成稳定、可供参考图生成的描述。",
-            ),
+            system_instruction=_system_instruction(invocation),
+            user_instruction=_user_instruction(invocation),
             user_payload={"selected_story": story_content},
             output_contract=CHARACTER_DESIGN_OUTPUT_CONTRACT,
         )
@@ -1341,11 +1414,8 @@ def _execute_scene_design(db: Session, run: WorkflowRun) -> None:
         result = generate_structured_text(
             snapshot,
             task_type="SCENE_DESIGN",
-            system_instruction=_system_instruction(
-                invocation,
-                "依据已选原创故事设计可长期复用的场景资产。描述要便于持续保持地点、"
-                "环境、视觉风格和氛围一致，且不得复制参考视频画面。",
-            ),
+            system_instruction=_system_instruction(invocation),
+            user_instruction=_user_instruction(invocation),
             user_payload={"selected_story": story_content},
             output_contract=SCENE_DESIGN_OUTPUT_CONTRACT,
         )
@@ -1369,10 +1439,17 @@ def _mock_image_url(kind: str, object_id: str, version: int) -> str:
     return f"mock://v1-image/{kind}/{object_id}/v{version}"
 
 
-def _image_prompt(instruction: str, subject: str) -> str:
-    """把冻结图片 Prompt 与本次资产描述合成为一段可审计的最终提示词。"""
+def _image_prompt(system_instruction: str, user_instruction: str, subject: str) -> str:
+    """组合冻结系统/用户模板与项目图片业务输入。
 
-    return f"{instruction.strip()}\n\n生成对象：{subject.strip()}"
+    ``subject`` 是项目产出的角色、场景或镜头事实；它不是可编辑的系统模板。
+    三部分都在创建 Run 时已冻结，Worker 不会回读 Prompt 中心的活动版本。
+    """
+
+    return (
+        f"{system_instruction.strip()}\n\n{user_instruction.strip()}\n\n"
+        f"<LEMONFLOW_PROJECT_PROMPT>\n{subject.strip()}\n</LEMONFLOW_PROJECT_PROMPT>"
+    )
 
 
 def _generate_persisted_v1_image(
@@ -1491,7 +1568,8 @@ def _execute_character_images(db: Session, run: WorkflowRun) -> None:
         )
         snapshot = invocation.model_profile_snapshot
         prompt = _image_prompt(
-            _system_instruction(invocation, "输出单人角色设定参考图，不出现文字、水印或其他未定义角色。"),
+            _system_instruction(invocation),
+            _user_instruction(invocation),
             f"角色编码：{character.get('character_code', '')}；姓名：{character.get('name', '')}；"
             f"年龄：{character.get('age_description', '')}；外貌：{character.get('appearance', '')}；"
             f"服装：{character.get('costume', '')}；气质：{character.get('temperament', '')}。",
@@ -1559,7 +1637,8 @@ def _execute_scene_images(db: Session, run: WorkflowRun) -> None:
         )
         snapshot = invocation.model_profile_snapshot
         prompt = _image_prompt(
-            _system_instruction(invocation, "输出无人场景设定参考图，不出现文字、水印或未定义人物。"),
+            _system_instruction(invocation),
+            _user_instruction(invocation),
             f"场景编码：{scene.get('scene_code', '')}；名称：{scene.get('name', '')}；地点：{scene.get('location', '')}；"
             f"环境：{scene.get('environment', '')}；视觉风格：{scene.get('visual_style', '')}；"
             f"氛围：{scene.get('mood', '')}。",
@@ -1725,12 +1804,8 @@ def _execute_director_plan(db: Session, run: WorkflowRun) -> None:
         result = generate_structured_text(
             snapshot,
             task_type="DIRECTOR_PLAN",
-            system_instruction=_system_instruction(
-                invocation,
-                "生成导演视觉方案和按顺序排列的分镜。只能引用输入中已经锁定的角色和场景编码，"
-                "每镜必须给出动作、情绪、镜头类型、运镜、光线、时长，以及可直接用于图片、视频、"
-                "声音生产的三类原创 Prompt。",
-            ),
+            system_instruction=_system_instruction(invocation),
+            user_instruction=_user_instruction(invocation),
             user_payload={
                 "selected_story": story_content,
                 "locked_characters": [
@@ -1907,11 +1982,8 @@ def _execute_shot_keyframes(db: Session, run: WorkflowRun) -> None:
         )
         snapshot = invocation.model_profile_snapshot
         prompt = _image_prompt(
-            _system_instruction(
-                invocation,
-                "必须以输入的锁定角色图和场景图为视觉参考，保持人物外观、服装、场景风格一致；"
-                "输出这个镜头的一张关键画面，不出现文字或水印。",
-            ),
+            _system_instruction(invocation),
+            _user_instruction(invocation),
             f"第 {shot_number} 镜；导演图片提示：{shot.get('image_prompt', '')}；动作：{shot.get('action_description', '')}；"
             f"情绪：{shot.get('emotion', '')}；镜头：{shot.get('camera_type', '')} / {shot.get('camera_move', '')}；"
             f"光线：{shot.get('lighting', '')}。",
@@ -2048,9 +2120,12 @@ def execute_v1_video_child(run_id: str, step_id: str) -> None:
                 create_video_request(
                     project_id=run.project_id,
                     shot_number=int(frozen_shot["shot_number"]),
-                    # 视频 Adapter 只消费创建时冻结的导演视频 Prompt；旧任务回放时仍可
-                    # 通过 video_action_prompt 兼容，但不会重新读取当前导演方案。
-                    prompt=str(frozen_shot.get("video_prompt") or frozen_shot.get("video_action_prompt") or ""),
+                    # 项目镜头正文与系统模板都来自本次冻结快照；旧任务回放仍可通过
+                    # video_action_prompt 兼容，但不会重新读取当前导演方案或活动 Prompt。
+                    prompt=_video_generation_prompt(
+                        invocation,
+                        str(frozen_shot.get("video_prompt") or frozen_shot.get("video_action_prompt") or ""),
+                    ),
                     image_urls=[keyframe["image_url"]],
                 )
             )

@@ -42,8 +42,6 @@ from app.models import (
     ProductAssetVersionStatus,
     Project,
     ProjectProductSelection,
-    PromptTemplate,
-    PromptTemplateStatus,
     RenderBatch,
     RenderBatchStatus,
     ReviewDecision,
@@ -86,6 +84,7 @@ from app.services.v1_configuration_service import enabled_profiles_for_slot
 from app.services.v1_model_adapter_service import assert_supported, generate_structured_text, is_mock_adapter
 from app.services.model_parameter_service import profile_parameter_config, resolve_effective_model_parameters
 from app.services.provider_config_security import redact_provider_config
+from app.services.prompt_template_service import freeze_active_prompt
 
 
 # 一个 StoryRun 只拥有一个长期存在的 Commerce 父运行。每个阶段和人工重做均在
@@ -117,6 +116,16 @@ NODE_MODEL_SPECS: dict[StoryRunStage, tuple[str | None, str | None]] = {
     StoryRunStage.SEGMENT_RENDER: ("VIDEO_GENERATE", "VIDEO_GENERATE"),
 }
 
+PROMPT_KEY_BY_STAGE: dict[StoryRunStage, str | None] = {
+    StoryRunStage.TOPIC: None,
+    StoryRunStage.OUTLINE: "commerce.story_outline",
+    StoryRunStage.CHAPTERS: "commerce.story_outline",
+    StoryRunStage.STORYBOARD: "commerce.director_storyboard",
+    StoryRunStage.VISUAL_ASSETS: "commerce.keyframe_prompt_organize",
+    StoryRunStage.VIDEO_PROMPTS: "commerce.video_prompt_generate",
+    StoryRunStage.SEGMENT_RENDER: "v1.video_prompt_generate",
+}
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -124,6 +133,15 @@ def utcnow() -> datetime:
 
 def _error(detail: str, code: int = status.HTTP_409_CONFLICT) -> None:
     raise HTTPException(status_code=code, detail=detail)
+
+
+def _frozen_prompt_text(prompt: dict[str, Any], field: str) -> str:
+    """拒绝执行时回读活动模板或回退为旧硬编码正文。"""
+
+    value = prompt.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"Commerce 工作流缺少冻结 Prompt 字段：{field}")
+    return value.strip()
 
 
 def _safe_error(_: Exception) -> str:
@@ -243,22 +261,6 @@ def _freeze_execution_snapshot(db: Session, story_run: StoryRun, stage: StoryRun
             )
             for binding in raw_bindings
         ]
-        active_prompt = db.scalars(
-            select(PromptTemplate)
-            .where(PromptTemplate.task_type == task_type, PromptTemplate.status == PromptTemplateStatus.ACTIVE)
-            .order_by(PromptTemplate.version.desc())
-        ).first()
-        if active_prompt is None:
-            _error(f"任务 {task_type} 没有活动 Prompt 模板", status.HTTP_503_SERVICE_UNAVAILABLE)
-        prompt = {
-            "id": active_prompt.id,
-            "task_type": active_prompt.task_type,
-            "name": active_prompt.name,
-            "version": active_prompt.version,
-            "content": active_prompt.content,
-            "variables_schema": deepcopy(active_prompt.variables_schema),
-            "status": active_prompt.status.value,
-        }
     selection = db.get(ProjectProductSelection, story_run.project_product_selection_id)
     product_version = db.get(ProductAssetVersion, story_run.product_asset_version_id)
     if selection is None or product_version is None:
@@ -303,12 +305,37 @@ def _freeze_execution_snapshot(db: Session, story_run: StoryRun, stage: StoryRun
             "definition_json": deepcopy(definition.definition_json),
         },
         "model_bindings": {slot_key: bindings} if slot_key else {},
-        "prompt_templates": {task_type: prompt} if task_type and prompt else {},
+        "prompt_templates": {},
     }
     # Slice 1 的 StoryRun 有一对一的上游输入版本快照。这里复制它，不再执行时回读
     # ScriptAnalysis、产品或创意表；旧 Commerce StoryRun 保持原有快照结构。
     if story_run.mainline_input is not None:
         snapshot["commerce_mainline"] = deepcopy(story_run.mainline_input.input_snapshot)
+    prompt_key = PROMPT_KEY_BY_STAGE.get(stage)
+    if prompt_key is not None:
+        # 模型绑定/Provider 配置属于运行审计，不属于模型业务输入。Prompt 只消费
+        # 已冻结的故事、商品与审核结果，避免任何历史异常配置字段被送入模板渲染。
+        business_context = {
+            "commerce": deepcopy(snapshot["commerce"]),
+            "commerce_mainline": deepcopy(snapshot.get("commerce_mainline") or {}),
+        }
+        if stage in {StoryRunStage.OUTLINE, StoryRunStage.CHAPTERS}:
+            variables = {"frozen_input": business_context}
+        elif stage == StoryRunStage.STORYBOARD:
+            variables = {"commerce_context": business_context}
+        elif stage == StoryRunStage.VISUAL_ASSETS:
+            variables = {"shot": business_context}
+        elif stage == StoryRunStage.VIDEO_PROMPTS:
+            variables = {"video_context": business_context}
+        else:
+            variables = {"shot": business_context}
+        prompt = freeze_active_prompt(db, prompt_key, variables, legacy_task_type=task_type)
+        if task_type is not None:
+            prompt["task_type"] = task_type
+            # 仅供已发布的旧 API/测试读取。实际 Worker 只读取 rendered_* 与
+            # prompt_version_id，绝不会把它当成未冻结的当前 Prompt。
+            prompt["content"] = prompt["rendered_system_template"]
+            snapshot["prompt_templates"] = {task_type: prompt}
     return snapshot
 
 
@@ -1405,6 +1432,7 @@ class MockCommerceNodeExecutor:
                     model_slot_id=items[0].get("slot_id"),
                     model_profile_id=items[0].get("model_profile_id"),
                     prompt_template_id=prompt.get("id"),
+                    prompt_template_version_id=prompt.get("prompt_version_id"),
                     task_type="STORY_GENERATE",
                     model_profile_snapshot=deepcopy(profile),
                     prompt_snapshot=deepcopy(prompt),
@@ -1427,11 +1455,8 @@ class MockCommerceNodeExecutor:
                 outline_payload = generate_structured_text(
                     profile,
                     task_type="STORY_GENERATE",
-                    system_instruction=(
-                        f"{str(prompt.get('content') or '').strip()}\n\n"
-                        "基于冻结脚本、冻结商品和已选创意生成原创故事大纲与结构化商品融入方案。"
-                        "禁止创造冻结商品分析中不存在的功效、包装、使用方法或宣传结论。"
-                    ),
+                    system_instruction=_frozen_prompt_text(prompt, "rendered_system_template"),
+                    user_instruction=_frozen_prompt_text(prompt, "rendered_user_template"),
                     user_payload={"frozen_input": deepcopy(frozen_input)},
                     output_contract=(
                         '{"title":"string","premise":"string","story_beats":[{"beat":"string","content":"string"}],'

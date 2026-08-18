@@ -13,7 +13,8 @@ DATABASE_SCHEMA_MODE=migrate alembic upgrade head
 
 - `0001_initial_schema`：旧项目基线。
 - `0002_model_evaluations`：早期模型评测记录。
-- `0003_v1_production_foundation`：V1 Workflow、审核、资产引用、模型槽位、Prompt 与调用审计。
+- `0003_v1_production_foundation`：V1 Workflow、审核、资产引用、模型槽位、旧 Prompt 与调用审计。
+- `0023_prompt_template_version_management`：系统 Prompt 目录、不可变版本、活动版本指针和 `ModelInvocation.prompt_template_version_id` 追溯；不触碰项目业务视频 Prompt 表。
 - `0004_v1_legacy_backfill`：历史 Workflow/模型兼容数据回填。
 - `0005_v1_asset_ownership_and_versions`：角色/场景归属与多版本锁图指针。
 - `0006_v1_quality_review_metrics`：模型质量人工评分、采用率等指标。

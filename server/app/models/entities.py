@@ -212,6 +212,18 @@ class PromptTemplateStatus(str, Enum):
     ARCHIVED = "ARCHIVED"
 
 
+class PromptTemplateVersionStatus(str, Enum):
+    """系统 Prompt 版本的发布状态。
+
+    ``PromptTemplate`` 是早期 V1 的兼容配置表，历史调用仍会引用它。本枚举只服务
+    于新 Prompt 中心的 ``PromptTemplateDefinition / PromptTemplateVersion`` 两层
+    模型，避免把项目内 ``video_prompt_versions`` 等业务产物误当成系统模板。
+    """
+
+    DRAFT = "DRAFT"
+    PUBLISHED = "PUBLISHED"
+
+
 # ---------------------------------------------------------------------------
 # 带货短剧（Commerce）工作流的领域枚举。
 #
@@ -2629,6 +2641,70 @@ class PromptTemplate(Base):
     )
 
 
+class PromptTemplateDefinition(Base):
+    """系统级 Prompt 的稳定目录项与活动版本指针。
+
+    一个目录项对应一个业务操作，而不是一个模型或项目。``active_version_id`` 有意
+    保存为不可变版本 ID：目录和版本之间存在循环引用，活动指针的归属校验由同一
+    事务内的服务层完成，版本表仍以正式外键约束其目录项。
+    """
+
+    __tablename__ = "prompt_template_definitions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    prompt_key: Mapped[str] = mapped_column(String(120), nullable=False, unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    operation_key: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    model_slot_key: Mapped[Optional[str]] = mapped_column(String(80), nullable=True, index=True)
+    capability: Mapped[str] = mapped_column(String(80), nullable=False)
+    active_version_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class PromptTemplateVersion(Base):
+    """不可覆盖的系统 Prompt 正文版本。
+
+    输出契约仍是代码中的稳定键。页面可以修改 Draft 的 system/user 文本和变更
+    说明，但不能把数据库 JSON 当作任意响应 Schema 或供应商请求配置。
+    """
+
+    __tablename__ = "prompt_template_versions"
+    __table_args__ = (
+        UniqueConstraint("prompt_template_id", "version", name="uq_prompt_template_definition_version"),
+        CheckConstraint("status IN ('DRAFT', 'PUBLISHED')", name="ck_prompt_template_version_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    prompt_template_id: Mapped[str] = mapped_column(
+        ForeignKey("prompt_template_definitions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[PromptTemplateVersionStatus] = mapped_column(
+        SqlEnum(
+            PromptTemplateVersionStatus,
+            native_enum=False,
+            create_constraint=True,
+            name="prompttemplateversionstatus",
+        ),
+        default=PromptTemplateVersionStatus.DRAFT,
+        nullable=False,
+    )
+    system_template: Mapped[str] = mapped_column(Text, nullable=False)
+    user_template: Mapped[str] = mapped_column(Text, nullable=False)
+    allowed_variables: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    output_contract_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    change_summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
 class ModelInvocation(Base):
     """一次真实或模拟模型调用的脱敏、可重放审计记录。"""
 
@@ -2652,6 +2728,11 @@ class ModelInvocation(Base):
     model_slot_id: Mapped[str] = mapped_column(ForeignKey("model_slots.id"), nullable=False, index=True)
     model_profile_id: Mapped[str] = mapped_column(ForeignKey("model_profiles.id"), nullable=False, index=True)
     prompt_template_id: Mapped[Optional[str]] = mapped_column(ForeignKey("prompt_templates.id"), nullable=True, index=True)
+    # 新 Prompt 中心的不可变版本。保留 legacy ``prompt_template_id``，确保历史 V1
+    # 调用与既有质量报表不被本次配置迁移破坏。
+    prompt_template_version_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("prompt_template_versions.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
     task_type: Mapped[str] = mapped_column(String(80), nullable=False)
     model_profile_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     prompt_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)

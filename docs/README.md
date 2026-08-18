@@ -15,7 +15,7 @@
 ## 生产管理与追溯
 
 - [模型质量报表操作](LemonFlow_V1_模型质量报表操作.md)：比较人工评分、采用率、预计成本和耗时；只供人工决策。
-- [Prompt 模板操作](LemonFlow_V1_Prompt模板操作.md)：创建、验收、启用和归档 Prompt 版本。
+- [Prompt 模板操作](LemonFlow_V1_Prompt模板操作.md)：复制 Draft、受控变量预览、发布、显式启用/回滚和运行冻结规则。
 - [生产追溯操作](LemonFlow_V1_生产追溯操作.md)：定位一个项目实际冻结的 Workflow、模型、Prompt 和供应商任务号。
 - [LemonFlow V1 架构设计](LemonFlow_V1_Architecture.md)：数据关系、状态机、能力槽位和兼容边界的架构基线。
 

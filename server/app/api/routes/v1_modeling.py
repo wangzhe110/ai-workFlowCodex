@@ -17,7 +17,13 @@ from app.schemas import (
     ModelQualityRefreshRequest,
     ModelProfilePreflightResponse,
     PromptTemplateCreateRequest,
+    PromptTemplateCatalogResponse,
+    PromptTemplateRenderPreviewRequest,
+    PromptTemplateRenderPreviewResponse,
     PromptTemplateResponse,
+    PromptTemplateVersionDraftRequest,
+    PromptTemplateVersionResponse,
+    PromptTemplateVersionUpdateRequest,
     V1ModelProfileCreateRequest,
     V1ModelProfileResponse,
     V1ModelProfileUpdateRequest,
@@ -43,6 +49,18 @@ from app.services.v1_configuration_service import (
 from app.services.v1_quality_service import list_latest_quality_evaluations, refresh_quality_evaluations
 from app.services.provider_config_security import redact_provider_config
 from app.services.model_parameter_service import profile_parameter_config
+from app.services.prompt_template_service import (
+    activate_prompt_version,
+    copy_prompt_draft,
+    get_prompt_definition,
+    list_prompt_definitions,
+    list_prompt_versions,
+    prompt_definition_response,
+    prompt_version_response,
+    publish_prompt_draft,
+    render_prompt_preview,
+    update_prompt_draft,
+)
 
 
 router = APIRouter(prefix="/api/v1/production", tags=["V1 模型与 Prompt 配置"])
@@ -116,6 +134,26 @@ def _prompt_response(item) -> PromptTemplateResponse:
         status=item.status.value,
         created_at=item.created_at,
         updated_at=item.updated_at,
+    )
+
+
+def _prompt_version_response(item) -> PromptTemplateVersionResponse:
+    """新 Prompt 中心版本响应；不包含模型/渠道配置或任何认证信息。"""
+
+    return PromptTemplateVersionResponse(**prompt_version_response(item))
+
+
+def _prompt_catalog_response(db: Session, item) -> PromptTemplateCatalogResponse:
+    """将系统 Prompt 目录与其不可变历史版本聚合为单一前端入口。"""
+
+    payload = prompt_definition_response(item)
+    versions = list_prompt_versions(db, item.prompt_key)
+    active = next((version for version in versions if version.id == item.active_version_id), None)
+    return PromptTemplateCatalogResponse(
+        **payload,
+        active_version=_prompt_version_response(active) if active is not None else None,
+        versions=[_prompt_version_response(version) for version in versions],
+        draft_count=sum(1 for version in versions if version.status.value == "DRAFT"),
     )
 
 
@@ -341,6 +379,91 @@ def list_prompt_templates_endpoint(
     """列出 Prompt 历史版本，便于比较质量、成本和最终采用率。"""
 
     return [_prompt_response(item) for item in list_prompt_templates(db, task_type)]
+
+
+# ``/prompt-templates`` 上方保留给旧 V1 表和历史客户端。下面的 catalog API 是
+# 正式系统 Prompt 中心：稳定 prompt_key、不可覆盖版本、活动指针和本地渲染预览。
+@router.get("/prompt-template-catalog", response_model=list[PromptTemplateCatalogResponse])
+def list_prompt_template_catalog_endpoint(
+    db: Session = Depends(get_db),
+) -> list[PromptTemplateCatalogResponse]:
+    return [_prompt_catalog_response(db, item) for item in list_prompt_definitions(db)]
+
+
+@router.get("/prompt-template-catalog/{prompt_key}", response_model=PromptTemplateCatalogResponse)
+def get_prompt_template_catalog_endpoint(
+    prompt_key: str,
+    db: Session = Depends(get_db),
+) -> PromptTemplateCatalogResponse:
+    return _prompt_catalog_response(db, get_prompt_definition(db, prompt_key))
+
+
+@router.post(
+    "/prompt-template-catalog/{prompt_key}/drafts",
+    response_model=PromptTemplateVersionResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def copy_prompt_template_draft_endpoint(
+    prompt_key: str,
+    payload: PromptTemplateVersionDraftRequest,
+    db: Session = Depends(get_db),
+) -> PromptTemplateVersionResponse:
+    return _prompt_version_response(
+        copy_prompt_draft(db, prompt_key=prompt_key, source_version_id=payload.source_version_id)
+    )
+
+
+@router.patch("/prompt-template-versions/{version_id}", response_model=PromptTemplateVersionResponse)
+def update_prompt_template_draft_endpoint(
+    version_id: str,
+    payload: PromptTemplateVersionUpdateRequest,
+    db: Session = Depends(get_db),
+) -> PromptTemplateVersionResponse:
+    return _prompt_version_response(
+        update_prompt_draft(
+            db,
+            version_id=version_id,
+            system_template=payload.system_template,
+            user_template=payload.user_template,
+            change_summary=payload.change_summary,
+        )
+    )
+
+
+@router.post("/prompt-template-versions/{version_id}/publish", response_model=PromptTemplateVersionResponse)
+def publish_prompt_template_draft_endpoint(
+    version_id: str,
+    db: Session = Depends(get_db),
+) -> PromptTemplateVersionResponse:
+    return _prompt_version_response(publish_prompt_draft(db, version_id=version_id))
+
+
+@router.post("/prompt-template-catalog/{prompt_key}/versions/{version_id}/activate", response_model=PromptTemplateCatalogResponse)
+def activate_prompt_template_version_endpoint(
+    prompt_key: str,
+    version_id: str,
+    db: Session = Depends(get_db),
+) -> PromptTemplateCatalogResponse:
+    return _prompt_catalog_response(db, activate_prompt_version(db, prompt_key=prompt_key, version_id=version_id))
+
+
+@router.post(
+    "/prompt-template-catalog/{prompt_key}/render-preview",
+    response_model=PromptTemplateRenderPreviewResponse,
+)
+def render_prompt_template_preview_endpoint(
+    prompt_key: str,
+    payload: PromptTemplateRenderPreviewRequest,
+    db: Session = Depends(get_db),
+) -> PromptTemplateRenderPreviewResponse:
+    return PromptTemplateRenderPreviewResponse(
+        **render_prompt_preview(
+            db,
+            prompt_key=prompt_key,
+            version_id=payload.version_id,
+            variables=payload.variables,
+        )
+    )
 
 
 @router.post(

@@ -72,6 +72,7 @@ docker compose --env-file infra/compose.env up --build
 - 制作人员从 [用户使用手册](docs/用户使用手册.md) 开始。
 - 跨项目复用角色与场景请阅读 [资产中心操作](docs/资产中心操作.md)。
 - 第一次配置模型，从 [模型配置小白操作卡](docs/模型配置小白操作卡.md) 开始；真实 Key 只写服务器环境变量，绝不写进网页、数据库或 Git。
+- 需要优化系统级模型执行说明时，使用 [Prompt 版本管理操作](docs/LemonFlow_V1_Prompt模板操作.md) 的“复制 Draft → 本地预览 → 发布 → 显式启用”流程；项目镜头的视频 Prompt 仍在生产台审核。
 - 启用 Seedance 前阅读 [豆包 Seedance 视频操作说明](docs/豆包Seedance视频操作说明.md)。
 - 模型、Prompt 与供应商任务号的历史定位见 [生产追溯操作](docs/LemonFlow_V1_生产追溯操作.md)。
 

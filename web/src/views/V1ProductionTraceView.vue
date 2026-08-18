@@ -44,6 +44,10 @@ function cost(item: ModelInvocationTrace): string {
   return item.cost_amount === null ? '未填写' : `${item.cost_amount.toFixed(4)} ${item.currency}`
 }
 
+function shortHash(value: string | null | undefined): string {
+  return value ? `${value.slice(0, 12)}…` : '未记录哈希'
+}
+
 async function load() {
   loading.value = true
   error.value = ''
@@ -103,7 +107,7 @@ watch(() => props.projectId, load)
             <td><strong>{{ taskLabels[item.task_type] || item.task_type }}</strong><span class="status" :class="item.status">{{ item.status }}</span><small v-if="item.error_code" class="error-text">错误：{{ item.error_code }}</small></td>
             <td><strong>{{ item.workflow_version || '历史记录' }}</strong><small>{{ item.workflow_key || '未记录工作流键' }}</small></td>
             <td><strong>{{ item.model_display_name }}</strong><small>{{ item.model_key }} · {{ item.model_version }}<template v-if="item.model_profile_version"> · 配置 v{{ item.model_profile_version }}</template></small></td>
-            <td><strong>{{ item.prompt_name || '未记录' }}</strong><small>{{ item.prompt_version ? `v${item.prompt_version}` : '未记录版本' }}</small></td>
+            <td><strong>{{ item.prompt_name || '未记录' }}</strong><small>{{ item.prompt_version ? `v${item.prompt_version}` : '未记录版本' }} · {{ shortHash(item.prompt_content_hash) }}</small></td>
             <td><strong>{{ cost(item) }}</strong><small>耗时：{{ duration(item.latency_ms) }}</small></td>
             <td><strong>{{ formatTime(item.created_at) }}</strong><small v-if="item.provider_task_id">供应商任务号：{{ item.provider_task_id }}</small><small v-else>平台调用 ID：{{ item.id }}</small></td>
           </tr>

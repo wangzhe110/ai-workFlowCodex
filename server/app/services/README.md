@@ -11,7 +11,8 @@
 - `analysis_provider.py`：OpenAI 兼容视觉、文本、图片、火山方舟 Seedance 和可配置异步视频协议的参数转换与返回值标准化。
 - `video_frame_service.py`：通过 FFprobe/FFmpeg 验证视频并抽帧，供参考视频分析使用。
 - `storage.py`：源视频、生成图片和最终成片的本地/S3 存储边界。
-- `v1_configuration_service.py`：Workflow 定义、能力槽位、候选模型版本、Prompt 模板及人工启用规则。
+- `v1_configuration_service.py`：Workflow 定义、能力槽位、候选模型版本和人工启用规则。
+- `prompt_template_service.py`：系统 Prompt 目录/不可变版本、严格简单变量渲染、内容哈希和 Workflow/调用冻结快照；不管理项目视频 Prompt 业务结果。
 - `v1_quality_service.py` / `v1_trace_service.py`：只读取已有调用和审核，提供质量比较与版本追溯；不自动换模型、不暴露密钥。
 - `asset_library_service.py`：资产中心的角色/场景版本、项目采用关系和旧锁图惰性补齐。它不调用模型、不改变生产阶段；采用资产仍必须回到现有锁图审核。
 - `commerce_configuration_service.py`：单独、幂等发布 `LEMONFLOW_COMMERCE` /

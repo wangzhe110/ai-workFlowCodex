@@ -1,211 +1,179 @@
 <script setup lang="ts">
-/**
- * LemonFlow V1 Prompt 模板版本管理页。
- *
- * 所有改动先创建草稿，再由制作负责人明确激活；已用于生产的内容已经随
- * ModelInvocation 冻结，因此本页绝不提供“直接编辑旧版本”的入口。
- */
+/** 系统 Prompt 中心：项目的业务视频 Prompt 不在此页编辑。 */
 import { computed, onMounted, ref, watch } from 'vue'
+import {
+  activatePromptTemplateVersion,
+  createPromptTemplateDraft,
+  getPromptTemplateCatalog,
+  previewPromptTemplateRender,
+  publishPromptTemplateDraft,
+  updatePromptTemplateDraft,
+} from '@/api/production'
+import type { PromptTemplateCatalog, PromptTemplateRenderPreview, PromptTemplateVersion } from '@/types/domain'
 
-import { activatePromptTemplate, archivePromptTemplate, createPromptTemplate, getPromptTemplates } from '@/api/production'
-import type { PromptTemplate } from '@/types/domain'
-
-const templates = ref<PromptTemplate[]>([])
+const catalog = ref<PromptTemplateCatalog[]>([])
+const selectedKey = ref('')
+const selectedVersionId = ref('')
 const loading = ref(true)
 const saving = ref(false)
-const actionId = ref('')
+const action = ref('')
 const error = ref('')
 const notice = ref('')
+const systemTemplate = ref('')
+const userTemplate = ref('')
+const changeSummary = ref('')
+const previewVariablesText = ref('{}')
+const preview = ref<PromptTemplateRenderPreview | null>(null)
 
-const taskType = ref('VIDEO_ANALYSIS')
-const name = ref('V1 视频分析提示词')
-const content = ref('只提炼结构、开头机制、爆款元素与场景作用；不得复刻人物、台词、画面或音乐。')
-const variablesSchemaText = ref('{\n  "type": "object",\n  "properties": {}\n}')
+const selected = computed(() => catalog.value.find((item) => item.prompt_key === selectedKey.value) || null)
+const selectedVersion = computed(() => selected.value?.versions.find((item) => item.id === selectedVersionId.value) || null)
+const activeVersion = computed(() => selected.value?.active_version || null)
+const isDraft = computed(() => selectedVersion.value?.status === 'DRAFT')
+const comparisonVersion = computed(() => {
+  if (!selectedVersion.value) return null
+  if (activeVersion.value && activeVersion.value.id !== selectedVersion.value.id) return activeVersion.value
+  return selected.value?.versions.find((item) => item.id !== selectedVersion.value?.id) || null
+})
+const invalidTemplateVariables = computed(() => {
+  const full = `${systemTemplate.value}\n${userTemplate.value}`
+  const values = [...full.matchAll(/\{([^}]*)\}/g)].map((match) => match[1])
+  const allowed = new Set(Object.keys(selectedVersion.value?.allowed_variables || {}))
+  return values.filter((value) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(value) || !allowed.has(value))
+})
+const groupedCatalog = computed(() => {
+  const groups = new Map<string, PromptTemplateCatalog[]>()
+  for (const item of catalog.value) {
+    const group = item.capability === 'video_analysis' ? '视频理解' : item.capability === 'image' ? '图片提示词' : item.capability === 'video' ? '视频提示词' : '文本创作'
+    groups.set(group, [...(groups.get(group) || []), item])
+  }
+  return [...groups.entries()]
+})
 
-const taskLabels: Record<string, string> = {
-  VIDEO_ANALYSIS: '参考视频分析',
-  STORY_GENERATE: '原创故事生成',
-  CHARACTER_DESIGN: '角色文字资产设计',
-  SCENE_DESIGN: '场景文字资产设计',
-  DIRECTOR_PLAN: 'AI 导演分镜',
-  IMAGE_GENERATE: '图片资产生成',
-  VIDEO_GENERATE: '视频片段生成',
-  FINAL_COMPOSE: '最终成片合成',
+function shortHash(value: string | undefined | null): string { return value ? `${value.slice(0, 12)}…` : '未记录' }
+/**
+ * 不引入可执行 diff 库的最小文本差异展示。
+ * 这是帮助制作人员核对版本正文的页面能力，不参与任何 Prompt 渲染或模型调用。
+ */
+function lineDiff(before: string, after: string): string {
+  const oldLines = before.split('\n')
+  const newLines = after.split('\n')
+  const rows: string[] = []
+  const total = Math.max(oldLines.length, newLines.length)
+  for (let index = 0; index < total; index += 1) {
+    const oldLine = oldLines[index]
+    const newLine = newLines[index]
+    if (oldLine === newLine) rows.push(`  ${oldLine || ''}`)
+    else {
+      if (oldLine !== undefined) rows.push(`- ${oldLine}`)
+      if (newLine !== undefined) rows.push(`+ ${newLine}`)
+    }
+  }
+  return rows.join('\n') || '两个版本的正文相同。'
 }
-
-const defaults: Record<string, { name: string; content: string }> = {
-  VIDEO_ANALYSIS: { name: 'V1 视频分析提示词', content: '只提炼结构、开头机制、爆款元素与场景作用；不得复刻人物、台词、画面或音乐。' },
-  STORY_GENERATE: { name: 'V1 原创故事提示词', content: '保留已锁定创作简报中的节奏和情绪机制，创作全新人设、关系和剧情；不得复制参考故事。' },
-  CHARACTER_DESIGN: { name: 'V1 角色设计提示词', content: '根据已选原创故事设计稳定角色资产：年龄、外貌、服装与性格；不使用参考视频人物。' },
-  SCENE_DESIGN: { name: 'V1 场景设计提示词', content: '根据已选原创故事设计稳定场景资产：地点、环境、视觉风格与氛围。' },
-  DIRECTOR_PLAN: { name: 'V1 导演分镜提示词', content: '只引用已经锁定的角色图和场景图，输出动作、机位、时长和视频动作描述。' },
-  IMAGE_GENERATE: { name: 'V1 图片资产提示词', content: '保持输入角色和场景资产一致，生成原创视觉画面；不得复用参考视频的具体画面。' },
-  VIDEO_GENERATE: { name: 'V1 视频片段提示词', content: '根据锁定角色图、场景图、关键帧与动作描述生成连续视频片段。' },
-  FINAL_COMPOSE: { name: 'V1 成片合成提示词', content: '按人工审核通过的视频片段顺序合成，不插入未经审核的片段。' },
-}
-
-const currentTemplates = computed(() => templates.value.filter((item) => item.task_type === taskType.value))
-
-function applyTaskDefaults(nextTask: string) {
-  const preset = defaults[nextTask]
-  if (!preset) return
-  name.value = preset.name
-  content.value = preset.content
-  variablesSchemaText.value = '{\n  "type": "object",\n  "properties": {}\n}'
+const templateDiff = computed(() => {
+  if (!selectedVersion.value || !comparisonVersion.value) return null
+  return {
+    againstVersion: comparisonVersion.value.version,
+    system: lineDiff(comparisonVersion.value.system_template, selectedVersion.value.system_template),
+    user: lineDiff(comparisonVersion.value.user_template, selectedVersion.value.user_template),
+  }
+})
+function selectVersion(version: PromptTemplateVersion | null) {
+  if (!version) return
+  selectedVersionId.value = version.id
+  systemTemplate.value = version.system_template
+  userTemplate.value = version.user_template
+  changeSummary.value = version.change_summary
+  preview.value = null
   error.value = ''
-  notice.value = ''
 }
-
-async function load() {
+function selectPrompt(key: string) {
+  selectedKey.value = key
+  const item = catalog.value.find((row) => row.prompt_key === key)
+  selectVersion(item?.versions[0] || item?.active_version || null)
+}
+async function load(preferredKey?: string, preferredVersionId?: string) {
   loading.value = true
-  error.value = ''
   try {
-    templates.value = await getPromptTemplates()
+    catalog.value = await getPromptTemplateCatalog()
+    const key = preferredKey && catalog.value.some((item) => item.prompt_key === preferredKey) ? preferredKey : selectedKey.value || catalog.value[0]?.prompt_key || ''
+    selectedKey.value = key
+    const item = catalog.value.find((row) => row.prompt_key === key)
+    selectVersion(item?.versions.find((row) => row.id === preferredVersionId) || item?.versions.find((row) => row.id === selectedVersionId.value) || item?.versions[0] || item?.active_version || null)
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : 'Prompt 模板加载失败，请确认后端服务已启动。'
-  } finally {
-    loading.value = false
-  }
+    error.value = cause instanceof Error ? cause.message : 'Prompt 中心加载失败，请确认后端服务已启动。'
+  } finally { loading.value = false }
 }
-
-function parseVariablesSchema(): Record<string, unknown> | null {
+async function copyDraft(source?: PromptTemplateVersion) {
+  if (!selected.value) return
+  action.value = 'copy'; error.value = ''
   try {
-    const value: unknown = JSON.parse(variablesSchemaText.value)
-    if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error('not-object')
-    return value as Record<string, unknown>
-  } catch {
-    error.value = '变量说明必须是有效的 JSON 对象。一般保持默认内容即可。'
-    return null
-  }
+    const draft = await createPromptTemplateDraft(selected.value.prompt_key, source?.id)
+    notice.value = `已从 v${source?.version || activeVersion.value?.version} 创建草稿 v${draft.version}。`
+    await load(selected.value.prompt_key, draft.id)
+  } catch (cause) { error.value = cause instanceof Error ? cause.message : '创建草稿失败，请重试。' } finally { action.value = '' }
 }
-
-function formatTime(value: string): string {
-  return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value))
-}
-
-async function createDraft() {
-  const variablesSchema = parseVariablesSchema()
-  if (!variablesSchema) return
-  if (!name.value.trim() || !content.value.trim()) {
-    error.value = '请填写模板名称和模板内容。'
-    return
-  }
-  saving.value = true
-  error.value = ''
-  notice.value = ''
+async function saveDraft() {
+  if (!selectedVersion.value || !isDraft.value) return
+  if (invalidTemplateVariables.value.length) { error.value = `存在未声明或不合法的变量：${invalidTemplateVariables.value.join('、')}`; return }
+  saving.value = true; error.value = ''
   try {
-    const created = await createPromptTemplate({
-      task_type: taskType.value,
-      name: name.value.trim(),
-      content: content.value.trim(),
-      variables_schema: variablesSchema,
-    })
-    notice.value = `已保存为草稿 v${created.version}。确认小样本内容后，再点击“启用这一版”。`
-    await load()
-  } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : '保存 Prompt 草稿失败，请重试。'
-  } finally {
-    saving.value = false
-  }
+    const result = await updatePromptTemplateDraft(selectedVersion.value.id, { system_template: systemTemplate.value, user_template: userTemplate.value, change_summary: changeSummary.value })
+    notice.value = `草稿 v${result.version} 已保存，尚未影响任何新任务。`
+    await load(selectedKey.value, result.id)
+  } catch (cause) { error.value = cause instanceof Error ? cause.message : '保存草稿失败，请检查变量和安全内容。' } finally { saving.value = false }
 }
-
-async function activate(item: PromptTemplate) {
-  actionId.value = item.id
-  error.value = ''
-  notice.value = ''
+async function publishDraft() {
+  if (!selectedVersion.value || !isDraft.value) return
+  action.value = 'publish'; error.value = ''
   try {
-    await activatePromptTemplate(item.id)
-    notice.value = `已启用「${item.name}」v${item.version}。同一用途的原生效版已归档，正在运行的项目不受影响。`
-    await load()
-  } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : '启用 Prompt 失败，请重试。'
-  } finally {
-    actionId.value = ''
-  }
+    const result = await publishPromptTemplateDraft(selectedVersion.value.id)
+    notice.value = `v${result.version} 已发布。发布不会自动切换生产任务，请继续显式启用。`
+    await load(selectedKey.value, result.id)
+  } catch (cause) { error.value = cause instanceof Error ? cause.message : '发布失败，请先保存并检查变量。' } finally { action.value = '' }
 }
-
-async function archive(item: PromptTemplate) {
-  actionId.value = item.id
-  error.value = ''
-  notice.value = ''
+async function activate(version: PromptTemplateVersion) {
+  if (!selected.value) return
+  action.value = `activate:${version.id}`; error.value = ''
   try {
-    await archivePromptTemplate(item.id)
-    notice.value = `已归档「${item.name}」v${item.version}，历史模型调用仍可完整回溯。`
-    await load()
-  } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : '归档 Prompt 失败，请重试。'
-  } finally {
-    actionId.value = ''
-  }
+    await activatePromptTemplateVersion(selected.value.prompt_key, version.id)
+    notice.value = `已启用 v${version.version}。已创建的运行继续使用各自冻结的历史版本。`
+    await load(selected.value.prompt_key, version.id)
+  } catch (cause) { error.value = cause instanceof Error ? cause.message : '启用失败；仅已发布且属于当前 Prompt 的版本可以启用。' } finally { action.value = '' }
 }
-
-watch(taskType, applyTaskDefaults)
+async function previewRender() {
+  if (!selected.value || !selectedVersion.value) return
+  let variables: Record<string, unknown>
+  try {
+    const parsed: unknown = JSON.parse(previewVariablesText.value)
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error('not object')
+    variables = parsed as Record<string, unknown>
+  } catch { error.value = '预览变量必须是 JSON 对象。页面只渲染，不会调用任何模型。'; return }
+  action.value = 'preview'; error.value = ''
+  try { preview.value = await previewPromptTemplateRender(selected.value.prompt_key, selectedVersion.value.id, variables); notice.value = '渲染预览已完成：没有调用模型，也没有创建任务。' }
+  catch (cause) { error.value = cause instanceof Error ? cause.message : '预览失败，请检查必填变量和安全输入。' } finally { action.value = '' }
+}
+function insertVariable(name: string) { userTemplate.value += `${userTemplate.value.endsWith('\n') || !userTemplate.value ? '' : '\n'}{${name}}` }
+watch(selectedKey, () => { preview.value = null })
 onMounted(load)
 </script>
 
 <template>
-  <section class="page-heading">
-    <div>
-      <RouterLink class="muted" to="/model-profiles">← 返回模型中心</RouterLink>
-      <h1>Prompt 模板版本</h1>
-      <p>修改提示词会影响生成结果，所以每次改动都创建新版本；系统不会覆盖历史，也不会自动启用草稿。</p>
-    </div>
-  </section>
-
-  <section class="panel stack">
-    <h2>安全使用顺序</h2>
-    <ol class="setup-steps">
-      <li>选择要优化的生产用途，修改默认提示词后先保存为草稿。</li>
-      <li>用小项目验证结果；旧项目仍使用自己已冻结的 Prompt 版本。</li>
-      <li>确认效果更好后，再点击“启用这一版”。每个用途同时只会有一个生效 Prompt。</li>
-    </ol>
-    <p class="notice info">不要把 API Key、客户隐私或没有授权的原视频台词填进 Prompt。一般情况下，“变量说明”保持默认内容即可。</p>
-  </section>
-
-  <div class="grid prompt-grid">
-    <form class="panel stack" @submit.prevent="createDraft">
-      <h2>新建 Prompt 草稿</h2>
-      <label class="field">用于哪一步？
-        <select v-model="taskType"><option v-for="(label, key) in taskLabels" :key="key" :value="key">{{ label }}</option></select>
-      </label>
-      <label class="field">模板名称<input v-model="name" maxlength="160" placeholder="例如：V1 原创故事提示词" /></label>
-      <label class="field">模板内容<textarea v-model="content" rows="12" maxlength="50000" /></label>
-      <details>
-        <summary>高级：变量说明（通常不用改）</summary>
-        <p class="muted">这是给后续技术扩展读取的 JSON Schema。若不确定，请保留默认值。</p>
-        <textarea v-model="variablesSchemaText" rows="7" class="code-input" spellcheck="false" />
-      </details>
-      <p v-if="error" class="notice error">{{ error }}</p>
-      <p v-if="notice" class="notice success">{{ notice }}</p>
-      <button class="button" :disabled="saving">{{ saving ? '正在保存…' : '保存为新草稿版本' }}</button>
-    </form>
-
-    <section class="panel stack">
-      <div class="meta-row"><h2>{{ taskLabels[taskType] }}的历史版本</h2><span>{{ currentTemplates.length }} 个版本</span></div>
-      <p v-if="loading" class="muted">正在读取…</p>
-      <p v-else-if="!currentTemplates.length" class="muted">当前用途还没有自定义 Prompt；系统会使用 V1 默认生效模板。</p>
-      <article v-for="item in currentTemplates" :key="item.id" class="prompt-card stack">
-        <div class="meta-row">
-          <strong>{{ item.name }} · v{{ item.version }}</strong>
-          <span class="status" :class="item.status === 'ACTIVE' ? 'SUCCEEDED' : item.status === 'DRAFT' ? 'PENDING' : 'muted'">{{ item.status === 'ACTIVE' ? '当前生效' : item.status === 'DRAFT' ? '草稿' : '已归档' }}</span>
-        </div>
-        <pre>{{ item.content }}</pre>
-        <small class="muted">更新：{{ formatTime(item.updated_at) }}</small>
-        <div class="action-row">
-          <button v-if="item.status !== 'ACTIVE'" class="button" :disabled="Boolean(actionId)" @click="activate(item)">{{ actionId === item.id ? '正在启用…' : '启用这一版' }}</button>
-          <button v-if="item.status === 'DRAFT'" class="button danger" :disabled="Boolean(actionId)" @click="archive(item)">{{ actionId === item.id ? '正在归档…' : '归档草稿' }}</button>
-        </div>
-      </article>
-    </section>
+  <section class="page-heading"><div><RouterLink class="muted" to="/model-profiles">← 返回模型中心</RouterLink><h1>Prompt 版本管理</h1><p>管理系统级执行模板。项目内视频 Prompt、分镜 Prompt 等业务结果仍在生产工作台审核，不会被这里的切换覆盖。</p></div></section>
+  <p class="notice info">推荐顺序：复制活动版本 → 编辑草稿 → 仅渲染预览 → 发布 → 明确启用。运行中的任务始终使用创建时冻结的版本。</p>
+  <p v-if="error" class="notice error">{{ error }}</p><p v-if="notice" class="notice success">{{ notice }}</p>
+  <div class="prompt-layout">
+    <aside class="panel catalog"><h2>业务操作</h2><p v-if="loading" class="muted">正在读取…</p><template v-for="[group, items] in groupedCatalog" :key="group"><h3>{{ group }}</h3><button v-for="item in items" :key="item.id" class="catalog-item" :class="{ active: item.prompt_key === selectedKey }" @click="selectPrompt(item.prompt_key)"><strong>{{ item.display_name }}</strong><small>{{ item.prompt_key }}</small><span>活动 v{{ item.active_version?.version || '—' }} · 草稿 {{ item.draft_count }}</span></button></template></aside>
+    <main v-if="selected" class="stack">
+      <section class="panel stack"><div class="meta-row"><div><h2>{{ selected.display_name }}</h2><p class="muted">{{ selected.description }}</p></div><button class="button" :disabled="Boolean(action)" @click="copyDraft(activeVersion || undefined)">{{ action === 'copy' ? '正在复制…' : '复制活动版为草稿' }}</button></div><dl class="definition-grid"><div><dt>Prompt Key</dt><dd><code>{{ selected.prompt_key }}</code></dd></div><div><dt>模型槽位</dt><dd>{{ selected.model_slot_key || '本地任务，不使用模型模板' }}</dd></div><div><dt>输出契约</dt><dd><code>{{ selectedVersion?.output_contract_key || '—' }}</code></dd></div><div><dt>活动哈希</dt><dd><code>{{ shortHash(activeVersion?.content_hash) }}</code></dd></div></dl></section>
+      <section class="panel stack"><div class="meta-row"><h2>版本历史</h2><span>{{ selected.versions.length }} 个版本</span></div><div class="version-list"><button v-for="version in selected.versions" :key="version.id" class="version-row" :class="{ active: version.id === selectedVersionId }" @click="selectVersion(version)"><strong>v{{ version.version }}</strong><span>{{ version.status === 'DRAFT' ? '草稿' : version.id === selected.active_version_id ? '当前活动' : '已发布' }}</span><small>{{ shortHash(version.content_hash) }}</small></button></div><div v-if="selectedVersion" class="action-row"><button class="button secondary" :disabled="Boolean(action)" @click="copyDraft(selectedVersion)">从此版本复制草稿</button><button v-if="selectedVersion.status === 'PUBLISHED' && selectedVersion.id !== selected.active_version_id" class="button" :disabled="Boolean(action)" @click="activate(selectedVersion)">{{ action === `activate:${selectedVersion.id}` ? '正在启用…' : '启用/回滚到此版本' }}</button></div></section>
+      <section v-if="selectedVersion" class="panel stack"><div class="meta-row"><h2>v{{ selectedVersion.version }} {{ isDraft ? '草稿编辑' : '已发布内容（只读）' }}</h2><span>{{ selectedVersion.status }}</span></div><label class="field">系统 Prompt<textarea v-model="systemTemplate" :readonly="!isDraft" rows="8" maxlength="50000" /></label><label class="field">用户 Prompt<textarea v-model="userTemplate" :readonly="!isDraft" rows="10" maxlength="50000" /></label><label class="field">变更说明<textarea v-model="changeSummary" :readonly="!isDraft" rows="3" maxlength="4000" /></label><p v-if="invalidTemplateVariables.length" class="notice error">未知或不合法变量：{{ invalidTemplateVariables.join('、') }}</p><div v-if="isDraft" class="action-row"><button class="button" :disabled="saving || Boolean(invalidTemplateVariables.length)" @click="saveDraft">{{ saving ? '正在保存…' : '保存草稿' }}</button><button class="button secondary" :disabled="Boolean(action)" @click="publishDraft">{{ action === 'publish' ? '正在发布…' : '发布草稿' }}</button></div></section>
+      <section v-if="templateDiff" class="panel stack"><div class="meta-row"><h2>版本文本差异</h2><span>当前 v{{ selectedVersion?.version }} 对比 v{{ templateDiff.againstVersion }}</span></div><p class="muted">“−”为对比版本内容，“+”为当前版本内容。差异仅在浏览器中显示，不会调用模型。</p><h3>系统 Prompt</h3><pre class="diff-content">{{ templateDiff.system }}</pre><h3>用户 Prompt</h3><pre class="diff-content">{{ templateDiff.user }}</pre></section>
+      <section v-if="selectedVersion" class="panel stack"><h2>允许变量与本地渲染预览</h2><p class="muted">变量由服务端严格校验；只允许 <code>{simple_name}</code>。预览不会调用模型、不会创建任务。</p><div class="variable-list"><button v-for="(info, name) in selectedVersion.allowed_variables" :key="name" class="variable-chip" :disabled="!isDraft" @click="insertVariable(name)"><code>{ {{ name }} }</code> · {{ info.description }}{{ info.required ? '（必填）' : '' }}</button></div><label class="field">安全测试变量（JSON 对象）<textarea v-model="previewVariablesText" rows="8" class="code-input" spellcheck="false" /></label><button class="button secondary" :disabled="Boolean(action)" @click="previewRender">{{ action === 'preview' ? '正在渲染…' : '仅渲染预览' }}</button><template v-if="preview"><p class="muted">渲染哈希：<code>{{ shortHash(preview.rendered_prompt_hash) }}</code>。变量快照仅显示摘要。</p><h3>系统渲染结果</h3><pre>{{ preview.rendered_system_template }}</pre><h3>用户渲染结果</h3><pre>{{ preview.rendered_user_template }}</pre></template></section>
+    </main>
   </div>
 </template>
 
 <style scoped>
-.prompt-grid { margin-top: 20px; }
-.prompt-card { border: 1px solid #dbe3ef; border-radius: 10px; padding: 14px; }
-.action-row { display: flex; gap: 10px; flex-wrap: wrap; }
-pre, .code-input { width: 100%; box-sizing: border-box; white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; padding: 10px; border: 1px solid #dbe3ef; border-radius: 7px; background: #f8fafc; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
-.code-input { resize: vertical; }
-details { border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px; }
-summary { cursor: pointer; font-weight: 600; }
+.prompt-layout { display: grid; grid-template-columns: minmax(230px, .8fr) minmax(0, 2fr); gap: 20px; align-items: start; margin-top: 18px; }.catalog { position: sticky; top: 16px; max-height: calc(100vh - 40px); overflow: auto; }.catalog h3 { color: #64748b; font-size: 13px; margin: 18px 0 8px; }.catalog-item, .version-row { width: 100%; text-align: left; border: 1px solid #dbe3ef; background: #fff; border-radius: 8px; padding: 10px; margin: 6px 0; cursor: pointer; display: grid; gap: 3px; color: inherit; }.catalog-item.active, .version-row.active { border-color: #2563eb; background: #eff6ff; }.catalog-item small, .catalog-item span, .version-row small { color: #64748b; overflow-wrap: anywhere; }.definition-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 0; }.definition-grid div { border: 1px solid #e2e8f0; padding: 10px; border-radius: 8px; }.definition-grid dt { color: #64748b; font-size: 12px; }.definition-grid dd { margin: 5px 0 0; overflow-wrap: anywhere; }.version-list, .action-row, .variable-list { display: flex; gap: 8px; flex-wrap: wrap; }.version-row { width: auto; min-width: 155px; }.version-row span { font-size: 12px; color: #2563eb; }.variable-chip { border: 1px solid #cbd5e1; background: #f8fafc; border-radius: 999px; padding: 6px 9px; cursor: pointer; }.variable-chip:disabled { cursor: default; }textarea, pre, .code-input { box-sizing: border-box; width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 8px; background: #f8fafc; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }.diff-content { border-left: 3px solid #64748b; }.field textarea[readonly] { background: #f1f5f9; color: #475569; }.code-input { resize: vertical; }@media (max-width: 850px) { .prompt-layout { grid-template-columns: 1fr; }.catalog { position: static; max-height: none; }.definition-grid { grid-template-columns: 1fr; } }
 </style>

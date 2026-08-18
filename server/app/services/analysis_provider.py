@@ -62,7 +62,13 @@ class VideoAnalysisProvider(Protocol):
     provider_key: str
     model_key: str
 
-    def analyze(self, request: VideoAnalysisInput) -> dict[str, Any]:
+    def analyze(
+        self,
+        request: VideoAnalysisInput,
+        *,
+        system_instruction: str = "",
+        user_instruction: str = "",
+    ) -> dict[str, Any]:
         """返回抽象创作特征，不返回可直接复刻原视频的具体表达。"""
 
 
@@ -76,7 +82,13 @@ class MockVideoAnalysisProvider:
     provider_key = "mock_provider"
     model_key = "mock-video-understanding-v1"
 
-    def analyze(self, request: VideoAnalysisInput) -> dict[str, Any]:
+    def analyze(
+        self,
+        request: VideoAnalysisInput,
+        *,
+        system_instruction: str = "",
+        user_instruction: str = "",
+    ) -> dict[str, Any]:
         """生成固定但符合最终契约的示例结果。"""
 
         return {
@@ -105,7 +117,13 @@ class OpenAICompatibleVisionAnalysisProvider:
         self.model_key = str(model_profile_snapshot["model_key"])
         self.provider_config = model_profile_snapshot.get("provider_config") or {}
 
-    def analyze(self, request: VideoAnalysisInput) -> dict[str, Any]:
+    def analyze(
+        self,
+        request: VideoAnalysisInput,
+        *,
+        system_instruction: str = "",
+        user_instruction: str = "",
+    ) -> dict[str, Any]:
         """发送采样帧并严格归一化成平台的合规分析契约。"""
 
         if not request.sampled_frames:
@@ -136,6 +154,7 @@ class OpenAICompatibleVisionAnalysisProvider:
             {
                 "type": "text",
                 "text": (
+                    f"{user_instruction}\n\n"
                     "请严格只返回合法 JSON，不要使用 Markdown 代码块。\n"
                     f"任务：{task_description}\n"
                     "合规要求：只分析开头信息释放、冲突类型、节奏、情绪曲线、镜头功能；"
@@ -174,7 +193,7 @@ class OpenAICompatibleVisionAnalysisProvider:
             "messages": [
                 {
                     "role": "system",
-                    "content": "你是短剧创作机制分析助手，必须遵守用户素材授权边界与原创要求。",
+                    "content": system_instruction,
                 },
                 {"role": "user", "content": user_content},
             ],
@@ -496,6 +515,7 @@ class OpenAICompatibleJsonProvider:
         self,
         *,
         system_instruction: str,
+        user_instruction: str | None = None,
         user_payload: dict[str, Any],
         output_contract: str,
     ) -> Any:
@@ -518,6 +538,8 @@ class OpenAICompatibleJsonProvider:
                 {
                     "role": "user",
                     "content": (
+                        f"{user_instruction.strip()}\n\n" if user_instruction else ""
+                    ) + (
                         "请严格只返回合法 JSON，不要使用 Markdown 代码块。\n"
                         f"输出契约：{output_contract}\n"
                         f"业务输入：{json.dumps(user_payload, ensure_ascii=False)}"

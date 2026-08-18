@@ -9,6 +9,9 @@ import type {
   ModelProfilePreflight,
   ProductionState,
   PromptTemplate,
+  PromptTemplateCatalog,
+  PromptTemplateRenderPreview,
+  PromptTemplateVersion,
   ReferenceAnalysis,
   ReviewActionPayload,
   SceneReferenceImageV1,
@@ -330,4 +333,52 @@ export function activatePromptTemplate(id: string): Promise<PromptTemplate> {
 /** 仅归档草稿或历史版本，当前生效版本必须先有替代版本。 */
 export function archivePromptTemplate(id: string): Promise<PromptTemplate> {
   return jsonPost<PromptTemplate>(`/production/prompt-templates/${id}/archive`)
+}
+
+/** 新 Prompt 中心：系统模板与项目内 video_prompt_versions 是两类独立数据。 */
+export function getPromptTemplateCatalog(): Promise<PromptTemplateCatalog[]> {
+  return request<PromptTemplateCatalog[]>('/production/prompt-template-catalog')
+}
+
+export function createPromptTemplateDraft(
+  promptKey: string,
+  sourceVersionId?: string,
+): Promise<PromptTemplateVersion> {
+  return jsonPost<PromptTemplateVersion>(
+    `/production/prompt-template-catalog/${encodeURIComponent(promptKey)}/drafts`,
+    sourceVersionId ? { source_version_id: sourceVersionId } : {},
+  )
+}
+
+export function updatePromptTemplateDraft(
+  versionId: string,
+  payload: { system_template: string; user_template: string; change_summary: string },
+): Promise<PromptTemplateVersion> {
+  return request<PromptTemplateVersion>(`/production/prompt-template-versions/${encodeURIComponent(versionId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+export function publishPromptTemplateDraft(versionId: string): Promise<PromptTemplateVersion> {
+  return jsonPost<PromptTemplateVersion>(`/production/prompt-template-versions/${encodeURIComponent(versionId)}/publish`)
+}
+
+export function activatePromptTemplateVersion(promptKey: string, versionId: string): Promise<PromptTemplateCatalog> {
+  return jsonPost<PromptTemplateCatalog>(
+    `/production/prompt-template-catalog/${encodeURIComponent(promptKey)}/versions/${encodeURIComponent(versionId)}/activate`,
+  )
+}
+
+/** 仅在服务端严格渲染变量；绝不调用模型。 */
+export function previewPromptTemplateRender(
+  promptKey: string,
+  versionId: string,
+  variables: Record<string, unknown>,
+): Promise<PromptTemplateRenderPreview> {
+  return jsonPost<PromptTemplateRenderPreview>(
+    `/production/prompt-template-catalog/${encodeURIComponent(promptKey)}/render-preview`,
+    { version_id: versionId, variables },
+  )
 }

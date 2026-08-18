@@ -41,8 +41,6 @@ from app.models import (
     ModelProfile,
     ModelSlot,
     ProductAssetVersion,
-    PromptTemplate,
-    PromptTemplateStatus,
     ReviewDecision,
     RunStatus,
     StoryOutlineVersion,
@@ -73,6 +71,7 @@ from app.services.model_parameter_service import (
     profile_parameter_config,
     resolve_effective_model_parameters,
 )
+from app.services.prompt_template_service import freeze_active_prompt
 from app.services.sensitive_data import sanitize_error_summary
 
 
@@ -91,6 +90,20 @@ OPERATION_SPECS: dict[str, tuple[str | None, str | None]] = {
     "VIDEO_PROMPT": ("DIRECTOR_PLAN", "DIRECTOR_PLAN"),
     "VIDEO_RENDER": ("VIDEO_GENERATE", "VIDEO_GENERATE"),
     "FINAL_COMPOSE": (None, None),
+}
+
+# Prompt 是业务操作的版本化配置，而不是模型 Profile 的附属字段。FINAL_COMPOSE
+# 只运行本地 FFmpeg，没有模型 Prompt。
+PROMPT_KEY_BY_OPERATION: dict[str, str | None] = {
+    "CHARACTER_DESIGN": "commerce.character_design",
+    "SCENE_DESIGN": "commerce.scene_design",
+    "STORYBOARD": "commerce.director_storyboard",
+    "CHARACTER_IMAGES": "commerce.image_prompt_organize",
+    "SCENE_IMAGES": "commerce.image_prompt_organize",
+    "SHOT_KEYFRAME": "commerce.keyframe_prompt_organize",
+    "VIDEO_PROMPT": "commerce.video_prompt_generate",
+    "VIDEO_RENDER": "v1.video_prompt_generate",
+    "FINAL_COMPOSE": None,
 }
 
 TERMINAL = {"LOCKED", "SUPERSEDED", "STALE", "REJECTED", "APPROVED", "FAILED"}
@@ -273,6 +286,7 @@ def _freeze_model_and_prompt(
     db: Session,
     operation: str,
     *,
+    context: dict[str, Any],
     parameter_preset: str = "standard",
     parameter_overrides: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
@@ -292,21 +306,22 @@ def _freeze_model_and_prompt(
         run_overrides=parameter_overrides or {},
         execution_context=execution_context,
     )
-    prompt = db.scalars(
-        select(PromptTemplate)
-        .where(PromptTemplate.task_type == task_type, PromptTemplate.status == PromptTemplateStatus.ACTIVE)
-        .order_by(PromptTemplate.version.desc())
-    ).first()
-    if prompt is None:
-        _error(f"任务 {task_type} 未配置活动 Prompt", status.HTTP_503_SERVICE_UNAVAILABLE)
-    return binding, {
-        "id": prompt.id,
-        "task_type": prompt.task_type,
-        "name": prompt.name,
-        "version": prompt.version,
-        "content": prompt.content,
-        "variables_schema": deepcopy(prompt.variables_schema),
-    }
+    prompt_key = PROMPT_KEY_BY_OPERATION[operation]
+    if prompt_key is None:
+        return binding, None
+    if operation in {"CHARACTER_DESIGN", "SCENE_DESIGN", "STORYBOARD"}:
+        variables = {"commerce_context": context}
+    elif operation in {"CHARACTER_IMAGES", "SCENE_IMAGES"}:
+        variables = {"image_subject": context}
+    elif operation == "SHOT_KEYFRAME":
+        variables = {"shot": context}
+    elif operation == "VIDEO_PROMPT":
+        variables = {"video_context": context}
+    else:
+        variables = {"shot": context}
+    prompt = freeze_active_prompt(db, prompt_key, variables, legacy_task_type=task_type)
+    prompt["task_type"] = task_type
+    return binding, prompt
 
 
 def _operation_prerequisites(db: Session, story_run: StoryRun, operation: str, target_id: str | None) -> dict[str, Any]:
@@ -401,7 +416,11 @@ def create_production_run(
     story_run = _story_run(db, story_run_id)
     context = _operation_prerequisites(db, story_run, operation, target_id)
     binding, prompt = _freeze_model_and_prompt(
-        db, operation, parameter_preset=parameter_preset, parameter_overrides=parameter_overrides
+        db,
+        operation,
+        context=context,
+        parameter_preset=parameter_preset,
+        parameter_overrides=parameter_overrides,
     )
     definition = ensure_commerce_foundation(db)
     semantic = _fingerprint(context, retry=retry)
@@ -697,6 +716,7 @@ def _start_invocation(
         model_slot_id=binding["slot_id"],
         model_profile_id=binding["model_profile_id"],
         prompt_template_id=prompt.get("id"),
+        prompt_template_version_id=prompt.get("prompt_version_id"),
         task_type=task_type,
         model_profile_snapshot=safe_profile_snapshot,
         prompt_snapshot=deepcopy(prompt),
@@ -987,7 +1007,19 @@ def _mark_stale(db: Session, story_run_id: str, *, source: str, shot_id: str | N
         db.execute(statement.values(**values))
 
 
-def _run_text_model(run_row: WorkflowRun, *, operation: str, system_suffix: str, output_contract: str, user_payload: dict[str, Any]) -> dict[str, Any]:
+def _run_text_model(
+    run_row: WorkflowRun,
+    *,
+    operation: str,
+    system_suffix: str = "",
+    output_contract: str,
+    user_payload: dict[str, Any],
+) -> dict[str, Any]:
+    # ``system_suffix`` is retained as an intentionally ignored compatibility
+    # argument for extensions/tests built before Prompt Center.  System-level
+    # instructions must only come from the frozen PromptTemplateVersion below.
+    # In particular, do not append this value to the supplier request.
+    del system_suffix
     binding = (run_row.input_snapshot or {}).get("model_binding") or {}
     prompt = (run_row.input_snapshot or {}).get("prompt_template") or {}
     profile = binding.get("profile_snapshot") if isinstance(binding, dict) else None
@@ -998,12 +1030,39 @@ def _run_text_model(run_row: WorkflowRun, *, operation: str, system_suffix: str,
     task_type = OPERATION_SPECS[operation][1]
     assert task_type is not None
     assert_supported(profile, task_type)
+    system_instruction = prompt.get("rendered_system_template")
+    user_instruction = prompt.get("rendered_user_template")
+    if not isinstance(system_instruction, str) or not system_instruction.strip():
+        raise RuntimeError("Commerce 生产任务缺少冻结系统 Prompt")
+    if not isinstance(user_instruction, str) or not user_instruction.strip():
+        raise RuntimeError("Commerce 生产任务缺少冻结用户 Prompt")
     return generate_structured_text(
         profile,
         task_type=task_type,
-        system_instruction=f"{str(prompt.get('content') or '').strip()}\n\n{system_suffix}",
+        system_instruction=system_instruction,
+        user_instruction=user_instruction,
         user_payload=user_payload,
         output_contract=output_contract,
+    )
+
+
+def _render_frozen_generation_prompt(run_row: WorkflowRun, business_prompt: str) -> str:
+    """为图片/视频 Adapter 组合已冻结系统模板与项目业务 Prompt。
+
+    项目内角色图、关键帧和视频 Prompt 是可审核的业务结果，不能被系统模板覆盖；
+    系统级模板则必须真实进入供应商请求，而不是只停留在审计快照中。
+    """
+
+    prompt = (run_row.input_snapshot or {}).get("prompt_template") or {}
+    system_instruction = prompt.get("rendered_system_template") if isinstance(prompt, dict) else None
+    user_instruction = prompt.get("rendered_user_template") if isinstance(prompt, dict) else None
+    if not isinstance(system_instruction, str) or not system_instruction.strip():
+        raise RuntimeError("Commerce 生产任务缺少冻结系统 Prompt")
+    if not isinstance(user_instruction, str) or not user_instruction.strip():
+        raise RuntimeError("Commerce 生产任务缺少冻结用户 Prompt")
+    return (
+        f"{system_instruction.strip()}\n\n{user_instruction.strip()}\n\n"
+        f"<LEMONFLOW_PROJECT_PROMPT>\n{business_prompt.strip()}\n</LEMONFLOW_PROJECT_PROMPT>"
     )
 
 
@@ -1012,7 +1071,7 @@ def _execute_character_design(db: Session, run_row: WorkflowRun, step: WorkflowS
     invocation = _start_invocation(db, run_row=run_row, step=step, task_type="CHARACTER_DESIGN")
     raw = _run_text_model(
         run_row, operation="CHARACTER_DESIGN",
-        system_suffix="根据冻结视频分析、脚本、商品、创意和已锁定大纲输出角色 JSON。禁止创造商品功效。",
+        system_suffix="",
         user_payload=deepcopy(context),
         output_contract='{"roles":[{"role_id":"string","name":"string","age_range":"string","gender":"string","identity_and_occupation":"string","personality":"string","dramatic_function":"string","relationships":[],"appearance":"string","hairstyle":"string","costume":"string","fixed_visual_features":["string"],"immutable_features":["string"],"product_relationship":"string","buyer":true,"user":true,"decision_influencer":false,"image_prompt":"string"}]}'
     )
@@ -1038,7 +1097,7 @@ def _execute_scene_design(db: Session, run_row: WorkflowRun, step: WorkflowStep,
     invocation = _start_invocation(db, run_row=run_row, step=step, task_type="SCENE_DESIGN")
     raw = _run_text_model(
         run_row, operation="SCENE_DESIGN",
-        system_suffix="基于冻结大纲、商品融入方案和已锁定角色设定输出连续场景 JSON；禁止创造商品功效或包装。",
+        system_suffix="",
         user_payload=deepcopy(context),
         output_contract='{"scenes":[{"scene_id":"string","name":"string","purpose":"string","time":"string","location":"string","lighting":"string","color_tone":"string","spatial_layout":"string","fixed_props":["string"],"product_position":"string","product_usage_environment":"string","continuity_requirements":["string"],"immutable_features":["string"],"base_image_prompt":"string"}]}'
     )
@@ -1067,7 +1126,7 @@ def _execute_storyboard(db: Session, run_row: WorkflowRun, step: WorkflowStep, c
     nodes = context["outline"]["integration_nodes"]
     raw = _run_text_model(
         run_row, operation="STORYBOARD",
-        system_suffix="输出 3 至 5 个独立视频镜头 JSON。每一镜必须有非空片段摘要，并且商品镜头只使用冻结融入节点和商品证据。",
+        system_suffix="",
         user_payload=deepcopy(context),
         output_contract='{"shots":[{"shot_id":"string","shot_number":1,"segment_summary":"string","story_paragraph":"string","duration_ms":6000,"character_ids":["string"],"scene_id":"string","product_integration_node_id":"string","product_visible":true,"shot_scale":"string","camera_position":"string","camera_move":"string","composition":"string","action":"string","expression":"string","dialogue":"string","narration":"string","product_position":"string","product_action":"string","product_exposure_ms":1000,"previous_continuity_state":"string","ending_continuity_state":"string","next_transition_requirement":"string","keyframe_prompt":"string","video_prompt":"string","forbidden_content":["string"]}]}'
     )
@@ -1128,7 +1187,7 @@ def _image_from_adapter(
         assert_supported(profile, "IMAGE_GENERATE")
         provider, first_result = start_image_generation(
             profile,
-            prompt=prompt,
+            prompt=_render_frozen_generation_prompt(run_row, prompt),
             reference_image_urls=references,
             reference_images=reference_images,
             existing_provider_task_id=invocation.provider_task_id if invocation is not None else None,
@@ -1358,7 +1417,7 @@ def _execute_video_prompt(db: Session, run_row: WorkflowRun, step: WorkflowStep,
         _error("必须先锁定该镜头的关键帧才能生成视频 Prompt")
     started = perf_counter()
     invocation = _start_invocation(db, run_row=run_row, step=step, task_type="DIRECTOR_PLAN")
-    raw = _run_text_model(run_row, operation="VIDEO_PROMPT", system_suffix="根据冻结导演镜头和锁定关键帧生成一个用于图生视频的动作 Prompt；禁止增加商品功效。", user_payload={"shot": deepcopy(shot), "keyframe_id": keyframe.id, "mainline": deepcopy(context["commerce_mainline"])}, output_contract='{"video_prompt":"string"}')
+    raw = _run_text_model(run_row, operation="VIDEO_PROMPT", system_suffix="", user_payload={"shot": deepcopy(shot), "keyframe_id": keyframe.id, "mainline": deepcopy(context["commerce_mainline"])}, output_contract='{"video_prompt":"string"}')
     prompt = str(shot["video_prompt"]) if raw.get("_mock") else _require_text(raw.get("video_prompt") if isinstance(raw, dict) else None, "video_prompt")
     version = _next_version(db, CommerceVideoPromptVersion, story_run_id=context["story_run_id"], extra_column="shot_id", extra_value=shot["shot_id"])
     row = CommerceVideoPromptVersion(story_run_id=context["story_run_id"], storyboard_version_id=storyboard["id"], shot_id=shot["shot_id"], shot_number=shot["shot_number"], keyframe_version_id=keyframe.id, workflow_run_id=run_row.id, model_invocation_id=invocation.id if invocation else None, version=version, prompt=prompt, trace={"shot_id": shot["shot_id"], "keyframe_version_id": keyframe.id, "forbidden_content": deepcopy(shot["forbidden_content"])}, status="LOCKED", locked_at=utcnow())
@@ -1514,7 +1573,7 @@ def _execute_video_render(db: Session, run_row: WorkflowRun, step: WorkflowStep,
                 create_video_request(
                     project_id=run_row.project_id,
                     shot_number=shot["shot_number"],
-                    prompt=prompt.prompt,
+                    prompt=_render_frozen_generation_prompt(run_row, prompt.prompt),
                     image_urls=[],
                     reference_images=[first_frame],
                 )

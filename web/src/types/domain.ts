@@ -430,6 +430,9 @@ export interface ModelInvocationTrace {
   model_version: string
   model_profile_version: number | null
   prompt_template_id: string | null
+  prompt_template_version_id?: string | null
+  prompt_key?: string | null
+  prompt_content_hash?: string | null
   prompt_name: string | null
   prompt_version: number | null
   status: 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED'
@@ -703,4 +706,48 @@ export interface PromptTemplate {
   status: 'DRAFT' | 'ACTIVE' | 'ARCHIVED'
   created_at: string
   updated_at: string
+}
+
+/** 系统级 Prompt 配置。业务镜头产生的 video_prompt_versions 不属于该对象。 */
+export interface PromptTemplateVersion {
+  id: string
+  prompt_template_id: string
+  version: number
+  status: 'DRAFT' | 'PUBLISHED'
+  system_template: string
+  user_template: string
+  allowed_variables: Record<string, { description: string; required: boolean }>
+  output_contract_key: string
+  content_hash: string
+  change_summary: string
+  created_at: string
+  updated_at: string
+}
+
+export interface PromptTemplateCatalog {
+  id: string
+  prompt_key: string
+  display_name: string
+  description: string
+  operation_key: string
+  model_slot_key: string | null
+  capability: string
+  active_version_id: string | null
+  active_version: PromptTemplateVersion | null
+  versions: PromptTemplateVersion[]
+  draft_count: number
+  created_at: string
+  updated_at: string
+}
+
+export interface PromptTemplateRenderPreview {
+  prompt_key: string
+  prompt_template_id: string
+  prompt_version_id: string
+  prompt_version: number
+  content_hash: string
+  rendered_system_template: string
+  rendered_user_template: string
+  rendered_prompt_hash: string
+  sanitized_variable_snapshot: Record<string, unknown>
 }

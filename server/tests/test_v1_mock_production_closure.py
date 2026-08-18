@@ -78,7 +78,20 @@ def test_mock_v1_adapter_runs_full_reviewed_production_closure() -> None:
         try:
             invocations = db.query(ModelInvocation).filter(ModelInvocation.project_id == project_id).all()
             assert len(invocations) >= 12
-            assert all(item.prompt_template_id and item.status.value == "SUCCEEDED" for item in invocations)
+            # 系统 Prompt 版本用于真实模型操作；FINAL_COMPOSE 是本地 FFmpeg，
+            # 不能为了兼容旧断言伪造 Prompt。其余调用同时保留 legacy 审计
+            # 指针和新 PromptVersion 指针。
+            assert all(item.status.value == "SUCCEEDED" for item in invocations)
+            model_calls = [item for item in invocations if item.task_type != "FINAL_COMPOSE"]
+            assert model_calls
+            assert all(
+                item.prompt_template_id and item.prompt_template_version_id
+                for item in model_calls
+            )
+            assert all(
+                item.prompt_template_id is None and item.prompt_template_version_id is None
+                for item in invocations if item.task_type == "FINAL_COMPOSE"
+            )
         finally:
             db.close()
 
@@ -90,6 +103,10 @@ def test_mock_v1_adapter_runs_full_reviewed_production_closure() -> None:
         first_trace = traces.json()[0]
         assert first_trace["workflow_version"] == "LemonFlow_V1"
         assert first_trace["model_display_name"]
-        assert first_trace["prompt_name"]
+        # 最新记录可能是本地 FFmpeg 合成；从真实模型调用行验证新 Prompt 版本追溯。
+        prompt_trace = next(item for item in traces.json() if item["task_type"] != "FINAL_COMPOSE")
+        assert prompt_trace["prompt_name"]
+        assert prompt_trace["prompt_template_version_id"]
+        assert prompt_trace["prompt_content_hash"]
         assert "input_snapshot" not in first_trace
         assert "output_reference" not in first_trace

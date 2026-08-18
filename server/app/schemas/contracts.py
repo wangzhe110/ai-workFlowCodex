@@ -582,6 +582,9 @@ class ModelInvocationTraceResponse(BaseModel):
     model_version: str
     model_profile_version: Optional[int]
     prompt_template_id: Optional[str]
+    prompt_template_version_id: Optional[str] = None
+    prompt_key: Optional[str] = None
+    prompt_content_hash: Optional[str] = None
     prompt_name: Optional[str]
     prompt_version: Optional[int]
     status: str
@@ -746,6 +749,76 @@ class PromptTemplateResponse(BaseModel):
     status: str
     created_at: datetime
     updated_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# 系统 Prompt 中心（0023）。这些对象与项目业务产物 VideoPromptVersion 分开：
+# 前者描述“模型如何执行一个操作”，后者保存某个镜头最终采用的业务正文。
+# ---------------------------------------------------------------------------
+
+
+class PromptTemplateVersionDraftRequest(BaseModel):
+    """从活动或指定已发布版本复制一个可编辑 Draft。"""
+
+    source_version_id: Optional[str] = Field(default=None, min_length=1, max_length=36)
+
+
+class PromptTemplateVersionUpdateRequest(BaseModel):
+    """仅 Draft 可以更新；输出契约和允许变量由操作契约固定。"""
+
+    system_template: str = Field(min_length=1, max_length=50_000)
+    user_template: str = Field(min_length=1, max_length=50_000)
+    change_summary: str = Field(default="", max_length=4_000)
+
+
+class PromptTemplateRenderPreviewRequest(BaseModel):
+    """本地安全渲染预览输入；该接口绝不调用任何模型。"""
+
+    version_id: str = Field(min_length=1, max_length=36)
+    variables: dict[str, Any] = Field(default_factory=dict)
+
+
+class PromptTemplateVersionResponse(BaseModel):
+    id: str
+    prompt_template_id: str
+    version: int
+    status: str
+    system_template: str
+    user_template: str
+    allowed_variables: dict[str, Any]
+    output_contract_key: str
+    content_hash: str
+    change_summary: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class PromptTemplateCatalogResponse(BaseModel):
+    id: str
+    prompt_key: str
+    display_name: str
+    description: str
+    operation_key: str
+    model_slot_key: Optional[str]
+    capability: str
+    active_version_id: Optional[str]
+    active_version: Optional[PromptTemplateVersionResponse] = None
+    versions: list[PromptTemplateVersionResponse] = Field(default_factory=list)
+    draft_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+
+class PromptTemplateRenderPreviewResponse(BaseModel):
+    prompt_key: str
+    prompt_template_id: str
+    prompt_version_id: str
+    prompt_version: int
+    content_hash: str
+    rendered_system_template: str
+    rendered_user_template: str
+    rendered_prompt_hash: str
+    sanitized_variable_snapshot: dict[str, Any]
 
 
 # ---------------------------------------------------------------------------

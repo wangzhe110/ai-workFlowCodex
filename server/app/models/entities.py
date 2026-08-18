@@ -224,6 +224,13 @@ class PromptTemplateVersionStatus(str, Enum):
     PUBLISHED = "PUBLISHED"
 
 
+class CommerceWorkflowPresetVersionStatus(str, Enum):
+    """Commerce 业务工作流预设的可编辑/可引用状态。"""
+
+    DRAFT = "DRAFT"
+    PUBLISHED = "PUBLISHED"
+
+
 # ---------------------------------------------------------------------------
 # 带货短剧（Commerce）工作流的领域枚举。
 #
@@ -1209,6 +1216,9 @@ class StoryRun(Base):
         order_by="CommerceWorkflowLink.created_at",
     )
     mainline_input: Mapped[Optional["CommerceStoryRunInput"]] = relationship(
+        back_populates="story_run", cascade="all, delete-orphan", uselist=False
+    )
+    workflow_config_freeze: Mapped[Optional["CommerceStoryRunWorkflowConfig"]] = relationship(
         back_populates="story_run", cascade="all, delete-orphan", uselist=False
     )
 
@@ -2703,6 +2713,92 @@ class PromptTemplateVersion(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
     )
+
+
+class CommerceWorkflowPresetDefinition(Base):
+    """Commerce 工作流预设的稳定目录与活动版本指针。
+
+    预设只描述普通用户可理解的业务目标与质量档位；渠道、密钥、Adapter 和原始
+    模型参数仍由 ModelProfile 管理。活动指针与 Prompt 中心保持相同的双表模式，
+    防止编辑历史版本时改变已经创建的 StoryRun。
+    """
+
+    __tablename__ = "commerce_workflow_preset_definitions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    preset_key: Mapped[str] = mapped_column(String(80), nullable=False, unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    active_version_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class CommerceWorkflowPresetVersion(Base):
+    """不可覆盖的 Commerce 预设版本。"""
+
+    __tablename__ = "commerce_workflow_preset_versions"
+    __table_args__ = (
+        UniqueConstraint("preset_definition_id", "version", name="uq_commerce_workflow_preset_version"),
+        CheckConstraint("status IN ('DRAFT', 'PUBLISHED')", name="ck_commerce_workflow_preset_version_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    preset_definition_id: Mapped[str] = mapped_column(
+        ForeignKey("commerce_workflow_preset_definitions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[CommerceWorkflowPresetVersionStatus] = mapped_column(
+        SqlEnum(
+            CommerceWorkflowPresetVersionStatus,
+            native_enum=False,
+            create_constraint=True,
+            name="commerceworkflowpresetversionstatus",
+        ),
+        default=CommerceWorkflowPresetVersionStatus.DRAFT,
+        nullable=False,
+    )
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    change_summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class CommerceStoryRunWorkflowConfig(Base):
+    """StoryRun 创建时冻结的预设、有效业务配置及运行依赖。
+
+    不在 StoryRun 上原地存 JSON，避免已有核心表迁移时意外覆盖历史数据；这个一对一
+    快照也让 rerun、retry 和 Worker 能始终使用同一份已解析配置。
+    """
+
+    __tablename__ = "commerce_story_run_workflow_configs"
+
+    story_run_id: Mapped[str] = mapped_column(
+        ForeignKey("story_runs.id", ondelete="CASCADE"), primary_key=True
+    )
+    preset_definition_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("commerce_workflow_preset_definitions.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    preset_version_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("commerce_workflow_preset_versions.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    preset_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    preset_content_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    requested_overrides: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    effective_workflow_config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    config_sources: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    estimates: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    model_bindings: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    prompt_templates: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    story_run: Mapped[StoryRun] = relationship(back_populates="workflow_config_freeze")
 
 
 class ModelInvocation(Base):

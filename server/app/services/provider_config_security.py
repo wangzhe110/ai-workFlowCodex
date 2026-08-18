@@ -7,15 +7,23 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import dataclass
+import re
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import HTTPException, status
 
-from app.services.sensitive_data import is_sensitive_key, redact_sensitive_data
+from app.services.sensitive_data import REDACTED_VALUE, is_sensitive_key, redact_sensitive_data
 
 
 _SHARED_METADATA_FIELDS = frozenset({"display_name", "estimated_cost_per_call", "currency"})
 _OPENAI_BASE_FIELDS = frozenset({"api_base_url", "secret_env_name", "timeout_seconds"})
+_SECRET_ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]{1,127}$")
+_FORBIDDEN_SNAPSHOT_KEYS = frozenset({"header", "headers", "url", "endpoint"})
+_SENSITIVE_URL_QUERY_KEYS = frozenset(
+    {"authorization", "token", "access_token", "api_key", "apikey", "signature", "sig", "xamzsignature"}
+)
 
 # 每个已接入 Adapter 只能持久化其代码实际会读取的非敏感参数。请求扩展参数被
 # 明确收敛到四个 ``*_request_options`` 容器；不能用根配置字段伪造请求头或凭证。
@@ -123,6 +131,95 @@ _SAFE_REQUEST_OPTION_FIELDS: dict[str, frozenset[str]] = {
 }
 
 
+@dataclass(frozen=True)
+class ExecutionMetadataScan:
+    """快照安全扫描的路径分类；从不携带原始配置值。"""
+
+    allowed_execution_metadata: tuple[str, ...]
+    sensitive_findings: tuple[str, ...]
+
+
+def is_registered_adapter_key(adapter_key: object) -> bool:
+    """只有代码已注册的 Adapter 标识可被固定到可执行配置中。"""
+
+    return isinstance(adapter_key, str) and adapter_key.strip() in _ADAPTER_FIELDS
+
+
+def _valid_api_base_url(value: object) -> bool:
+    """Base URL 是非敏感的固定 HTTPS 地址，不能携带鉴权或签名状态。"""
+
+    if not isinstance(value, str) or not value.strip() or value != value.strip():
+        return False
+    parsed = urlsplit(value)
+    if parsed.scheme != "https" or not parsed.hostname:
+        return False
+    if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+        return False
+    return True
+
+
+def classify_execution_metadata(value: Any, *, path: str = "snapshot") -> ExecutionMetadataScan:
+    """仅按路径分类历史快照：允许的执行元数据与真正敏感发现分开统计。
+
+    该函数只返回字段路径，不读取或回显值；用于只读审计、测试及运维扫描。
+    """
+
+    allowed: list[str] = []
+    sensitive: list[str] = []
+
+    def redacted_only(item: Any) -> bool:
+        """历史 API 脱敏占位符不是凭证泄露；真实值仍按敏感发现处理。"""
+
+        if item == REDACTED_VALUE:
+            return True
+        if isinstance(item, dict):
+            return bool(item) and all(redacted_only(nested) for nested in item.values())
+        if isinstance(item, list):
+            return bool(item) and all(redacted_only(nested) for nested in item)
+        return False
+
+    def walk(item: Any, current: str) -> None:
+        if isinstance(item, dict):
+            for raw_key, nested in item.items():
+                key = str(raw_key)
+                child = f"{current}.{key}"
+                normalized = "".join(char for char in key.casefold() if char.isalnum())
+                if key == "adapter_key":
+                    (allowed if is_registered_adapter_key(nested) else sensitive).append(child)
+                elif key == "secret_env_name":
+                    (allowed if isinstance(nested, str) and _SECRET_ENV_NAME.fullmatch(nested) else sensitive).append(child)
+                elif key == "api_base_url":
+                    (allowed if _valid_api_base_url(nested) else sensitive).append(child)
+                elif is_sensitive_key(key) or normalized in _FORBIDDEN_SNAPSHOT_KEYS:
+                    # 旧审计记录中的 [REDACTED] 是防御性展示，不是 Key/Token 值。
+                    # 扫描不将其计入真正的泄露发现，也绝不将其列为可执行元数据。
+                    if not redacted_only(nested):
+                        sensitive.append(child)
+                walk(nested, child)
+        elif isinstance(item, list):
+            for index, nested in enumerate(item):
+                walk(nested, f"{current}[{index}]")
+        elif isinstance(item, str):
+            parsed = urlsplit(item)
+            query_names = {
+                key.casefold().replace("-", "").replace("_", "")
+                for part in parsed.query.split("&") if part
+                for key in [part.split("=", 1)[0]]
+            }
+            if (
+                item.casefold().startswith("data:")
+                or "base64," in item.casefold()
+                or "bearer " in item.casefold()
+                or query_names & _SENSITIVE_URL_QUERY_KEYS
+                or parsed.username is not None
+                or parsed.password is not None
+            ):
+                sensitive.append(current)
+
+    walk(value, path)
+    return ExecutionMetadataScan(tuple(allowed), tuple(sensitive))
+
+
 def normalize_provider_config(*, adapter_key: str, provider_config: dict[str, Any]) -> dict[str, Any]:
     """返回可安全入库的配置；未知字段或敏感字段一律以 422 拒绝。"""
 
@@ -136,6 +233,7 @@ def normalize_provider_config(*, adapter_key: str, provider_config: dict[str, An
     unknown = sorted(str(key) for key in normalized if key not in allowed)
     if unknown:
         _reject(f"当前 Adapter 不允许保存配置字段：{', '.join(unknown)}")
+    _validate_execution_metadata(normalized)
     return normalized
 
 
@@ -218,3 +316,38 @@ def _validate_request_options(value: dict[str, Any], *, path: str, option_name: 
 
 def _reject(detail: str) -> None:
     raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=detail)
+
+
+def _validate_execution_metadata(value: dict[str, Any]) -> None:
+    """入口配置只能引用受控 Adapter、环境变量名及无鉴权 HTTPS Base URL。"""
+
+    secret_env_name = value.get("secret_env_name")
+    if secret_env_name is not None and (
+        not isinstance(secret_env_name, str) or not _SECRET_ENV_NAME.fullmatch(secret_env_name)
+    ):
+        _reject("secret_env_name 必须是 2 至 128 位的大写环境变量名称")
+    base_url = value.get("api_base_url")
+    if base_url is not None and not _valid_api_base_url(base_url):
+        _reject("api_base_url 必须是无 userinfo、query 或 fragment 的 HTTPS 固定服务地址")
+
+
+def assert_safe_execution_metadata(*, adapter_key: object, provider_config: dict[str, Any]) -> None:
+    """在冻结可执行快照前验证 Adapter 与连接元数据。
+
+    非执行的候选 Profile 仍可由模型中心登记为未接入状态；只有实际进入
+    Workflow/StoryRun 冻结的 Profile 必须是代码已注册的 Adapter。
+    """
+
+    if not is_registered_adapter_key(adapter_key):
+        _reject("adapter_key 未在当前代码包注册，不能冻结为可执行配置")
+    if not isinstance(provider_config, dict):
+        _reject("可执行模型配置必须是 JSON 对象")
+    _validate_execution_metadata(provider_config)
+    # 历史异常数据或绕过模型中心的写入也不能在新运行冻结时把鉴权字段、Data URL
+    # 或带签名的 URL 带进快照。分类器只返回路径，因此这一检查不会接触或回显值。
+    snapshot_scan = classify_execution_metadata(
+        {"adapter_key": adapter_key, "provider_config": provider_config},
+        path="execution_snapshot",
+    )
+    if snapshot_scan.sensitive_findings:
+        _reject("可执行模型配置包含敏感或不合法的执行字段，不能冻结")

@@ -233,6 +233,43 @@ export interface CommerceStoryRunSelection {
   current_status: string
 }
 
+export interface CommerceWorkflowPresetVersion {
+  id: string
+  preset_definition_id: string
+  version: number
+  status: 'DRAFT' | 'PUBLISHED'
+  schema_version: number
+  config: Record<string, unknown>
+  content_hash: string
+  change_summary: string
+  created_at: string
+  updated_at: string
+}
+
+/** 只显示业务目标和质量档位，绝不携带渠道、Key、URL 或原始 model_key。 */
+export interface CommerceWorkflowPreset {
+  id: string
+  preset_key: string
+  display_name: string
+  description: string
+  active_version_id: string | null
+  active_version: CommerceWorkflowPresetVersion | null
+  created_at: string
+  updated_at: string
+}
+
+export interface CommerceStoryRunWorkflowConfig {
+  preset_definition_id: string | null
+  preset_version_id: string | null
+  preset_version: number | null
+  preset_content_hash: string | null
+  requested_overrides: Record<string, unknown>
+  effective_workflow_config: Record<string, unknown>
+  config_sources: Record<string, unknown>
+  estimates: Record<string, unknown>
+  quality_presets_by_slot: Record<string, string>
+}
+
 /** Slice 1 选择创意后复用的 Commerce StoryRun；Slice 2 的所有资产都只挂在它下面。 */
 export interface CommerceStoryRun {
   id: string
@@ -249,6 +286,7 @@ export interface CommerceStoryRun {
   can_confirm: boolean
   latest_error: string | null
   stage_result_references: Record<string, unknown>
+  workflow_config: CommerceStoryRunWorkflowConfig | null
   created_at: string
   updated_at: string
 }

@@ -72,6 +72,8 @@ from app.services.model_parameter_service import (
     resolve_effective_model_parameters,
 )
 from app.services.prompt_template_service import freeze_active_prompt
+from app.services.prompt_template_service import freeze_prompt_version
+from app.services.commerce_workflow_preset_service import story_run_workflow_config_snapshot
 from app.services.sensitive_data import sanitize_error_summary
 
 
@@ -286,6 +288,7 @@ def _freeze_model_and_prompt(
     db: Session,
     operation: str,
     *,
+    story_run: StoryRun,
     context: dict[str, Any],
     parameter_preset: str = "standard",
     parameter_overrides: dict[str, Any] | None = None,
@@ -293,19 +296,30 @@ def _freeze_model_and_prompt(
     slot_key, task_type = OPERATION_SPECS[operation]
     if slot_key is None:
         return None, None
-    bindings = enabled_profiles_for_slot(db, slot_key)
-    if not bindings:
-        _error(f"模型槽位 {slot_key} 未启用模型配置", status.HTTP_503_SERVICE_UNAVAILABLE)
-    binding = _profile_snapshot(db, bindings[0], slot_key)
-    execution_context = {"operation": operation}
-    if operation == "VIDEO_RENDER":
-        execution_context["input_mode"] = "first_frame"
-    binding["profile_snapshot"]["parameter_resolution"] = resolve_effective_model_parameters(
-        binding["profile_snapshot"],
-        preset=parameter_preset,
-        run_overrides=parameter_overrides or {},
-        execution_context=execution_context,
-    )
+    workflow_config = story_run_workflow_config_snapshot(story_run)
+    if workflow_config is not None:
+        frozen_bindings = (workflow_config.get("model_bindings") or {}).get(slot_key)
+        if not isinstance(frozen_bindings, list) or not frozen_bindings:
+            _error(f"StoryRun 缺少冻结模型槽位 {slot_key}", status.HTTP_409_CONFLICT)
+        if parameter_overrides:
+            _error("StoryRun 已开始使用冻结配置；模型专属参数不能在运行中修改", status.HTTP_409_CONFLICT)
+        # 新配置类 StoryRun 无论页面仍传旧默认值还是用户刷新页面，都使用创建时解析
+        # 的 quality preset/effective parameters，绝不回读当前 Profile。
+        binding = deepcopy(frozen_bindings[0])
+    else:
+        bindings = enabled_profiles_for_slot(db, slot_key)
+        if not bindings:
+            _error(f"模型槽位 {slot_key} 未启用模型配置", status.HTTP_503_SERVICE_UNAVAILABLE)
+        binding = _profile_snapshot(db, bindings[0], slot_key)
+        execution_context = {"operation": operation}
+        if operation == "VIDEO_RENDER":
+            execution_context["input_mode"] = "first_frame"
+        binding["profile_snapshot"]["parameter_resolution"] = resolve_effective_model_parameters(
+            binding["profile_snapshot"],
+            preset=parameter_preset,
+            run_overrides=parameter_overrides or {},
+            execution_context=execution_context,
+        )
     prompt_key = PROMPT_KEY_BY_OPERATION[operation]
     if prompt_key is None:
         return binding, None
@@ -319,7 +333,20 @@ def _freeze_model_and_prompt(
         variables = {"video_context": context}
     else:
         variables = {"shot": context}
-    prompt = freeze_active_prompt(db, prompt_key, variables, legacy_task_type=task_type)
+    frozen_prompt = ((workflow_config or {}).get("prompt_templates") or {}).get(prompt_key)
+    if workflow_config is not None:
+        version_id = frozen_prompt.get("prompt_version_id") if isinstance(frozen_prompt, dict) else None
+        if not isinstance(version_id, str) or not version_id:
+            _error(f"StoryRun 缺少冻结 Prompt {prompt_key}", status.HTTP_409_CONFLICT)
+        prompt = freeze_prompt_version(
+            db,
+            prompt_key=prompt_key,
+            prompt_version_id=version_id,
+            variables=variables,
+            legacy_task_type=task_type,
+        )
+    else:
+        prompt = freeze_active_prompt(db, prompt_key, variables, legacy_task_type=task_type)
     prompt["task_type"] = task_type
     return binding, prompt
 
@@ -348,6 +375,17 @@ def _operation_prerequisites(db: Session, story_run: StoryRun, operation: str, t
             "integration_nodes": _integration_nodes(outline, mainline),
         },
     }
+    frozen_config = story_run_workflow_config_snapshot(story_run)
+    if frozen_config is not None:
+        # 仅复制业务配置、估算和版本 ID；提示词渲染器会移除执行元数据，不能把模型
+        # 配置送入业务 Prompt。
+        context["workflow_config"] = {
+            "preset_definition_id": frozen_config.get("preset_definition_id"),
+            "preset_version_id": frozen_config.get("preset_version_id"),
+            "preset_version": frozen_config.get("preset_version"),
+            "effective_workflow_config": deepcopy(frozen_config.get("effective_workflow_config") or {}),
+            "estimates": deepcopy(frozen_config.get("estimates") or {}),
+        }
     if operation in {"CHARACTER_DESIGN"}:
         return context
     character = _current_locked_character(db, story_run.id)
@@ -418,6 +456,7 @@ def create_production_run(
     binding, prompt = _freeze_model_and_prompt(
         db,
         operation,
+        story_run=story_run,
         context=context,
         parameter_preset=parameter_preset,
         parameter_overrides=parameter_overrides,
@@ -443,6 +482,9 @@ def create_production_run(
             ((binding or {}).get("profile_snapshot") or {}).get("parameter_resolution") or {}
         ),
     }
+    frozen_config = story_run_workflow_config_snapshot(story_run)
+    if frozen_config is not None:
+        snapshot["workflow_config"] = frozen_config
     run_row = WorkflowRun(
         project_id=story_run.project_id,
         workflow_key=workflow_key,

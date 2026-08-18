@@ -84,7 +84,17 @@ from app.services.v1_configuration_service import enabled_profiles_for_slot
 from app.services.v1_model_adapter_service import assert_supported, generate_structured_text, is_mock_adapter
 from app.services.model_parameter_service import profile_parameter_config, resolve_effective_model_parameters
 from app.services.provider_config_security import redact_provider_config
-from app.services.prompt_template_service import freeze_active_prompt
+from app.services.prompt_template_service import (
+    ensure_prompt_template_foundation,
+    freeze_active_prompt,
+    freeze_prompt_version,
+)
+from app.services.commerce_workflow_preset_service import (
+    copy_story_run_workflow_config,
+    freeze_story_run_workflow_config,
+    resolve_story_run_workflow_config,
+    story_run_workflow_config_snapshot,
+)
 
 
 # 一个 StoryRun 只拥有一个长期存在的 Commerce 父运行。每个阶段和人工重做均在
@@ -248,19 +258,29 @@ def _freeze_execution_snapshot(db: Session, story_run: StoryRun, stage: StoryRun
     slot_key, task_type = NODE_MODEL_SPECS[stage]
     bindings: list[dict[str, Any]] = []
     prompt: dict[str, Any] | None = None
+    workflow_config = story_run_workflow_config_snapshot(story_run)
     if slot_key:
-        raw_bindings = enabled_profiles_for_slot(db, slot_key)
-        if not raw_bindings:
-            _error(f"模型槽位 {slot_key} 没有启用的模型配置", status.HTTP_503_SERVICE_UNAVAILABLE)
-        bindings = [
-            _profile_snapshot(
-                db,
-                binding,
-                slot_key,
-                execution_context={"operation": stage.value},
-            )
-            for binding in raw_bindings
-        ]
+        if workflow_config is not None:
+            frozen_bindings = (workflow_config.get("model_bindings") or {}).get(slot_key)
+            if not isinstance(frozen_bindings, list) or not frozen_bindings:
+                _error(f"StoryRun 缺少已冻结的模型槽位 {slot_key}", status.HTTP_409_CONFLICT)
+            # 已配置的 StoryRun 只能复制创建时的完整 Binding/Profile/参数快照；不允许
+            # 后续切换模型中心、质量预设或槽位绑定影响已开始的工作流。
+            bindings = deepcopy(frozen_bindings)
+        else:
+            # 0024 前的历史 StoryRun 没有预设冻结行，维持既有行为以保证历史恢复可读。
+            raw_bindings = enabled_profiles_for_slot(db, slot_key)
+            if not raw_bindings:
+                _error(f"模型槽位 {slot_key} 没有启用的模型配置", status.HTTP_503_SERVICE_UNAVAILABLE)
+            bindings = [
+                _profile_snapshot(
+                    db,
+                    binding,
+                    slot_key,
+                    execution_context={"operation": stage.value},
+                )
+                for binding in raw_bindings
+            ]
     selection = db.get(ProjectProductSelection, story_run.project_product_selection_id)
     product_version = db.get(ProductAssetVersion, story_run.product_asset_version_id)
     if selection is None or product_version is None:
@@ -307,6 +327,8 @@ def _freeze_execution_snapshot(db: Session, story_run: StoryRun, stage: StoryRun
         "model_bindings": {slot_key: bindings} if slot_key else {},
         "prompt_templates": {},
     }
+    if workflow_config is not None:
+        snapshot["workflow_config"] = workflow_config
     # Slice 1 的 StoryRun 有一对一的上游输入版本快照。这里复制它，不再执行时回读
     # ScriptAnalysis、产品或创意表；旧 Commerce StoryRun 保持原有快照结构。
     if story_run.mainline_input is not None:
@@ -329,7 +351,20 @@ def _freeze_execution_snapshot(db: Session, story_run: StoryRun, stage: StoryRun
             variables = {"video_context": business_context}
         else:
             variables = {"shot": business_context}
-        prompt = freeze_active_prompt(db, prompt_key, variables, legacy_task_type=task_type)
+        frozen_prompt = ((workflow_config or {}).get("prompt_templates") or {}).get(prompt_key)
+        if workflow_config is not None:
+            version_id = frozen_prompt.get("prompt_version_id") if isinstance(frozen_prompt, dict) else None
+            if not isinstance(version_id, str) or not version_id:
+                _error(f"StoryRun 缺少已冻结的 Prompt {prompt_key}", status.HTTP_409_CONFLICT)
+            prompt = freeze_prompt_version(
+                db,
+                prompt_key=prompt_key,
+                prompt_version_id=version_id,
+                variables=variables,
+                legacy_task_type=task_type,
+            )
+        else:
+            prompt = freeze_active_prompt(db, prompt_key, variables, legacy_task_type=task_type)
         if task_type is not None:
             prompt["task_type"] = task_type
             # 仅供已发布的旧 API/测试读取。实际 Worker 只读取 rendered_* 与
@@ -345,10 +380,17 @@ def create_next_story_run(
     project_id: str,
     topic_candidate_id: str,
     project_product_selection_id: str,
-    mode: StoryRunMode,
+    mode: StoryRunMode | None = None,
+    preset_key: str | None = None,
+    preset_version_id: str | None = None,
+    run_overrides: dict[str, Any] | None = None,
 ) -> StoryRun:
     """集中计算重跑编号，并从项目选择读取冻结产品版本。"""
 
+    # 旧的服务调用方可能只初始化了 V1/Commerce 工作流定义，而没有经过
+    # 应用启动时的全量 foundation。创建新 Run 前补齐系统 Prompt 目录，保证
+    # 新增的冻结链对这些兼容调用同样可用；函数本身是幂等的，不会重置人工版本。
+    ensure_prompt_template_foundation(db)
     if db.get(Project, project_id) is None:
         _error("项目不存在", status.HTTP_404_NOT_FOUND)
     selection = db.get(ProjectProductSelection, project_product_selection_id)
@@ -368,6 +410,13 @@ def create_next_story_run(
         )
         or 0
     ) + 1
+    requested_overrides = deepcopy(run_overrides or {})
+    if mode is not None:
+        requested_overrides.setdefault("execution_mode", mode.value)
+    resolved_config = resolve_story_run_workflow_config(
+        db, preset_key=preset_key, preset_version_id=preset_version_id, run_overrides=requested_overrides
+    )
+    effective_mode = StoryRunMode(resolved_config["effective_workflow_config"]["execution_mode"])
     try:
         story_run = create_story_run(
             db,
@@ -376,8 +425,9 @@ def create_next_story_run(
             project_product_selection_id=selection.id,
             product_asset_version_id=selection.product_asset_version_id,
             run_number=next_number,
-            mode=mode,
+            mode=effective_mode,
         )
+        freeze_story_run_workflow_config(db, story_run=story_run, resolved=resolved_config)
         db.commit()
     except IntegrityError as exc:
         db.rollback()
@@ -467,7 +517,15 @@ def _next_creative_rerun_number(db: Session, creative_idea_id: str) -> int:
     ) + 1
 
 
-def rerun_story_run(db: Session, *, source_story_run_id: str) -> tuple[StoryRun, WorkflowRun]:
+def rerun_story_run(
+    db: Session,
+    *,
+    source_story_run_id: str,
+    use_current_preset: bool = False,
+    preset_key: str | None = None,
+    preset_version_id: str | None = None,
+    run_overrides: dict[str, Any] | None = None,
+) -> tuple[StoryRun, WorkflowRun]:
     """用同一已选创意的新编号创建完全独立的 StoryRun。
 
     此操作只复制冻结业务输入并创建长期 Commerce 父 ``WorkflowRun``。它绝不创建
@@ -482,6 +540,17 @@ def rerun_story_run(db: Session, *, source_story_run_id: str) -> tuple[StoryRun,
         try:
             source, source_input, idea = _locked_rerun_source(db, source_story_run_id)
             run_number = _next_creative_rerun_number(db, idea.id)
+            if use_current_preset:
+                resolved_config = resolve_story_run_workflow_config(
+                    db,
+                    preset_key=preset_key,
+                    preset_version_id=preset_version_id,
+                    run_overrides=run_overrides,
+                )
+                rerun_mode = StoryRunMode(resolved_config["effective_workflow_config"]["execution_mode"])
+            else:
+                resolved_config = None
+                rerun_mode = source.mode
             new_run = create_story_run(
                 db,
                 project_id=source.project_id,
@@ -489,8 +558,12 @@ def rerun_story_run(db: Session, *, source_story_run_id: str) -> tuple[StoryRun,
                 project_product_selection_id=source.project_product_selection_id,
                 product_asset_version_id=source.product_asset_version_id,
                 run_number=run_number,
-                mode=source.mode,
+                mode=rerun_mode,
             )
+            if resolved_config is not None:
+                freeze_story_run_workflow_config(db, story_run=new_run, resolved=resolved_config)
+            else:
+                copy_story_run_workflow_config(db, source_story_run=source, target_story_run=new_run)
             frozen_input = deepcopy(source_input.input_snapshot)
             frozen_input["rerun"] = {
                 "source_story_run_id": source.id,
@@ -593,6 +666,11 @@ def _ensure_commerce_workflow(db: Session, story_run: StoryRun) -> tuple[Workflo
             "definition_json": deepcopy(definition.definition_json),
         },
     }
+    workflow_config = story_run_workflow_config_snapshot(story_run)
+    if workflow_config is not None:
+        # 父运行保存同一份不可变配置；子步骤只从此/自身冻结快照读取，Worker 不会
+        # 重新查询当前活动预设、Prompt 或模型中心。
+        root_snapshot["workflow_config"] = workflow_config
     semantic = f"commerce:{story_run.id}:workflow"
     run = WorkflowRun(
         project_id=story_run.project_id,

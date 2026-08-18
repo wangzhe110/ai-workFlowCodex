@@ -293,7 +293,7 @@ def test_0023_sqlite_upgrade_downgrade_and_reupgrade(tmp_path: Path) -> None:
     database_url = f"sqlite:///{tmp_path / 'prompt-template-0023.db'}"
     config = Config(str(server_root / "alembic.ini"))
     config.set_main_option("script_location", str(server_root / "migrations"))
-    assert ScriptDirectory.from_config(config).get_heads() == ["0023_prompt_template_version_management"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["0024_commerce_workflow_presets"]
 
     def migrate(action: str, revision: str) -> None:
         engine = create_engine(database_url)

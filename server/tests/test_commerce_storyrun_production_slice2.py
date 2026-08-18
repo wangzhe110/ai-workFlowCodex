@@ -9,6 +9,7 @@ from pathlib import Path
 from subprocess import CalledProcessError
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -126,91 +127,44 @@ def _lock(client: TestClient, path: str) -> dict:
     return response.json()
 
 
-def test_commerce_run_freezes_selected_parameter_preset_and_new_retry_can_use_new_profile() -> None:
-    """生产 Run 必须冻结本次参数，后续 Profile 切换只能影响新的人工 retry。"""
+def test_commerce_run_uses_storyrun_frozen_parameters_for_retries() -> None:
+    """0024 后生产重试继续使用创建 StoryRun 时冻结的 Profile 与参数。"""
 
-    text_parameters = {
-        "schema_version": 1,
-        "capability": "text",
-        "supported_parameters": {"temperature": {}, "max_tokens": {}},
-        "defaults": {"temperature": 0.2, "max_tokens": 256},
-        "presets": {
-            "preview": {"temperature": 0, "max_tokens": 64},
-            "standard": {"temperature": 0.2, "max_tokens": 256},
-            "high": {"temperature": 0.6, "max_tokens": 1024},
-        },
-    }
     with TestClient(app) as client:
         story_run_id, _ = _make_story_run(client)
         db = SessionLocal()
-        created_profile_ids: list[str] = []
-        original_enabled: dict[str, bool] = {}
         try:
-            slot = db.scalar(select(ModelSlot).where(ModelSlot.slot_key == "CHARACTER_DESIGN"))
-            assert slot is not None
-            existing = list(db.scalars(select(ModelSlotProfileBinding).where(ModelSlotProfileBinding.slot_id == slot.id)).all())
-            original_enabled = {binding.id: binding.is_enabled for binding in existing}
-            for binding in existing:
-                binding.is_enabled = False
-            profile_one = ModelProfile(
-                step_key="CHARACTER_DESIGN", provider_key="openai_compatible", adapter_key="openai_compatible",
-                model_key="frozen-parameter-test-v1", model_version="v1", display_name="冻结参数测试 v1",
-                version=9901, profile_status="ACTIVE",
-                provider_config={"api_base_url": "https://example.invalid/v1", "secret_env_name": "FROZEN_PARAMETER_TEST_KEY"},
-                parameter_config=text_parameters,
-                is_active=False,
-            )
-            db.add(profile_one); db.flush(); created_profile_ids.append(profile_one.id)
-            first_binding = ModelSlotProfileBinding(slot_id=slot.id, model_profile_id=profile_one.id, is_enabled=True, priority=-20)
-            db.add(first_binding); db.commit()
+            story_run = db.get(StoryRun, story_run_id)
+            assert story_run is not None and story_run.workflow_config_freeze is not None
+            expected = story_run.workflow_config_freeze.model_bindings["CHARACTER_DESIGN"][0]
+            with pytest.raises(HTTPException) as blocked:
+                create_production_run(
+                    db,
+                    story_run_id=story_run_id,
+                    operation="CHARACTER_DESIGN",
+                    parameter_preset="preview",
+                    parameter_overrides={"temperature": 0},
+                )
+            assert getattr(blocked.value, "status_code", None) == 409
 
-            first, created = create_production_run(
-                db, story_run_id=story_run_id, operation="CHARACTER_DESIGN",
-                parameter_preset="preview", parameter_overrides={"temperature": 0},
-            )
+            first, created = create_production_run(db, story_run_id=story_run_id, operation="CHARACTER_DESIGN")
             assert created is True
             first_frozen = first.input_snapshot["generation_parameters"]
-            assert first_frozen["selected_preset"] == "preview"
-            assert first_frozen["effective_parameters"] == {"temperature": 0, "max_tokens": 64}
+            assert first.input_snapshot["model_binding"] == expected
             assert first.steps[0].model_profile_snapshot["generation_parameters"] == first_frozen
 
-            # 模拟人工确认失败后，切换一个新版本，并且只让新的 retry 使用它。
+            # 人工重做追加新的执行 Run，但不能借机读取后续切换的活动 Profile。
             first.status = RunStatus.FAILED
             first.steps[0].status = RunStatus.FAILED
-            first_binding.is_enabled = False
-            profile_two = ModelProfile(
-                step_key="CHARACTER_DESIGN", provider_key="openai_compatible", adapter_key="openai_compatible",
-                model_key="frozen-parameter-test-v2", model_version="v2", display_name="冻结参数测试 v2",
-                version=9902, profile_status="ACTIVE",
-                provider_config={"api_base_url": "https://example.invalid/v1", "secret_env_name": "FROZEN_PARAMETER_TEST_KEY"},
-                parameter_config={**text_parameters, "presets": {**text_parameters["presets"], "standard": {"temperature": 0.4, "max_tokens": 512}}},
-                is_active=False,
-            )
-            db.add(profile_two); db.flush(); created_profile_ids.append(profile_two.id)
-            db.add(ModelSlotProfileBinding(slot_id=slot.id, model_profile_id=profile_two.id, is_enabled=True, priority=-20))
             db.commit()
-
-            second, created = create_production_run(
-                db, story_run_id=story_run_id, operation="CHARACTER_DESIGN",
-                retry=True, parameter_preset="standard",
-            )
+            second, created = create_production_run(db, story_run_id=story_run_id, operation="CHARACTER_DESIGN", retry=True)
             assert created is True
             assert second.id != first.id
-            assert second.input_snapshot["generation_parameters"]["effective_parameters"] == {"temperature": 0.4, "max_tokens": 512}
+            assert second.input_snapshot["model_binding"] == expected
+            assert second.input_snapshot["generation_parameters"] == first_frozen
             db.refresh(first)
             assert first.input_snapshot["generation_parameters"] == first_frozen
         finally:
-            for binding in list(db.scalars(select(ModelSlotProfileBinding).where(ModelSlotProfileBinding.slot_id == slot.id)).all()):
-                if binding.model_profile_id in created_profile_ids:
-                    db.delete(binding)
-                elif binding.id in original_enabled:
-                    binding.is_enabled = original_enabled[binding.id]
-            db.flush()
-            for profile_id in created_profile_ids:
-                profile = db.get(ModelProfile, profile_id)
-                if profile is not None:
-                    db.delete(profile)
-            db.commit()
             db.close()
 
 
@@ -294,23 +248,6 @@ def test_ark_keyframe_uses_locked_character_then_scene_assets_without_persisting
     """真实图片 Adapter 分支只把经 Storage 解析的角色、场景 Data URL 交给方舟。"""
 
     with TestClient(app) as client:
-        story_run_id, _ = _make_story_run(client)
-        _operation(client, story_run_id, "CHARACTER_DESIGN")
-        character = _assets(client, story_run_id)["character_designs"][0]
-        _lock(client, f"/api/v1/commerce/story-runs/{story_run_id}/character-designs/{character['id']}/lock")
-        _operation(client, story_run_id, "SCENE_DESIGN")
-        scene = _assets(client, story_run_id)["scene_designs"][0]
-        _lock(client, f"/api/v1/commerce/story-runs/{story_run_id}/scene-designs/{scene['id']}/lock")
-        _operation(client, story_run_id, "STORYBOARD")
-        board = _assets(client, story_run_id)["storyboards"][0]
-        _lock(client, f"/api/v1/commerce/story-runs/{story_run_id}/storyboards/{board['id']}/lock")
-        _operation(client, story_run_id, "CHARACTER_IMAGES")
-        for image in _assets(client, story_run_id)["character_images"]:
-            _lock(client, f"/api/v1/commerce/story-runs/{story_run_id}/images/CHARACTER/{image['id']}/lock")
-        _operation(client, story_run_id, "SCENE_IMAGES")
-        for image in _assets(client, story_run_id)["scene_images"]:
-            _lock(client, f"/api/v1/commerce/story-runs/{story_run_id}/images/SCENE/{image['id']}/lock")
-
         db = SessionLocal()
         try:
             slot = db.scalar(select(ModelSlot).where(ModelSlot.slot_key == "SHOT_KEYFRAME_GENERATE"))
@@ -331,6 +268,25 @@ def test_ark_keyframe_uses_locked_character_then_scene_assets_without_persisting
             test_binding_id = test_binding.id
         finally:
             db.close()
+
+        # Profile 在选择创意创建 StoryRun 之前已切换；该 Run 因而在创建时冻结
+        # Seedream binding，而不是靠运行中重读当前槽位。
+        story_run_id, _ = _make_story_run(client)
+        _operation(client, story_run_id, "CHARACTER_DESIGN")
+        character = _assets(client, story_run_id)["character_designs"][0]
+        _lock(client, f"/api/v1/commerce/story-runs/{story_run_id}/character-designs/{character['id']}/lock")
+        _operation(client, story_run_id, "SCENE_DESIGN")
+        scene = _assets(client, story_run_id)["scene_designs"][0]
+        _lock(client, f"/api/v1/commerce/story-runs/{story_run_id}/scene-designs/{scene['id']}/lock")
+        _operation(client, story_run_id, "STORYBOARD")
+        board = _assets(client, story_run_id)["storyboards"][0]
+        _lock(client, f"/api/v1/commerce/story-runs/{story_run_id}/storyboards/{board['id']}/lock")
+        _operation(client, story_run_id, "CHARACTER_IMAGES")
+        for image in _assets(client, story_run_id)["character_images"]:
+            _lock(client, f"/api/v1/commerce/story-runs/{story_run_id}/images/CHARACTER/{image['id']}/lock")
+        _operation(client, story_run_id, "SCENE_IMAGES")
+        for image in _assets(client, story_run_id)["scene_images"]:
+            _lock(client, f"/api/v1/commerce/story-runs/{story_run_id}/images/SCENE/{image['id']}/lock")
 
         loaded_roles: list[str] = []
         loaded_namespaces: list[str] = []
@@ -405,7 +361,6 @@ def test_slice2_real_adapter_branch_is_not_hardcoded(monkeypatch) -> None:
     from app.services import commerce_production_service
 
     with TestClient(app) as client:
-        story_run_id, _ = _make_story_run(client)
         db = SessionLocal()
         try:
             slot = db.scalar(select(ModelSlot).where(ModelSlot.slot_key == "CHARACTER_DESIGN"))
@@ -427,6 +382,8 @@ def test_slice2_real_adapter_branch_is_not_hardcoded(monkeypatch) -> None:
             profile_id = profile.id
         finally:
             db.close()
+        # 选择创意时冻结刚绑定的真实 Adapter；后续生产操作不能再从槽位中心取值。
+        story_run_id, _ = _make_story_run(client)
         captured: dict[str, object] = {}
 
         def fake_generate(snapshot, **kwargs):
@@ -588,6 +545,29 @@ def test_slice2_restarted_video_worker_only_polls_saved_provider_task(monkeypatc
     """供应商任务号已落库时，重启 Worker 只能 poll，绝不能再次 submit。"""
 
     with TestClient(app) as client:
+        # 新 Profile 必须在选择创意之前绑定，确保 StoryRun 创建时冻结它，而不是
+        # 在已经冻结的 Run 上偷换 VIDEO_GENERATE 槽位。
+        db = SessionLocal()
+        try:
+            slot = db.scalar(select(ModelSlot).where(ModelSlot.slot_key == "VIDEO_GENERATE"))
+            assert slot is not None
+            defaults = list(db.scalars(select(ModelSlotProfileBinding).where(ModelSlotProfileBinding.slot_id == slot.id)).all())
+            default_states = {binding.id: binding.is_enabled for binding in defaults}
+            for binding in defaults:
+                binding.is_enabled = False
+            profile = ModelProfile(
+                step_key="VIDEO_GENERATE", provider_key="configurable_async_video", adapter_key="configurable_async_video",
+                model_key="restart-fake", model_version="restart-fake", display_name="Restart Fake", version=996,
+                provider_config={"secret_env_name": "DECOY"}, is_active=False, profile_status="ACTIVE",
+            )
+            db.add(profile)
+            db.flush()
+            db.add(ModelSlotProfileBinding(slot_id=slot.id, model_profile_id=profile.id, is_enabled=True, priority=-100))
+            db.commit()
+            profile_id, default_ids = profile.id, list(default_states)
+        finally:
+            db.close()
+
         story_run_id, _ = _make_story_run(client)
         _operation(client, story_run_id, "CHARACTER_DESIGN")
         character = _assets(client, story_run_id)["character_designs"][0]
@@ -612,23 +592,6 @@ def test_slice2_restarted_video_worker_only_polls_saved_provider_task(monkeypatc
 
         db = SessionLocal()
         try:
-            slot = db.scalar(select(ModelSlot).where(ModelSlot.slot_key == "VIDEO_GENERATE"))
-            assert slot is not None
-            defaults = list(db.scalars(select(ModelSlotProfileBinding).where(ModelSlotProfileBinding.slot_id == slot.id)).all())
-            default_states = {binding.id: binding.is_enabled for binding in defaults}
-            for binding in defaults:
-                binding.is_enabled = False
-            profile = ModelProfile(
-                step_key="VIDEO_GENERATE", provider_key="configurable_async_video", adapter_key="configurable_async_video",
-                model_key="restart-fake", model_version="restart-fake", display_name="Restart Fake", version=996,
-                provider_config={"secret_env_name": "DECOY"}, is_active=False, profile_status="ACTIVE",
-            )
-            db.add(profile)
-            db.flush()
-            real_binding = ModelSlotProfileBinding(slot_id=slot.id, model_profile_id=profile.id, is_enabled=True, priority=-100)
-            db.add(real_binding)
-            db.commit()
-
             run, created = create_production_run(
                 db, story_run_id=story_run_id, operation="VIDEO_RENDER", target_id=shot["shot_id"]
             )
@@ -662,7 +625,7 @@ def test_slice2_restarted_video_worker_only_polls_saved_provider_task(monkeypatc
             step.provider_task_id = clip.provider_task_id
             run.status = RunStatus.RUNNING
             db.commit()
-            run_id, profile_id, default_ids = run.id, profile.id, [item.id for item in defaults]
+            run_id = run.id
         finally:
             db.close()
 
@@ -713,7 +676,7 @@ def test_slice2_restarted_video_worker_only_polls_saved_provider_task(monkeypatc
                 assert binding is not None
                 binding.is_enabled = False
                 for default in db.scalars(select(ModelSlotProfileBinding).where(ModelSlotProfileBinding.id.in_(default_ids))):
-                    default.is_enabled = True
+                    default.is_enabled = default_states[default.id]
                 db.commit()
             finally:
                 db.close()
@@ -723,6 +686,34 @@ def test_video_submit_failure_preserves_audit_without_persisting_data_url(monkey
     """供应商创建拒绝也必须保留可重试的失败片段与脱敏调用审计。"""
 
     with TestClient(app) as client:
+        # Profile 必须在 StoryRun 创建之前完成绑定：新 Run 会冻结这一绑定，
+        # 不能再依赖执行过程中读取（或切换）当前槽位。
+        db = SessionLocal()
+        try:
+            slot = db.scalar(select(ModelSlot).where(ModelSlot.slot_key == "VIDEO_GENERATE"))
+            assert slot is not None
+            defaults = list(db.scalars(select(ModelSlotProfileBinding).where(ModelSlotProfileBinding.slot_id == slot.id)).all())
+            default_states = {binding.id: binding.is_enabled for binding in defaults}
+            for binding in defaults:
+                binding.is_enabled = False
+            profile = ModelProfile(
+                step_key="VIDEO_GENERATE", provider_key="volcengine_ark_video", adapter_key="volcengine_ark_video",
+                model_key="doubao-seedance-2-5-260628", model_version="doubao-seedance-2-5-260628",
+                display_name="Rejected Ark", version=997, is_active=False, profile_status="ACTIVE",
+                provider_config={
+                    "api_base_url": "https://ark.cn-beijing.volces.com/api/v3",
+                    "secret_env_name": "ARK_API_KEY", "ratio": "16:9", "duration": 5,
+                    "resolution": "480p", "generate_audio": False,
+                },
+            )
+            db.add(profile)
+            db.flush()
+            db.add(ModelSlotProfileBinding(slot_id=slot.id, model_profile_id=profile.id, is_enabled=True, priority=-100))
+            db.commit()
+            profile_id = profile.id
+        finally:
+            db.close()
+
         story_run_id, _ = _make_story_run(client)
         _operation(client, story_run_id, "CHARACTER_DESIGN")
         character = _assets(client, story_run_id)["character_designs"][0]
@@ -744,31 +735,6 @@ def test_video_submit_failure_preserves_audit_without_persisting_data_url(monkey
         frame = _assets(client, story_run_id)["keyframes"][0]
         _lock(client, f"/api/v1/commerce/story-runs/{story_run_id}/images/KEYFRAME/{frame['id']}/lock")
         _operation(client, story_run_id, "VIDEO_PROMPT", target_id=shot["shot_id"])
-
-        db = SessionLocal()
-        try:
-            slot = db.scalar(select(ModelSlot).where(ModelSlot.slot_key == "VIDEO_GENERATE"))
-            assert slot is not None
-            defaults = list(db.scalars(select(ModelSlotProfileBinding).where(ModelSlotProfileBinding.slot_id == slot.id)).all())
-            default_states = {binding.id: binding.is_enabled for binding in defaults}
-            for binding in defaults:
-                binding.is_enabled = False
-            profile = ModelProfile(
-                step_key="VIDEO_GENERATE", provider_key="volcengine_ark_video", adapter_key="volcengine_ark_video",
-                model_key="doubao-seedance-2-5-260628", model_version="doubao-seedance-2-5-260628",
-                display_name="Rejected Ark", version=997, is_active=False, profile_status="ACTIVE",
-                provider_config={
-                    "api_base_url": "https://ark.cn-beijing.volces.com/api/v3",
-                    "secret_env_name": "ARK_API_KEY", "ratio": "16:9", "duration": 5,
-                    "resolution": "480p", "generate_audio": False,
-                },
-            )
-            db.add(profile); db.flush()
-            db.add(ModelSlotProfileBinding(slot_id=slot.id, model_profile_id=profile.id, is_enabled=True, priority=-100))
-            db.commit()
-            profile_id = profile.id
-        finally:
-            db.close()
 
         reference = LocalImageReference(
             asset_id=frame["id"], role="first_frame", mime_type="image/jpeg", width=2848, height=1600,

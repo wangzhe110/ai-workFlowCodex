@@ -71,6 +71,7 @@ def init_database() -> None:
     # 默认模型配置同样是可审计数据：本地建表或生产迁移完成后首次启动写入模拟
     # 配置，后续由配置中心新增版本并切换，历史工作流仍保留原来的快照。
     from app.services.commerce_configuration_service import ensure_commerce_foundation
+    from app.services.commerce_workflow_preset_service import ensure_commerce_workflow_preset_foundation
     from app.services.model_profile_service import ensure_default_profiles
     from app.services.prompt_template_service import ensure_prompt_template_foundation
     from app.services.v1_configuration_service import ensure_v1_foundation
@@ -81,6 +82,9 @@ def init_database() -> None:
         # 不为旧项目创建 StoryRun，也不会切换任何项目的既有工作流。
         ensure_v1_foundation(db)
         ensure_commerce_foundation(db)
+        # Commerce 预设只写入三份缺失的初始 Published 版本；它们不替换既有活动
+        # Profile/Prompt，也不会为历史 StoryRun 回填或改写配置。
+        ensure_commerce_workflow_preset_foundation(db)
         # 系统 Prompt 与项目内 video_prompt_versions 是两类数据。这里只幂等补齐
         # 未出现过的系统初始版本，绝不覆盖人工后来激活的版本或历史运行快照。
         ensure_prompt_template_foundation(db)

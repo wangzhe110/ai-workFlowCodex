@@ -666,6 +666,48 @@ def freeze_active_prompt(
     )
 
 
+def freeze_prompt_version(
+    db: Session,
+    *,
+    prompt_key: str,
+    prompt_version_id: str,
+    variables: Mapping[str, Any],
+    legacy_task_type: str | None = None,
+) -> dict[str, Any]:
+    """渲染 StoryRun 创建时已冻结的 Published Prompt 版本。
+
+    这和 ``freeze_active_prompt`` 的区别是：它不会读取目录的当前活动指针。用于
+    已启动 StoryRun 的 Worker/后续阶段，因此之后的 Prompt 激活或回滚不会改变
+    已经创建运行的业务行为。
+    """
+
+    definition = get_prompt_definition(db, prompt_key)
+    version = db.get(PromptTemplateVersion, prompt_version_id)
+    if (
+        version is None
+        or version.prompt_template_id != definition.id
+        or version.status != PromptTemplateVersionStatus.PUBLISHED
+    ):
+        _error(f"Prompt {prompt_key} 的冻结版本无效", status.HTTP_409_CONFLICT)
+    legacy_template_id: str | None = None
+    if legacy_task_type:
+        legacy_template_id = db.scalar(
+            select(PromptTemplate.id)
+            .where(
+                PromptTemplate.task_type == legacy_task_type,
+                PromptTemplate.status == PromptTemplateStatus.ACTIVE,
+            )
+            .order_by(PromptTemplate.version.desc())
+            .limit(1)
+        )
+    return _version_snapshot(
+        definition,
+        version,
+        variables,
+        legacy_prompt_template_id=legacy_template_id,
+    )
+
+
 def _next_version_number(db: Session, definition_id: str) -> int:
     return int(
         db.scalar(

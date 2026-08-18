@@ -382,7 +382,7 @@ def select_commerce_creative_idea_endpoint(
     """选择一个创意并建立/冻结现有 Commerce StoryRun 的输入证据链。"""
 
     try:
-        mode = StoryRunMode(payload.mode)
+        mode = StoryRunMode(payload.mode) if payload.mode else None
     except ValueError as exc:  # schema 已校验，保留防御性错误语义。
         from fastapi import HTTPException
 
@@ -393,6 +393,9 @@ def select_commerce_creative_idea_endpoint(
         reviewer_label=payload.reviewer_label,
         note=payload.note,
         mode=mode,
+        preset_key=payload.preset_key,
+        preset_version_id=payload.preset_version_id,
+        run_overrides=payload.run_overrides,
     )
     # 选择即把现有 Commerce StoryRun 推进到 OUTLINE；继续使用同一个父工作流和
     # Worker 分发器，而不是在生产台创建第三套“大纲任务”。

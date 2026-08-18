@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import parse_qsl, urlsplit
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
@@ -11,7 +11,15 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.models import ModelInvocation, StoryRunMode, StoryRunStage, StoryRunStatus, WorkflowRun, WorkflowStep
+from app.models import (
+    CommerceWorkflowPresetVersion,
+    ModelInvocation,
+    StoryRunMode,
+    StoryRunStage,
+    StoryRunStatus,
+    WorkflowRun,
+    WorkflowStep,
+)
 from app.schemas import (
     CommerceOutlineCreateRequest,
     CommerceOutlinePatchRequest,
@@ -19,7 +27,13 @@ from app.schemas import (
     CommerceReviewRequest,
     CommerceReviewResponse,
     CommerceStoryRunCreateRequest,
+    CommerceStoryRunRerunRequest,
     CommerceStoryRunResponse,
+    CommerceStoryRunWorkflowConfigResponse,
+    CommerceWorkflowPresetDraftPatchRequest,
+    CommerceWorkflowPresetDraftRequest,
+    CommerceWorkflowPresetResponse,
+    CommerceWorkflowPresetVersionResponse,
     CommerceWorkflowDefinitionResponse,
     CommerceWorkflowRunResponse,
     CommerceWorkflowStepResponse,
@@ -37,6 +51,15 @@ from app.schemas import (
     CommerceVideoPromptResponse,
 )
 from app.services.commerce_configuration_service import ensure_commerce_foundation
+from app.services.commerce_workflow_preset_service import (
+    activate_preset_version,
+    copy_preset_draft,
+    list_preset_definitions,
+    list_preset_versions,
+    publish_preset_draft,
+    story_run_workflow_config_snapshot,
+    update_preset_draft,
+)
 from app.services.commerce_workflow_service import (
     cancel_story_run,
     continue_story_run,
@@ -259,6 +282,61 @@ def _review_response(item) -> CommerceReviewResponse:
     )
 
 
+def _preset_version_response(item) -> CommerceWorkflowPresetVersionResponse:
+    return CommerceWorkflowPresetVersionResponse(
+        id=item.id,
+        preset_definition_id=item.preset_definition_id,
+        version=item.version,
+        status=item.status.value,
+        schema_version=item.schema_version,
+        config=_safe_snapshot(item.config),
+        content_hash=item.content_hash,
+        change_summary=item.change_summary,
+        created_at=item.created_at,
+        updated_at=item.updated_at,
+    )
+
+
+def _preset_response(db: Session, item) -> CommerceWorkflowPresetResponse:
+    active = db.get(CommerceWorkflowPresetVersion, item.active_version_id) if item.active_version_id else None
+    # 避免把预设版本正文/连接配置混入普通生产台；config 是后端强类型业务字段。
+    return CommerceWorkflowPresetResponse(
+        id=item.id,
+        preset_key=item.preset_key,
+        display_name=item.display_name,
+        description=item.description,
+        active_version_id=item.active_version_id,
+        active_version=_preset_version_response(active) if active is not None else None,
+        created_at=item.created_at,
+        updated_at=item.updated_at,
+    )
+
+
+def _workflow_config_response(story_run) -> CommerceStoryRunWorkflowConfigResponse | None:
+    frozen = story_run_workflow_config_snapshot(story_run)
+    if frozen is None:
+        return None
+    effective = frozen.get("effective_workflow_config") or {}
+    quality = {
+        "CHARACTER_IMAGE_GENERATE": str(effective.get("image_quality_preset", "standard")),
+        "SCENE_IMAGE_GENERATE": str(effective.get("image_quality_preset", "standard")),
+        "SHOT_KEYFRAME_GENERATE": str(effective.get("image_quality_preset", "standard")),
+        "VIDEO_GENERATE": str(effective.get("video_quality_preset", "standard")),
+        "FINAL_COMPOSE": str(effective.get("final_compose_quality_preset", "standard")),
+    }
+    return CommerceStoryRunWorkflowConfigResponse(
+        preset_definition_id=frozen.get("preset_definition_id"),
+        preset_version_id=frozen.get("preset_version_id"),
+        preset_version=frozen.get("preset_version"),
+        preset_content_hash=frozen.get("preset_content_hash"),
+        requested_overrides=_safe_snapshot(frozen.get("requested_overrides")),
+        effective_workflow_config=_safe_snapshot(effective),
+        config_sources=_safe_snapshot(frozen.get("config_sources")),
+        estimates=_safe_snapshot(frozen.get("estimates")),
+        quality_presets_by_slot=quality,
+    )
+
+
 def _story_run_response(db: Session, story_run) -> CommerceStoryRunResponse:
     runs = workflow_for_story_run(db, story_run.id)
     active = next((item for item in runs if item.status.value in {"PENDING", "RUNNING"}), None)
@@ -294,6 +372,7 @@ def _story_run_response(db: Session, story_run) -> CommerceStoryRunResponse:
         can_confirm=state.status == StoryRunStatus.PAUSED and (state.stage_data or {}).get("blocked_reason") in {"awaiting_review", "awaiting_continue"},
         current_workflow_run=_workflow_response(current), current_workflow_step=_step_response(current_step),
         latest_error=latest_error, stage_result_references=refs,
+        workflow_config=_workflow_config_response(story_run),
         created_at=story_run.created_at, updated_at=story_run.updated_at,
     )
 
@@ -311,13 +390,66 @@ def commerce_workflow_definition(db: Session = Depends(get_db)) -> CommerceWorkf
     return CommerceWorkflowDefinitionResponse(id=definition.id, workflow_code=definition.workflow_code, version=definition.version, definition_json=definition.definition_json, status=definition.status.value, published_at=definition.published_at)
 
 
+@router.get("/workflow-presets", response_model=list[CommerceWorkflowPresetResponse])
+def list_workflow_presets_endpoint(db: Session = Depends(get_db)) -> list[CommerceWorkflowPresetResponse]:
+    """普通用户可选择的 Commerce 业务预设目录，不暴露模型连接配置。"""
+
+    return [_preset_response(db, item) for item in list_preset_definitions(db)]
+
+
+@router.get("/workflow-presets/{preset_key}/versions", response_model=list[CommerceWorkflowPresetVersionResponse])
+def list_workflow_preset_versions_endpoint(
+    preset_key: str, db: Session = Depends(get_db)
+) -> list[CommerceWorkflowPresetVersionResponse]:
+    return [_preset_version_response(item) for item in list_preset_versions(db, preset_key)]
+
+
+@router.post("/workflow-presets/{preset_key}/drafts", response_model=CommerceWorkflowPresetVersionResponse, status_code=status.HTTP_201_CREATED)
+def copy_workflow_preset_draft_endpoint(
+    preset_key: str, payload: CommerceWorkflowPresetDraftRequest, db: Session = Depends(get_db)
+) -> CommerceWorkflowPresetVersionResponse:
+    return _preset_version_response(copy_preset_draft(db, preset_key=preset_key, source_version_id=payload.source_version_id))
+
+
+@router.patch("/workflow-preset-versions/{version_id}", response_model=CommerceWorkflowPresetVersionResponse)
+def update_workflow_preset_draft_endpoint(
+    version_id: str, payload: CommerceWorkflowPresetDraftPatchRequest, db: Session = Depends(get_db)
+) -> CommerceWorkflowPresetVersionResponse:
+    return _preset_version_response(
+        update_preset_draft(db, version_id=version_id, config=payload.config, change_summary=payload.change_summary)
+    )
+
+
+@router.post("/workflow-preset-versions/{version_id}/publish", response_model=CommerceWorkflowPresetVersionResponse)
+def publish_workflow_preset_draft_endpoint(
+    version_id: str, db: Session = Depends(get_db)
+) -> CommerceWorkflowPresetVersionResponse:
+    return _preset_version_response(publish_preset_draft(db, version_id=version_id))
+
+
+@router.post("/workflow-presets/{preset_key}/versions/{version_id}/activate", response_model=CommerceWorkflowPresetResponse)
+def activate_workflow_preset_version_endpoint(
+    preset_key: str, version_id: str, db: Session = Depends(get_db)
+) -> CommerceWorkflowPresetResponse:
+    return _preset_response(db, activate_preset_version(db, preset_key=preset_key, version_id=version_id))
+
+
 @router.post("/projects/{project_id}/story-runs", response_model=CommerceStoryRunResponse, status_code=status.HTTP_201_CREATED)
 def create_story_run_endpoint(project_id: str, payload: CommerceStoryRunCreateRequest, db: Session = Depends(get_db)) -> CommerceStoryRunResponse:
     try:
-        mode = StoryRunMode(payload.mode)
+        mode = StoryRunMode(payload.mode) if payload.mode else None
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="运行模式仅支持 STEPWISE 或 AUTO") from exc
-    return _story_run_response(db, create_next_story_run(db, project_id=project_id, topic_candidate_id=payload.topic_candidate_id, project_product_selection_id=payload.project_product_selection_id, mode=mode))
+    return _story_run_response(db, create_next_story_run(
+        db,
+        project_id=project_id,
+        topic_candidate_id=payload.topic_candidate_id,
+        project_product_selection_id=payload.project_product_selection_id,
+        mode=mode,
+        preset_key=payload.preset_key,
+        preset_version_id=payload.preset_version_id,
+        run_overrides=payload.run_overrides,
+    ))
 
 
 @router.get("/projects/{project_id}/story-runs", response_model=list[CommerceStoryRunResponse])
@@ -331,10 +463,22 @@ def get_story_run_endpoint(story_run_id: str, db: Session = Depends(get_db)) -> 
 
 
 @router.post("/story-runs/{story_run_id}/rerun", response_model=CommerceStoryRunResponse, status_code=status.HTTP_201_CREATED)
-def rerun_story_run_endpoint(story_run_id: str, db: Session = Depends(get_db)) -> CommerceStoryRunResponse:
+def rerun_story_run_endpoint(
+    story_run_id: str,
+    payload: Optional[CommerceStoryRunRerunRequest] = None,
+    db: Session = Depends(get_db),
+) -> CommerceStoryRunResponse:
     """从已选创意的冻结输入创建独立新 Run；不启动或投递任何模型任务。"""
 
-    story_run, _workflow_run = rerun_story_run(db, source_story_run_id=story_run_id)
+    payload = payload or CommerceStoryRunRerunRequest()
+    story_run, _workflow_run = rerun_story_run(
+        db,
+        source_story_run_id=story_run_id,
+        use_current_preset=payload.use_current_preset,
+        preset_key=payload.preset_key,
+        preset_version_id=payload.preset_version_id,
+        run_overrides=payload.run_overrides,
+    )
     return _story_run_response(db, story_run)
 
 

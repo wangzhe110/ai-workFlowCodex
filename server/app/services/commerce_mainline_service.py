@@ -54,6 +54,10 @@ from app.services.commerce_domain_service import (
     transition_product_asset_version_status,
 )
 from app.services.v1_model_adapter_service import assert_supported, generate_structured_text, is_mock_adapter
+from app.services.commerce_workflow_preset_service import (
+    freeze_story_run_workflow_config,
+    resolve_story_run_workflow_config,
+)
 
 
 IDEA_COUNT = 10
@@ -509,7 +513,10 @@ def select_creative_idea(
     idea_id: str,
     reviewer_label: str | None,
     note: str | None,
-    mode: StoryRunMode = StoryRunMode.STEPWISE,
+    mode: StoryRunMode | None = None,
+    preset_key: str | None = None,
+    preset_version_id: str | None = None,
+    run_overrides: dict[str, Any] | None = None,
 ) -> StoryRun:
     """选择创意后创建唯一关联的 Commerce StoryRun 与冻结输入快照。
 
@@ -588,6 +595,17 @@ def select_creative_idea(
         )
         or 0
     ) + 1
+    requested_overrides = deepcopy(run_overrides or {})
+    # 老客户端只发送 mode；将其视为已允许的业务覆盖，保持原有 STEPWISE/AUTO
+    # 语义，同时把最终值写入同一份配置冻结。
+    if mode is not None:
+        requested_overrides.setdefault("execution_mode", mode.value)
+    resolved_config = resolve_story_run_workflow_config(
+        db,
+        preset_key=preset_key,
+        preset_version_id=preset_version_id,
+        run_overrides=requested_overrides,
+    )
     story_run = create_story_run(
         db,
         project_id=idea.project_id,
@@ -595,8 +613,9 @@ def select_creative_idea(
         project_product_selection_id=selection.id,
         product_asset_version_id=product.id,
         run_number=run_number,
-        mode=mode,
+        mode=StoryRunMode(resolved_config["effective_workflow_config"]["execution_mode"]),
     )
+    freeze_story_run_workflow_config(db, story_run=story_run, resolved=resolved_config)
     db.add(
         CommerceStoryRunInput(
             story_run_id=story_run.id,

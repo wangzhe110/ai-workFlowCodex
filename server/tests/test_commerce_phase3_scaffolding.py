@@ -631,7 +631,7 @@ def test_0016_empty_sqlite_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
     server_root = Path(__file__).resolve().parents[1]
     config = Config(str(server_root / "alembic.ini"))
     config.set_main_option("script_location", str(server_root / "migrations"))
-    assert ScriptDirectory.from_config(config).get_heads() == ["0023_prompt_template_version_management"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["0024_commerce_workflow_presets"]
     _migration_runner(database_url, "head")
     migration_engine = create_engine(database_url)
     try:

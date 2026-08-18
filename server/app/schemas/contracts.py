@@ -829,7 +829,65 @@ class PromptTemplateRenderPreviewResponse(BaseModel):
 class CommerceStoryRunCreateRequest(BaseModel):
     topic_candidate_id: str = Field(min_length=1, max_length=36)
     project_product_selection_id: str = Field(min_length=1, max_length=36)
-    mode: str = Field(default="STEPWISE", pattern="^(STEPWISE|AUTO)$")
+    # mode 保留给旧客户端；服务端会把它视为 execution_mode 覆盖并写进冻结配置。
+    mode: Optional[str] = Field(default=None, pattern="^(STEPWISE|AUTO)$")
+    preset_key: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    preset_version_id: Optional[str] = Field(default=None, min_length=1, max_length=36)
+    run_overrides: dict[str, Any] = Field(default_factory=dict)
+
+
+class CommerceStoryRunRerunRequest(BaseModel):
+    """默认复制来源冻结配置；显式选择 current 才重新解析当前预设。"""
+
+    use_current_preset: bool = False
+    preset_key: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    preset_version_id: Optional[str] = Field(default=None, min_length=1, max_length=36)
+    run_overrides: dict[str, Any] = Field(default_factory=dict)
+
+
+class CommerceWorkflowPresetVersionResponse(BaseModel):
+    id: str
+    preset_definition_id: str
+    version: int
+    status: str
+    schema_version: int
+    config: dict[str, Any]
+    content_hash: str
+    change_summary: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class CommerceWorkflowPresetResponse(BaseModel):
+    id: str
+    preset_key: str
+    display_name: str
+    description: str
+    active_version_id: Optional[str]
+    active_version: Optional[CommerceWorkflowPresetVersionResponse]
+    created_at: datetime
+    updated_at: datetime
+
+
+class CommerceWorkflowPresetDraftRequest(BaseModel):
+    source_version_id: Optional[str] = Field(default=None, min_length=1, max_length=36)
+
+
+class CommerceWorkflowPresetDraftPatchRequest(BaseModel):
+    config: dict[str, Any]
+    change_summary: str = Field(default="", max_length=4000)
+
+
+class CommerceStoryRunWorkflowConfigResponse(BaseModel):
+    preset_definition_id: Optional[str]
+    preset_version_id: Optional[str]
+    preset_version: Optional[int]
+    preset_content_hash: Optional[str]
+    requested_overrides: dict[str, Any]
+    effective_workflow_config: dict[str, Any]
+    config_sources: dict[str, Any]
+    estimates: dict[str, Any]
+    quality_presets_by_slot: dict[str, str]
 
 
 class CommerceReviewRequest(BaseModel):
@@ -933,6 +991,7 @@ class CommerceStoryRunResponse(BaseModel):
     current_workflow_step: Optional[CommerceWorkflowStepResponse]
     latest_error: Optional[str]
     stage_result_references: dict[str, Any]
+    workflow_config: Optional[CommerceStoryRunWorkflowConfigResponse] = None
     created_at: datetime
     updated_at: datetime
 
@@ -1176,7 +1235,10 @@ class CommerceCreativeBatchResponse(BaseModel):
 class CommerceCreativeIdeaSelectRequest(BaseModel):
     reviewer_label: str = Field(default="制作人", min_length=1, max_length=120)
     note: Optional[str] = Field(default=None, max_length=4000)
-    mode: str = Field(default="STEPWISE", pattern="^(STEPWISE|AUTO)$")
+    mode: Optional[str] = Field(default=None, pattern="^(STEPWISE|AUTO)$")
+    preset_key: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    preset_version_id: Optional[str] = Field(default=None, min_length=1, max_length=36)
+    run_overrides: dict[str, Any] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

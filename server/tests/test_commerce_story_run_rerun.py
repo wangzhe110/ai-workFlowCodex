@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from base64 import b64decode
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from datetime import datetime, timezone
 import os
 from pathlib import Path
@@ -52,6 +53,13 @@ from app.services.commerce_production_service import (
     lock_storyboard,
 )
 from app.services.commerce_workflow_service import cancel_story_run, rerun_story_run
+from app.services.commerce_workflow_preset_service import (
+    activate_preset_version,
+    copy_preset_draft,
+    get_preset_definition,
+    publish_preset_draft,
+    update_preset_draft,
+)
 
 
 def _video() -> bytes:
@@ -185,6 +193,62 @@ def test_rerun_api_creates_independent_run_and_preserves_source_without_dispatch
         second = client.post(f"/api/v1/commerce/story-runs/{source_id}/rerun")
         assert second.status_code == 201, second.text
         assert second.json()["run_number"] == 3
+
+
+def test_rerun_copies_frozen_config_by_default_and_can_explicitly_use_current_preset() -> None:
+    """默认重跑可复现；显式 current 才读取后来激活的预设版本。"""
+
+    with TestClient(app) as client:
+        _project_id, source_id = _source_story_run(client)
+        db = SessionLocal()
+        try:
+            source = db.get(StoryRun, source_id)
+            assert source is not None and source.workflow_config_freeze is not None
+            source_config = source.workflow_config_freeze
+            original_preset_id = source_config.preset_version_id
+            assert isinstance(original_preset_id, str)
+            definition = get_preset_definition(db, "standard")
+            assert definition.active_version_id == original_preset_id
+            draft = copy_preset_draft(db, preset_key="standard", source_version_id=original_preset_id)
+            current_config = deepcopy(draft.config)
+            current_config["target_duration_seconds"] = 45
+            update_preset_draft(
+                db,
+                version_id=draft.id,
+                config=current_config,
+                change_summary="rerun current preset fixture",
+            )
+            publish_preset_draft(db, version_id=draft.id)
+            activate_preset_version(db, preset_key="standard", version_id=draft.id)
+        finally:
+            db.close()
+
+        try:
+            copied = client.post(f"/api/v1/commerce/story-runs/{source_id}/rerun")
+            assert copied.status_code == 201, copied.text
+            current = client.post(
+                f"/api/v1/commerce/story-runs/{source_id}/rerun",
+                json={"use_current_preset": True, "preset_key": "standard"},
+            )
+            assert current.status_code == 201, current.text
+            db = SessionLocal()
+            try:
+                copied_run = db.get(StoryRun, copied.json()["id"])
+                current_run = db.get(StoryRun, current.json()["id"])
+                assert copied_run is not None and copied_run.workflow_config_freeze is not None
+                assert current_run is not None and current_run.workflow_config_freeze is not None
+                assert copied_run.workflow_config_freeze.preset_version_id == original_preset_id
+                assert copied_run.workflow_config_freeze.effective_workflow_config == source_config.effective_workflow_config
+                assert current_run.workflow_config_freeze.preset_version_id == draft.id
+                assert current_run.workflow_config_freeze.effective_workflow_config["target_duration_seconds"] == 45
+            finally:
+                db.close()
+        finally:
+            db = SessionLocal()
+            try:
+                activate_preset_version(db, preset_key="standard", version_id=original_preset_id)
+            finally:
+                db.close()
 
 
 def test_rerun_api_rejects_missing_or_incomplete_source_and_rolls_back(monkeypatch: pytest.MonkeyPatch) -> None:

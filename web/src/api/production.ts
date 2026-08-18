@@ -31,6 +31,8 @@ import type {
   CommerceReferenceIntake,
   CommerceStoryRun,
   CommerceStoryRunSelection,
+  CommerceWorkflowPreset,
+  CommerceWorkflowPresetVersion,
   CommerceVideoClip,
 } from '@/types/domain'
 
@@ -93,9 +95,41 @@ export function getCommerceCreativeBatches(projectId: string): Promise<CommerceC
 /** 选择十创意中的一个，并建立现有 Commerce StoryRun 的冻结输入证据链。 */
 export function selectCommerceCreativeIdea(
   ideaId: string,
-  payload: ReviewActionPayload & { mode?: 'STEPWISE' | 'AUTO' } = {},
+  payload: ReviewActionPayload & {
+    mode?: 'STEPWISE' | 'AUTO'
+    preset_key?: string
+    preset_version_id?: string
+    run_overrides?: Record<string, unknown>
+  } = {},
 ): Promise<CommerceStoryRunSelection> {
   return jsonPost<CommerceStoryRunSelection>(`/production/commerce-creative-ideas/${ideaId}/select`, payload)
+}
+
+/** Commerce StoryRun 创建前可选择的简单业务预设；不返回模型连接信息。 */
+export function getCommerceWorkflowPresets(): Promise<CommerceWorkflowPreset[]> {
+  return request<CommerceWorkflowPreset[]>('/commerce/workflow-presets')
+}
+
+export function getCommerceWorkflowPresetVersions(presetKey: string): Promise<CommerceWorkflowPresetVersion[]> {
+  return request<CommerceWorkflowPresetVersion[]>(`/commerce/workflow-presets/${encodeURIComponent(presetKey)}/versions`)
+}
+
+export function copyCommerceWorkflowPresetDraft(presetKey: string, sourceVersionId?: string): Promise<CommerceWorkflowPresetVersion> {
+  return jsonPost<CommerceWorkflowPresetVersion>(`/commerce/workflow-presets/${encodeURIComponent(presetKey)}/drafts`, { source_version_id: sourceVersionId })
+}
+
+export function updateCommerceWorkflowPresetDraft(versionId: string, payload: { config: Record<string, unknown>; change_summary: string }): Promise<CommerceWorkflowPresetVersion> {
+  return request<CommerceWorkflowPresetVersion>(`/commerce/workflow-preset-versions/${encodeURIComponent(versionId)}`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  })
+}
+
+export function publishCommerceWorkflowPresetDraft(versionId: string): Promise<CommerceWorkflowPresetVersion> {
+  return jsonPost<CommerceWorkflowPresetVersion>(`/commerce/workflow-preset-versions/${encodeURIComponent(versionId)}/publish`)
+}
+
+export function activateCommerceWorkflowPresetVersion(presetKey: string, versionId: string): Promise<CommerceWorkflowPreset> {
+  return jsonPost<CommerceWorkflowPreset>(`/commerce/workflow-presets/${encodeURIComponent(presetKey)}/versions/${encodeURIComponent(versionId)}/activate`)
 }
 
 /** 读取 Slice 1 已创建的 Commerce StoryRun；不再让页面从项目级“最新状态”猜当前运行。 */

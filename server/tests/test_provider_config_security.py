@@ -7,6 +7,8 @@ import pytest
 from fastapi import HTTPException
 
 from app.services.provider_config_security import (
+    assert_safe_execution_metadata,
+    classify_execution_metadata,
     find_sensitive_provider_config_paths,
     normalize_provider_config,
     redact_provider_config,
@@ -166,6 +168,75 @@ def test_ark_image_provider_rejects_unknown_configuration_fields() -> None:
         )
     assert raised.value.status_code == 422
     assert "unapproved_vendor_option" in str(raised.value.detail)
+
+
+def test_execution_snapshot_allows_registered_adapter_and_safe_connection_metadata(monkeypatch) -> None:
+    """冻结快照保留 Adapter、固定 HTTPS 地址与变量名，但绝不读取变量值。"""
+
+    monkeypatch.setenv("UNIT_TEST_EXECUTION_METADATA_KEY", "must-never-be-read")
+    config = {
+        "api_base_url": "https://reasoning.example/v1",
+        "secret_env_name": "UNIT_TEST_EXECUTION_METADATA_KEY",
+        "temperature": 0,
+        "max_tokens": 64,
+    }
+    assert_safe_execution_metadata(adapter_key="openai_compatible", provider_config=config)
+    scan = classify_execution_metadata(
+        {"adapter_key": "openai_compatible", "provider_config": config}, path="snapshot"
+    )
+    assert scan.sensitive_findings == ()
+    assert set(scan.allowed_execution_metadata) == {
+        "snapshot.adapter_key",
+        "snapshot.provider_config.api_base_url",
+        "snapshot.provider_config.secret_env_name",
+    }
+    # 校验函数没有读取环境变量，快照中也只保存变量名称。
+    assert "must-never-be-read" not in repr(config)
+
+
+@pytest.mark.parametrize(
+    ("adapter_key", "provider_config"),
+    [
+        ("not_registered_adapter", {}),
+        ("openai_compatible", {"secret_env_name": "lowercase_key"}),
+        ("openai_compatible", {"api_base_url": "https://user:pass@reasoning.example/v1"}),
+        ("openai_compatible", {"api_base_url": "https://reasoning.example/v1?token=forbidden"}),
+        ("openai_compatible", {"api_base_url": "https://reasoning.example/v1#fragment"}),
+        ("openai_compatible", {"api_base_url": "data:text/plain;base64,forbidden"}),
+        ("openai_compatible", {"headers": {"Authorization": "forbidden"}}),
+    ],
+)
+def test_execution_snapshot_rejects_unregistered_or_unsafe_metadata(
+    adapter_key: str, provider_config: dict[str, object]
+) -> None:
+    with pytest.raises(HTTPException) as raised:
+        assert_safe_execution_metadata(adapter_key=adapter_key, provider_config=provider_config)
+    assert raised.value.status_code == 422
+
+
+def test_execution_snapshot_scanner_separates_metadata_from_sensitive_values() -> None:
+    """扫描只返回路径：合法执行元数据不计为敏感，认证和签名内容必须计入。"""
+
+    scan = classify_execution_metadata(
+        {
+            "adapter_key": "openai_compatible",
+            "provider_config": {
+                "api_base_url": "https://reasoning.example/v1",
+                "secret_env_name": "YUNWU_REASONING_API_KEY",
+            },
+            "headers": {"Authorization": "not-printed"},
+            "image": "data:image/png;base64,not-printed",
+            "result_url": "https://cdn.example/result?signature=not-printed",
+        },
+        path="snapshot",
+    )
+    assert len(scan.allowed_execution_metadata) == 3
+    assert set(scan.sensitive_findings) == {
+        "snapshot.headers",
+        "snapshot.headers.Authorization",
+        "snapshot.image",
+        "snapshot.result_url",
+    }
 
 
 @pytest.mark.parametrize(

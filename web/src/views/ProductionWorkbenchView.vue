@@ -19,6 +19,7 @@ import {
   getCommerceOutlines,
   getCommerceProductionAssets,
   getCommerceStoryRuns,
+  getCommerceWorkflowPresets,
   getProductionState,
   getReferenceAnalyses,
   getSceneReferenceImages,
@@ -28,6 +29,9 @@ import {
   getV1VideoClips,
   lockCharacterReferenceImage,
   confirmCommerceProduct,
+  activateCommerceWorkflowPresetVersion,
+  copyCommerceWorkflowPresetDraft,
+  getCommerceWorkflowPresetVersions,
   lockReferenceAnalysis,
   lockCommerceCharacterDesign,
   lockCommerceProductionImage,
@@ -39,10 +43,12 @@ import {
   rejectV1VideoClip,
   selectStoryProposal,
   selectCommerceCreativeIdea,
+  publishCommerceWorkflowPresetDraft,
   confirmCommerceStage,
   reviewCommerceVideoClip,
   resumeCommerceProviderTask,
   startCommerceProduction,
+  updateCommerceWorkflowPresetDraft,
   startProductionRun,
 } from '@/api/production'
 import { apiDownloadUrl } from '@/api/http'
@@ -57,6 +63,8 @@ import type {
   CommerceReferenceIntake,
   CommerceStoryRun,
   CommerceVideoClip,
+  CommerceWorkflowPreset,
+  CommerceWorkflowPresetVersion,
   DirectorPlanV1,
   ProductionStage,
   ProductionState,
@@ -79,7 +87,16 @@ const stories = ref<StoryProposalV1[]>([])
 const commerceIntakes = ref<CommerceReferenceIntake[]>([])
 const commerceCreativeBatches = ref<CommerceCreativeBatch[]>([])
 const commerceStoryRuns = ref<CommerceStoryRun[]>([])
+const commerceWorkflowPresets = ref<CommerceWorkflowPreset[]>([])
+const commerceWorkflowPresetVersions = ref<CommerceWorkflowPresetVersion[]>([])
 const selectedCommerceStoryRunId = ref('')
+const selectedCommercePresetKey = ref('standard')
+const editingCommercePresetDraftId = ref('')
+const commercePresetAction = ref('')
+const commerceRunOverrides = ref<Record<string, unknown>>({
+  target_platform: 'douyin', target_duration_seconds: 30, aspect_ratio: '9:16',
+  visual_style: '电影短剧写实风格', execution_mode: 'STEPWISE', idea_candidate_count: 10,
+})
 const commerceOutlines = ref<CommerceOutline[]>([])
 const commerceAssets = ref<CommerceProductionAssets | null>(null)
 const productionProfiles = ref<V1ModelProfile[]>([])
@@ -149,6 +166,158 @@ const hasSourceVideo = computed(() => sourceVideos.value.length > 0)
 const latestCommerceIntake = computed(() => commerceIntakes.value[0] ?? null)
 const latestSuccessfulCreativeBatch = computed(() => commerceCreativeBatches.value.find((item) => item.status === 'SUCCEEDED') ?? null)
 const commerceProductReady = computed(() => latestCommerceIntake.value?.product_status === 'CONFIRMED' && Boolean(latestCommerceIntake.value.product_frozen_at))
+const selectedCommercePreset = computed(() => (
+  commerceWorkflowPresets.value.find((item) => item.preset_key === selectedCommercePresetKey.value)
+  ?? commerceWorkflowPresets.value.find((item) => item.preset_key === 'standard')
+  ?? null
+))
+const selectedCommercePresetConfig = computed<Record<string, unknown>>(() => (
+  selectedCommercePreset.value?.active_version?.config ?? {}
+))
+const commerceEstimatePreview = computed(() => {
+  const config = { ...selectedCommercePresetConfig.value, ...commerceRunOverrides.value }
+  const duration = Number(config.target_duration_seconds ?? 30)
+  const shot = Number(config.target_shot_duration_seconds ?? 5)
+  const shots = Math.max(1, Math.ceil(duration / Math.max(1, shot)))
+  const chapters = config.chapter_mode === 'MANUAL'
+    ? Math.max(1, Number(config.chapter_count ?? 1))
+    : Math.max(1, Math.ceil(duration / 60))
+  return {
+    duration,
+    shot,
+    chapters,
+    characters: 1,
+    scenes: chapters,
+    shots,
+    images: 1 + chapters + shots,
+    videos: shots,
+  }
+})
+const commerceQualitySlots: Record<'image' | 'video' | 'compose', string[]> = {
+  image: ['CHARACTER_IMAGE_GENERATE', 'SCENE_IMAGE_GENERATE', 'SHOT_KEYFRAME_GENERATE'],
+  video: ['VIDEO_GENERATE'],
+  compose: ['FINAL_COMPOSE'],
+}
+
+/** 只展示当前活动 Profile 明确声明的质量档位，绝不在浏览器里猜能力或自动降级。 */
+function commerceQualityPresetSupported(kind: 'image' | 'video' | 'compose', preset: 'preview' | 'standard' | 'high'): boolean {
+  return commerceQualitySlots[kind].every((slotKey) => {
+    const profile = productionProfiles.value.find((item) => item.slot_key === slotKey && item.is_enabled_in_slot)
+    return Boolean(profile?.parameter_config.presets[preset])
+  })
+}
+
+function commercePresetAvailable(preset: CommerceWorkflowPreset): boolean {
+  const config = preset.active_version?.config ?? {}
+  const image = config.image_quality_preset
+  const video = config.video_quality_preset
+  const compose = config.final_compose_quality_preset
+  if (!isQualityPreset(image) || !isQualityPreset(video) || !isQualityPreset(compose)) return false
+  return commerceQualityPresetSupported('image', image)
+    && commerceQualityPresetSupported('video', video)
+    && commerceQualityPresetSupported('compose', compose)
+}
+
+function isQualityPreset(value: unknown): value is 'preview' | 'standard' | 'high' {
+  return value === 'preview' || value === 'standard' || value === 'high'
+}
+
+function selectCommercePreset(presetKey: string): void {
+  selectedCommercePresetKey.value = presetKey
+  const preset = commerceWorkflowPresets.value.find((item) => item.preset_key === presetKey)
+  // 预设只填充前端可编辑的业务字段；模型、渠道、Key、Base URL 和原始参数都不在
+  // 浏览器状态中。创建时服务端会再次强类型校验并冻结最终有效配置。
+  commerceRunOverrides.value = { ...(preset?.active_version?.config ?? {}) }
+}
+
+/** 只提交与已选预设不同的字段，保留服务端的“预设 → 本次覆盖”来源审计。 */
+function commerceRunOverridesForRequest(): Record<string, unknown> {
+  const base = selectedCommercePresetConfig.value
+  return Object.fromEntries(
+    Object.entries(commerceRunOverrides.value).filter(([key, value]) => (
+      JSON.stringify(value) !== JSON.stringify(base[key])
+    )),
+  )
+}
+
+/** 版本管理只编辑强类型业务字段；模型、Key 和原始 Provider 参数均不进入页面。 */
+async function loadCommercePresetVersions(presetKey = selectedCommercePresetKey.value): Promise<void> {
+  if (!presetKey) return
+  commerceWorkflowPresetVersions.value = await getCommerceWorkflowPresetVersions(presetKey)
+}
+
+function shortConfigHash(value?: string): string {
+  return value ? `${value.slice(0, 10)}…` : '—'
+}
+
+async function copyCommercePresetDraft(versionId?: string): Promise<void> {
+  const presetKey = selectedCommercePresetKey.value
+  if (!presetKey) return
+  commercePresetAction.value = 'copy'
+  error.value = ''
+  try {
+    const draft = await copyCommerceWorkflowPresetDraft(presetKey, versionId)
+    editingCommercePresetDraftId.value = draft.id
+    commerceRunOverrides.value = { ...draft.config }
+    await loadCommercePresetVersions(presetKey)
+    backgroundNotice.value = `已创建 ${selectedCommercePreset.value?.display_name ?? presetKey} 的草稿 v${draft.version}。请用上方表单调整业务配置后保存。`
+  } catch (caught) {
+    error.value = caught instanceof Error ? caught.message : '创建预设草稿失败'
+  } finally {
+    commercePresetAction.value = ''
+  }
+}
+
+async function saveCommercePresetDraft(): Promise<void> {
+  if (!editingCommercePresetDraftId.value) return
+  commercePresetAction.value = 'save'
+  error.value = ''
+  try {
+    await updateCommerceWorkflowPresetDraft(editingCommercePresetDraftId.value, {
+      config: { ...commerceRunOverrides.value },
+      change_summary: '通过生产台业务配置表单更新',
+    })
+    await loadCommercePresetVersions()
+    backgroundNotice.value = '预设草稿已保存。发布后才可以被新的 StoryRun 选择。'
+  } catch (caught) {
+    error.value = caught instanceof Error ? caught.message : '保存预设草稿失败'
+  } finally {
+    commercePresetAction.value = ''
+  }
+}
+
+async function publishCommercePresetDraft(): Promise<void> {
+  if (!editingCommercePresetDraftId.value) return
+  commercePresetAction.value = 'publish'
+  error.value = ''
+  try {
+    const published = await publishCommerceWorkflowPresetDraft(editingCommercePresetDraftId.value)
+    editingCommercePresetDraftId.value = ''
+    await loadCommercePresetVersions()
+    backgroundNotice.value = `预设 v${published.version} 已发布；请选择“启用此版本”后才会成为新 Run 的默认项。`
+  } catch (caught) {
+    error.value = caught instanceof Error ? caught.message : '发布预设草稿失败'
+  } finally {
+    commercePresetAction.value = ''
+  }
+}
+
+async function activateCommercePresetVersion(versionId: string): Promise<void> {
+  const presetKey = selectedCommercePresetKey.value
+  if (!presetKey) return
+  commercePresetAction.value = `activate-${versionId}`
+  error.value = ''
+  try {
+    await activateCommerceWorkflowPresetVersion(presetKey, versionId)
+    await loadWorkbench()
+    await loadCommercePresetVersions(presetKey)
+    backgroundNotice.value = '已启用该预设版本。已创建的 StoryRun 仍使用各自冻结的配置。'
+  } catch (caught) {
+    error.value = caught instanceof Error ? caught.message : '启用预设版本失败'
+  } finally {
+    commercePresetAction.value = ''
+  }
+}
 /** Slice 1 可能保留多个历史运行；默认最近一条，但制作人可切换查看，不会混用资产。 */
 const activeCommerceStoryRun = computed(() => (
   commerceStoryRuns.value.find((item) => item.id === selectedCommerceStoryRunId.value)
@@ -269,7 +438,7 @@ async function loadWorkbench() {
   loading.value = true
   error.value = ''
   try {
-    const [nextProject, nextState, nextAnalyses, nextStories, nextCommerceIntakes, nextCommerceCreativeBatches, nextCommerceStoryRuns, nextCharacters, nextScenes, nextDirectorPlan, nextKeyframes, nextClips, nextCharacterLibraryAssets, nextSceneLibraryAssets, nextProductionProfiles] = await Promise.all([
+    const [nextProject, nextState, nextAnalyses, nextStories, nextCommerceIntakes, nextCommerceCreativeBatches, nextCommerceStoryRuns, nextCommerceWorkflowPresets, nextCharacters, nextScenes, nextDirectorPlan, nextKeyframes, nextClips, nextCharacterLibraryAssets, nextSceneLibraryAssets, nextProductionProfiles] = await Promise.all([
       getProject(props.projectId),
       getProductionState(props.projectId),
       getReferenceAnalyses(props.projectId),
@@ -277,6 +446,7 @@ async function loadWorkbench() {
       getCommerceReferenceIntakes(props.projectId),
       getCommerceCreativeBatches(props.projectId),
       getCommerceStoryRuns(props.projectId),
+      getCommerceWorkflowPresets(),
       getCharacterReferenceImages(props.projectId),
       getSceneReferenceImages(props.projectId),
       getCurrentDirectorPlan(props.projectId),
@@ -296,6 +466,10 @@ async function loadWorkbench() {
     commerceIntakes.value = nextCommerceIntakes
     commerceCreativeBatches.value = nextCommerceCreativeBatches
     commerceStoryRuns.value = nextCommerceStoryRuns
+    commerceWorkflowPresets.value = nextCommerceWorkflowPresets
+    if (!nextCommerceWorkflowPresets.some((item) => item.preset_key === selectedCommercePresetKey.value)) {
+      selectedCommercePresetKey.value = nextCommerceWorkflowPresets.find((item) => item.preset_key === 'standard')?.preset_key ?? ''
+    }
     if (!nextCommerceStoryRuns.some((item) => item.id === selectedCommerceStoryRunId.value)) {
       selectedCommerceStoryRunId.value = nextCommerceStoryRuns[0]?.id ?? ''
     }
@@ -469,7 +643,11 @@ async function confirmProductDraft(intake: CommerceReferenceIntake) {
 
 async function chooseCommerceIdea(ideaId: string) {
   await review(`commerce-idea-${ideaId}`, async () => {
-    const selection = await selectCommerceCreativeIdea(ideaId, { ...reviewPayload(), mode: 'STEPWISE' })
+    const selection = await selectCommerceCreativeIdea(ideaId, {
+      ...reviewPayload(),
+      preset_key: selectedCommercePresetKey.value || undefined,
+      run_overrides: commerceRunOverridesForRequest(),
+    })
     backgroundNotice.value = `已创建带货 StoryRun。下一步请在 Commerce 工作流中启动故事大纲：${selection.story_run_id}`
   })
 }
@@ -822,6 +1000,74 @@ watch(() => props.projectId, () => void loadWorkbench())
     <section v-if="latestSuccessfulCreativeBatch" class="panel stack review-panel">
       <div class="meta-row"><h2>固定 10 个带货故事创意</h2><span>批次 {{ latestSuccessfulCreativeBatch.batch_number }} · 使用已冻结脚本、商品、模型和 Prompt</span></div>
       <p class="muted">页面只突出最新成功批次；旧批次仍保留在数据库中用于追溯。选择后会创建现有 Commerce StoryRun，继续生成故事大纲和商品融入方案。</p>
+      <article class="asset-card stack commerce-run-config">
+        <div class="meta-row"><strong>新 StoryRun 制作预设</strong><span>创建后会冻结，不能原地修改</span></div>
+        <div class="preset-cards">
+          <button v-for="preset in commerceWorkflowPresets" :key="preset.id" type="button" class="preset-card" :disabled="!commercePresetAvailable(preset)" :class="{ selected: selectedCommercePresetKey === preset.preset_key }" @click="selectCommercePreset(preset.preset_key)">
+            <strong>{{ preset.display_name }}</strong><span>{{ preset.description }}</span><small>v{{ preset.active_version?.version ?? '—' }}</small>
+            <small v-if="!commercePresetAvailable(preset)">当前活动模型不支持此预设所需质量档位</small>
+          </button>
+        </div>
+        <div class="parameter-controls">
+          <label class="field">目标平台<input v-model="commerceRunOverrides.target_platform" maxlength="40" /></label>
+          <label class="field">目标时长（秒）<input v-model.number="commerceRunOverrides.target_duration_seconds" type="number" min="10" max="120" /></label>
+          <label class="field">成片画幅
+            <select v-model="commerceRunOverrides.aspect_ratio"><option value="9:16">9:16 竖屏</option><option value="16:9">16:9 横屏</option><option value="1:1">1:1 方形</option><option value="3:4">3:4</option><option value="4:3">4:3</option><option value="21:9">21:9</option></select>
+          </label>
+          <label class="field">画面风格<input v-model="commerceRunOverrides.visual_style" maxlength="160" /></label>
+          <label class="field">执行方式
+            <select v-model="commerceRunOverrides.execution_mode"><option value="STEPWISE">分步确认</option><option value="AUTO">自动推进</option></select>
+          </label>
+          <label class="field">创意候选数量<input v-model.number="commerceRunOverrides.idea_candidate_count" type="number" min="1" max="10" /></label>
+        </div>
+        <p class="notice info">预计 {{ commerceEstimatePreview.duration }} 秒成片（单镜约 {{ commerceEstimatePreview.shot }} 秒）：{{ commerceEstimatePreview.chapters }} 个章节 · {{ commerceEstimatePreview.characters }} 个角色图 · {{ commerceEstimatePreview.scenes }} 个场景图 · {{ commerceEstimatePreview.shots }} 个关键帧/镜头 · {{ commerceEstimatePreview.images }} 个图片任务 · {{ commerceEstimatePreview.videos }} 个视频任务。仅用于数量预估，系统不会据此提前创建生成任务或显示价格。</p>
+        <details>
+          <summary>高级设置</summary>
+          <div class="parameter-controls advanced">
+            <label class="field">语言<input v-model="commerceRunOverrides.language" maxlength="20" placeholder="zh-CN" /></label>
+            <label class="field">运行变体数<input v-model.number="commerceRunOverrides.run_variant_count" type="number" min="1" max="10" /></label>
+            <label class="field">章节方式<select v-model="commerceRunOverrides.chapter_mode"><option value="AUTO">自动章节</option><option value="MANUAL">手动章节</option></select></label>
+            <label v-if="commerceRunOverrides.chapter_mode === 'MANUAL'" class="field">章节数量<input v-model.number="commerceRunOverrides.chapter_count" type="number" min="1" max="12" /></label>
+            <label class="field">叙事节奏<select v-model="commerceRunOverrides.pacing"><option value="FAST">快</option><option value="STANDARD">标准</option><option value="SLOW">慢</option></select></label>
+            <label class="field">单镜头目标时长（秒）<input v-model.number="commerceRunOverrides.target_shot_duration_seconds" type="number" min="1" max="15" /></label>
+            <label class="field">商品植入强度<select v-model="commerceRunOverrides.product_integration"><option value="LIGHT">轻</option><option value="STANDARD">标准</option><option value="STRONG">强</option></select></label>
+            <label class="field">图片质量<select v-model="commerceRunOverrides.image_quality_preset"><option value="preview" :disabled="!commerceQualityPresetSupported('image', 'preview')">预览</option><option value="standard" :disabled="!commerceQualityPresetSupported('image', 'standard')">标准</option><option value="high" :disabled="!commerceQualityPresetSupported('image', 'high')">高质量</option></select></label>
+            <label class="field">视频质量<select v-model="commerceRunOverrides.video_quality_preset"><option value="preview" :disabled="!commerceQualityPresetSupported('video', 'preview')">预览</option><option value="standard" :disabled="!commerceQualityPresetSupported('video', 'standard')">标准</option><option value="high" :disabled="!commerceQualityPresetSupported('video', 'high')">高质量</option></select></label>
+            <label class="field">成片质量<select v-model="commerceRunOverrides.final_compose_quality_preset"><option value="preview" :disabled="!commerceQualityPresetSupported('compose', 'preview')">预览</option><option value="standard" :disabled="!commerceQualityPresetSupported('compose', 'standard')">标准</option><option value="high" :disabled="!commerceQualityPresetSupported('compose', 'high')">高质量</option></select></label>
+            <label class="field checkbox"><input v-model="commerceRunOverrides.ending_interaction_enabled" type="checkbox" />结尾互动</label>
+            <label class="field checkbox"><input v-model="commerceRunOverrides.cta_enabled" type="checkbox" />CTA</label>
+          </div>
+        </details>
+        <details class="preset-management">
+          <summary @click="loadCommercePresetVersions()">管理当前预设版本</summary>
+          <p class="muted">仅管理平台、时长、节奏和质量档位等业务配置。模型、渠道、Key、Base URL 与原始参数始终由模型中心管理，不会在这里显示或编辑。</p>
+          <div class="action-row">
+            <button class="button secondary" :disabled="Boolean(commercePresetAction)" @click="copyCommercePresetDraft()">
+              {{ commercePresetAction === 'copy' ? '正在创建草稿…' : '复制当前版本为草稿' }}
+            </button>
+            <template v-if="editingCommercePresetDraftId">
+              <button class="button secondary" :disabled="Boolean(commercePresetAction)" @click="saveCommercePresetDraft">
+                {{ commercePresetAction === 'save' ? '正在保存…' : '保存上方表单为草稿' }}
+              </button>
+              <button class="button" :disabled="Boolean(commercePresetAction)" @click="publishCommercePresetDraft">
+                {{ commercePresetAction === 'publish' ? '正在发布…' : '发布草稿' }}
+              </button>
+            </template>
+          </div>
+          <div v-if="commerceWorkflowPresetVersions.length" class="preset-version-list">
+            <div v-for="version in commerceWorkflowPresetVersions" :key="version.id" class="sub-card preset-version-row">
+              <div><strong>v{{ version.version }}</strong><span class="muted"> · {{ version.status }} · 配置哈希 {{ shortConfigHash(version.content_hash) }}</span></div>
+              <div class="action-row">
+                <button v-if="version.status === 'PUBLISHED'" class="button secondary" :disabled="Boolean(commercePresetAction)" @click="copyCommercePresetDraft(version.id)">复制为草稿</button>
+                <button v-if="version.status === 'DRAFT'" class="button secondary" :disabled="Boolean(commercePresetAction)" @click="editingCommercePresetDraftId = version.id; commerceRunOverrides = { ...version.config }">编辑这个草稿</button>
+                <button v-if="version.status === 'PUBLISHED' && selectedCommercePreset?.active_version_id !== version.id" class="button" :disabled="Boolean(commercePresetAction)" @click="activateCommercePresetVersion(version.id)">启用此版本</button>
+                <span v-else-if="version.status === 'PUBLISHED'" class="muted">当前启用</span>
+              </div>
+            </div>
+          </div>
+          <p v-else class="muted">展开后将加载该预设的历史版本。</p>
+        </details>
+      </article>
       <article v-for="idea in latestSuccessfulCreativeBatch.ideas" :key="idea.id" class="asset-card stack">
         <div class="meta-row"><strong>创意 {{ idea.candidate_number }}</strong><span class="status" :class="idea.status === 'SELECTED' ? 'SUCCEEDED' : 'PENDING'">{{ idea.status }}</span></div>
         <pre>{{ formatJson(idea.content) }}</pre>
@@ -849,7 +1095,13 @@ watch(() => props.projectId, () => void loadWorkbench())
       <p v-if="activeCommerceStoryRun.blocked_reason" class="notice info">当前闸门：{{ activeCommerceStoryRun.blocked_reason }}</p>
       <p v-if="activeCommerceStoryRun.latest_error" class="notice error">最近工作流错误：{{ activeCommerceStoryRun.latest_error }}</p>
 
-      <article class="asset-card stack production-parameters-card">
+      <article v-if="activeCommerceStoryRun.workflow_config" class="asset-card stack">
+        <div class="meta-row"><strong>本次运行的冻结制作配置</strong><span>预设 v{{ activeCommerceStoryRun.workflow_config.preset_version ?? '—' }}</span></div>
+        <p class="muted">预设、业务参数、模型 Profile 版本与 Prompt 版本已在创建 StoryRun 时冻结；后续切换模型中心或 Prompt 中心不会改变本次运行。</p>
+        <pre>{{ formatJson({ effective_config: activeCommerceStoryRun.workflow_config.effective_workflow_config, estimates: activeCommerceStoryRun.workflow_config.estimates, quality_presets: activeCommerceStoryRun.workflow_config.quality_presets_by_slot }) }}</pre>
+      </article>
+
+      <article v-if="!activeCommerceStoryRun.workflow_config" class="asset-card stack production-parameters-card">
         <div class="meta-row"><strong>本次生成配置</strong><span>创建任务时冻结，不会影响已运行任务</span></div>
         <p class="muted">普通使用只需选择质量和画幅；模型、渠道、密钥和原始模型 ID 由模型中心的正式槽位绑定决定。</p>
         <div class="parameter-controls">
@@ -872,7 +1124,7 @@ watch(() => props.projectId, () => void loadWorkbench())
           </label>
           <p v-else-if="selectedProductionParameterConfig?.capability === 'video'" class="muted parameter-rule">首帧图生视频的画幅跟随已锁定关键帧；系统不会发送或替换画幅参数。</p>
         </div>
-        <p v-if="selectedProductionProfile" class="muted">当前正式 Profile：{{ selectedProductionProfile.display_name }} · {{ selectedProductionProfile.adapter_key }} · {{ selectedProductionProfile.model_key }}</p>
+        <p v-if="selectedProductionProfile" class="muted">当前正式配置：{{ selectedProductionProfile.display_name }}</p>
         <p v-if="selectedProductionProfile && !selectedProductionProfile.parameter_config_complete" class="notice info">这个旧模型版本仍按原配置运行；建议在模型中心复制新版本后完善能力与预设。</p>
         <p v-if="selectedProductionParameterConfig && !selectedPresetSupported" class="notice error">当前 Profile 不支持所选质量预设。请换成可用预设，系统不会自动降级。</p>
         <details class="production-parameters-advanced">
@@ -1078,6 +1330,17 @@ watch(() => props.projectId, () => void loadWorkbench())
 .review-panel { margin-top: 20px; }
 .review-fields { display: grid; grid-template-columns: minmax(160px, .5fr) minmax(240px, 1.5fr); gap: 12px; }
 .asset-card { border: 1px solid #dbe3ef; border-radius: 10px; padding: 16px; }
+.preset-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
+.preset-card { display: grid; gap: 6px; padding: 13px; text-align: left; color: #334155; border: 1px solid #cbd5e1; border-radius: 9px; background: #fff; cursor: pointer; }
+.preset-card:hover, .preset-card.selected { border-color: #2563eb; background: #eff6ff; }
+.preset-card span { color: #64748b; font-size: 12px; line-height: 1.45; }
+.preset-card small { color: #2563eb; }
+.preset-management { padding: 10px 0 0; }
+.preset-management summary { cursor: pointer; color: #1d4ed8; font-weight: 600; }
+.preset-version-list { display: grid; gap: 8px; margin-top: 10px; }
+.preset-version-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.checkbox { display: flex; align-items: center; gap: 7px; }
+.checkbox input { width: auto; margin: 0; }
 .commerce-production { border-color: #bfdbfe; }
 .production-parameters-card { background: #fbfdff; }
 .parameter-controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; align-items: end; }

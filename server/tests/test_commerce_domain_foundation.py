@@ -506,7 +506,7 @@ def test_render_batch_reuses_existing_workflow_run(commerce_db) -> None:
 
 
 def test_alembic_commerce_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
-    """验证 Commerce 迁移链可往返，且最终只有当前 0021 head。"""
+    """验证 Commerce 迁移链可往返，且最终只有当前 0022 head。"""
 
     server_root = Path(__file__).resolve().parents[1]
     database_path = tmp_path / "commerce-migration.db"
@@ -528,7 +528,7 @@ def test_alembic_commerce_upgrade_downgrade_and_reupgrade(tmp_path) -> None:
 
     config = Config(str(server_root / "alembic.ini"))
     config.set_main_option("script_location", str(server_root / "migrations"))
-    assert ScriptDirectory.from_config(config).get_heads() == ["0021_commerce_story_run_rerun"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["0022_model_parameter_capabilities"]
 
     run_revision("upgrade", "0010_commerce_domain_foundation")
     run_revision("upgrade", "head")

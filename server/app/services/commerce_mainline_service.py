@@ -426,7 +426,12 @@ def execute_creative_generation(db: Session, run: WorkflowRun, *, binding: dict[
         task_type="STORY_GENERATE",
         model_profile_snapshot=deepcopy(model_snapshot),
         prompt_snapshot=deepcopy(prompt),
-        input_snapshot=deepcopy(context),
+        # 同一份解析后的参数也写进调用审计。这里不重新读取当前 Profile；绑定来自
+        # WorkflowRun 创建时冻结的 V1 快照，模型中心随后切换不会改变这次十创意。
+        input_snapshot={
+            **deepcopy(context),
+            "generation_parameters": deepcopy(model_snapshot.get("parameter_resolution") or {}),
+        },
         idempotency_key=f"{run.idempotency_key}:commerce-ideas",
         status=RunStatus.RUNNING,
     )

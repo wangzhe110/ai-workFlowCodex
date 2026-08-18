@@ -17,7 +17,7 @@ import {
   setV1ModelProfileEnabled,
   updateV1ModelProfile,
 } from '@/api/production'
-import type { ModelProfilePreflight, ModelSlot, V1ModelProfile } from '@/types/domain'
+import type { ModelParameterConfig, ModelProfilePreflight, ModelSlot, V1ModelProfile } from '@/types/domain'
 
 const slots = ref<ModelSlot[]>([])
 const profiles = ref<V1ModelProfile[]>([])
@@ -35,13 +35,16 @@ const apiBaseUrl = ref('https://yunwu.ai/v1')
 const secretEnvName = ref('YUNWU_REASONING_API_KEY')
 const imageSize = ref('2K')
 const referenceImageField = ref('images')
-const videoRatio = ref('9:16')
-const videoDuration = ref(5)
 const estimatedCost = ref<number | null>(null)
 const enableAfterSave = ref(false)
 const editingProfileId = ref<string | null>(null)
 const editingAdapterKey = ref('')
 const editingProviderConfig = ref<Record<string, unknown>>({})
+// 参数字段由服务端返回的 capability 配置驱动。浏览器没有“自定义字段名”入口，
+// 从而不能把任意供应商 JSON、Header 或密钥伪装成生成参数提交。
+const editingParameterConfig = ref<ModelParameterConfig | null>(null)
+const editingParameterDefaults = ref<Record<string, unknown>>({})
+const editingParameterPresets = ref<Record<string, Record<string, unknown>>>({})
 const preflightingProfileId = ref<string | null>(null)
 const preflights = ref<Record<string, ModelProfilePreflight>>({})
 
@@ -83,6 +86,54 @@ const editingVersionLabel = computed(() => {
   const profile = profiles.value.find((item) => item.id === editingProfileId.value)
   return profile ? `保存第 ${profile.version} 版修改` : '保存当前版本修改'
 })
+const editingProfile = computed(() => profiles.value.find((item) => item.id === editingProfileId.value) ?? null)
+const parameterPresetNames = ['preview', 'standard', 'high'] as const
+const parameterNames = computed(() => Object.keys(editingParameterConfig.value?.supported_parameters ?? {}))
+const parameterConfigLocked = computed(() => Boolean(editingProfile.value && editingProfile.value.profile_status !== 'DRAFT'))
+
+function cloneParameterConfig(value: ModelParameterConfig): ModelParameterConfig {
+  return JSON.parse(JSON.stringify(value)) as ModelParameterConfig
+}
+
+function parameterSpec(name: string): Record<string, unknown> {
+  return editingParameterConfig.value?.supported_parameters[name] ?? {}
+}
+
+function isEnumParameter(name: string): boolean {
+  return parameterSpec(name).kind === 'enum'
+}
+
+function enumValues(name: string): Array<string | number | boolean> {
+  const values = parameterSpec(name).values
+  return Array.isArray(values) ? values.filter((value): value is string | number | boolean => ['string', 'number', 'boolean'].includes(typeof value)) : []
+}
+
+function numericMinimum(name: string): number | undefined {
+  const value = parameterSpec(name).minimum
+  return typeof value === 'number' ? value : undefined
+}
+
+function numericMaximum(name: string): number | undefined {
+  const value = parameterSpec(name).maximum
+  return typeof value === 'number' ? value : undefined
+}
+
+function presetValues(name: typeof parameterPresetNames[number]): Record<string, unknown> {
+  return editingParameterPresets.value[name] ?? {}
+}
+
+function currentParameterConfig(): ModelParameterConfig | undefined {
+  if (!editingParameterConfig.value) return undefined
+  return {
+    ...cloneParameterConfig(editingParameterConfig.value),
+    defaults: { ...editingParameterDefaults.value },
+    presets: Object.fromEntries(
+      parameterPresetNames
+        .filter((preset) => Object.prototype.hasOwnProperty.call(editingParameterPresets.value, preset))
+        .map((preset) => [preset, { ...presetValues(preset) }]),
+    ) as ModelParameterConfig['presets'],
+  }
+}
 
 /** 读取服务端正式配置；删除权限、活动任务数不能由浏览器自行判断。 */
 async function load() {
@@ -146,7 +197,11 @@ function currentProviderConfig(): Record<string, unknown> {
     return withEstimatedCost(preserved)
   }
   if (isVideo.value) {
-    return withEstimatedCost({ ...preserved, secret_env_name: 'ARK_API_KEY', ratio: videoRatio.value, duration: videoDuration.value })
+    // 画幅、时长、分辨率、音频和水印都属于版本化 parameter_config；不能继续
+    // 混在连接配置中。保留旧 Profile 中的字段只用于服务端兼容读取，新草稿保存
+    // 后由 Worker 将冻结参数临时映射到供应商协议。
+    for (const name of ['ratio', 'duration', 'resolution', 'generate_audio', 'watermark']) delete preserved[name]
+    return withEstimatedCost({ ...preserved, secret_env_name: 'ARK_API_KEY' })
   }
   if (isFinalCompose.value) return withEstimatedCost(preserved)
   const config: Record<string, unknown> = {
@@ -159,10 +214,7 @@ function currentProviderConfig(): Record<string, unknown> {
     config.frame_sample_count = 6
   }
   if (isArkImage.value) {
-    config.size = '2K'
-    config.sequential_image_generation = 'disabled'
-    config.response_format = 'url'
-    config.watermark = false
+    for (const name of ['size', 'sequential_image_generation', 'response_format', 'watermark']) delete config[name]
   } else if (isImage.value && !isFalImage.value) {
     config.image_size = imageSize.value.trim()
     if (isKeyframe.value) config.reference_image_field = referenceImageField.value.trim()
@@ -183,6 +235,9 @@ function resetToCandidate() {
   editingProfileId.value = null
   editingAdapterKey.value = ''
   editingProviderConfig.value = {}
+  editingParameterConfig.value = null
+  editingParameterDefaults.value = {}
+  editingParameterPresets.value = {}
   applySlotTemplate(slotKey.value)
 }
 
@@ -200,6 +255,7 @@ async function saveCandidate() {
       display_name: displayName.value.trim(),
       model_version: modelVersion.value.trim() || undefined,
       provider_config: currentProviderConfig(),
+      ...(editingProfileId.value ? { parameter_config: currentParameterConfig() } : {}),
     }
     if (editingProfileId.value) {
       await updateV1ModelProfile(editingProfileId.value, payload)
@@ -233,6 +289,13 @@ function beginEdit(profile: V1ModelProfile) {
   editingProfileId.value = profile.id
   editingAdapterKey.value = profile.adapter_key
   editingProviderConfig.value = { ...profile.provider_config }
+  editingParameterConfig.value = cloneParameterConfig(profile.parameter_config)
+  editingParameterDefaults.value = { ...profile.parameter_config.defaults }
+  editingParameterPresets.value = Object.fromEntries(
+    parameterPresetNames
+      .filter((preset) => profile.parameter_config.presets[preset] !== undefined)
+      .map((preset) => [preset, { ...(profile.parameter_config.presets[preset] ?? {}) }]),
+  )
   slotKey.value = profile.slot_key
   modelKey.value = profile.model_key
   displayName.value = profile.display_name
@@ -241,8 +304,6 @@ function beginEdit(profile: V1ModelProfile) {
   secretEnvName.value = String(profile.provider_config.secret_env_name || '')
   imageSize.value = String(profile.provider_config.size || profile.provider_config.image_size || '')
   referenceImageField.value = String(profile.provider_config.reference_image_field || '')
-  videoRatio.value = String(profile.provider_config.ratio || '9:16')
-  videoDuration.value = Number(profile.provider_config.duration || 5)
   estimatedCost.value = typeof profile.provider_config.estimated_cost_per_call === 'number'
     ? profile.provider_config.estimated_cost_per_call
     : null
@@ -391,16 +452,8 @@ applySlotTemplate(slotKey.value)
             </el-form-item>
 
             <template v-if="isVideo">
-              <el-alert title="视频生成使用火山方舟原生协议，不需要填写 API 地址。" type="info" :closable="false" show-icon class="compact-alert" />
+              <el-alert title="视频生成使用火山方舟原生协议。时长、分辨率、音频和画幅请在下方“模型能力与参数”中按版本配置。" type="info" :closable="false" show-icon class="compact-alert" />
               <el-form-item label="模型名称"><el-input v-model="modelKey" maxlength="160" /></el-form-item>
-              <el-form-item label="视频画幅">
-                <el-select v-model="videoRatio" class="full-width">
-                  <el-option label="竖屏短剧（9:16）" value="9:16" />
-                  <el-option label="横屏（16:9）" value="16:9" />
-                  <el-option label="方形（1:1）" value="1:1" />
-                </el-select>
-              </el-form-item>
-              <el-form-item label="每段时长"><el-select v-model="videoDuration" class="full-width"><el-option :value="3" label="3 秒（测试）" /><el-option :value="5" label="5 秒（推荐）" /><el-option :value="8" label="8 秒" /></el-select></el-form-item>
             </template>
 
             <template v-else-if="isFinalCompose">
@@ -420,6 +473,47 @@ applySlotTemplate(slotKey.value)
             <template v-if="isImage && !isFalImage && !isArkImage">
               <el-form-item label="图片尺寸"><el-input v-model="imageSize" placeholder="例如 1728x2304" /></el-form-item>
               <el-form-item v-if="isKeyframe" label="中转站文档中的参考图字段名"><el-input v-model="referenceImageField" placeholder="通常为 images，以文档为准" /></el-form-item>
+            </template>
+
+            <template v-if="editingParameterConfig">
+              <el-divider content-position="left">模型能力与参数</el-divider>
+              <el-alert
+                :title="parameterConfigLocked ? '已启用版本的能力、默认值和质量预设不能原地修改；请先复制为草稿。' : '这里只能调整当前 Adapter 已声明的字段；保存后会随本 Profile 版本冻结。'"
+                :type="parameterConfigLocked ? 'warning' : 'info'"
+                :closable="false"
+                show-icon
+                class="compact-alert"
+              />
+              <div class="parameter-summary">
+                <el-tag effect="plain">能力：{{ editingParameterConfig.capability }}</el-tag>
+                <el-tag :type="editingProfile?.parameter_config_complete ? 'success' : 'warning'" effect="plain">
+                  {{ editingProfile?.parameter_config_complete ? '已保存能力版本' : '旧版本兼容视图' }}
+                </el-tag>
+              </div>
+              <template v-for="name in parameterNames" :key="`default-${name}`">
+                <el-form-item :label="`${name} 默认值`">
+                  <el-select v-if="isEnumParameter(name)" v-model="editingParameterDefaults[name]" :disabled="parameterConfigLocked" class="full-width">
+                    <el-option v-for="value in enumValues(name)" :key="String(value)" :label="String(value)" :value="value" />
+                  </el-select>
+                  <el-input-number v-else v-model="editingParameterDefaults[name]" :min="numericMinimum(name)" :max="numericMaximum(name)" :step="parameterSpec(name).kind === 'number' ? 0.1 : 1" :precision="parameterSpec(name).kind === 'number' ? 2 : 0" :disabled="parameterConfigLocked" class="full-width" controls-position="right" />
+                </el-form-item>
+              </template>
+              <div class="preset-grid">
+                <section v-for="preset in parameterPresetNames" :key="preset" class="preset-card">
+                  <div class="meta-row"><strong>{{ preset === 'preview' ? '预览' : preset === 'standard' ? '标准生产' : '高质量' }}</strong><el-tag v-if="!editingParameterPresets[preset]" type="warning" size="small">未支持</el-tag></div>
+                  <p v-if="!editingParameterPresets[preset]" class="form-help">当前 Profile 没有该预设，生产页会明确禁止选择，不会自动降级。</p>
+                  <template v-else>
+                    <template v-for="name in parameterNames" :key="`${preset}-${name}`">
+                      <label class="preset-field">{{ name }}
+                        <el-select v-if="isEnumParameter(name)" v-model="presetValues(preset)[name]" :disabled="parameterConfigLocked" class="full-width">
+                          <el-option v-for="value in enumValues(name)" :key="String(value)" :label="String(value)" :value="value" />
+                        </el-select>
+                        <el-input-number v-else v-model="presetValues(preset)[name]" :min="numericMinimum(name)" :max="numericMaximum(name)" :step="parameterSpec(name).kind === 'number' ? 0.1 : 1" :precision="parameterSpec(name).kind === 'number' ? 2 : 0" :disabled="parameterConfigLocked" class="full-width" controls-position="right" />
+                      </label>
+                    </template>
+                  </template>
+                </section>
+              </div>
             </template>
 
             <el-divider />
@@ -468,6 +562,16 @@ applySlotTemplate(slotKey.value)
                 <div class="model-key">{{ profile.model_key }}</div>
                 <div class="table-subline">{{ profile.model_version || '未填写模型版本' }}</div>
                 <div class="table-subline">{{ profile.adapter_key }} · 优先级 {{ profile.priority ?? '—' }}</div>
+              </template>
+            </el-table-column>
+            <el-table-column label="能力 / 预设" min-width="175">
+              <template #default="{ row: profile }">
+                <el-space size="small" wrap>
+                  <el-tag size="small" effect="plain">{{ profile.parameter_config.capability }}</el-tag>
+                  <el-tag v-for="preset in Object.keys(profile.parameter_config.presets)" :key="`${profile.id}-${preset}`" size="small" type="info" effect="plain">{{ preset }}</el-tag>
+                </el-space>
+                <div class="table-subline">参数：{{ Object.keys(profile.parameter_config.supported_parameters).join('、') || '无可调参数' }}</div>
+                <div v-if="!profile.parameter_config_complete" class="legacy-parameter-warning">旧版本能力配置不完整；建议复制创建新版本。</div>
               </template>
             </el-table-column>
             <el-table-column label="可操作性" min-width="180">
@@ -525,6 +629,11 @@ applySlotTemplate(slotKey.value)
 .full-width { width: 100%; }
 .form-help { margin-top: 6px; color: #909399; font-size: 12px; line-height: 1.5; }
 .compact-alert { margin: 0 0 18px; }
+.parameter-summary { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
+.preset-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 6px 0 18px; }
+.preset-card { display: grid; gap: 8px; padding: 12px; border: 1px solid #e4e7ed; border-radius: 10px; background: #fafcff; }
+.preset-field { display: grid; gap: 4px; color: #606266; font-size: 12px; }
+.legacy-parameter-warning { margin-top: 6px; color: #e6a23c; font-size: 12px; line-height: 1.45; }
 .enable-switch { margin-top: 18px; }
 .form-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 22px; }
 .count-label { padding: 0 3px; color: #606266; }
@@ -536,5 +645,6 @@ applySlotTemplate(slotKey.value)
 .row-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 0 4px; }
 .bottom-tip { margin-top: 18px; }
 @media (max-width: 1199px) { .versions-column { margin-top: 20px; } }
+@media (max-width: 900px) { .preset-grid { grid-template-columns: 1fr; } }
 @media (max-width: 640px) { .page-topbar { flex-direction: column; } .page-topbar h1 { font-size: 26px; } }
 </style>

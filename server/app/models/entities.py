@@ -1687,6 +1687,10 @@ class ModelProfile(Base):
     # 已被替换的旧版本保留为 HISTORICAL。是否允许编辑仍须以 ModelInvocation 为准。
     profile_status: Mapped[str] = mapped_column(String(20), nullable=False, default="DRAFT")
     provider_config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    # 模型的可选生成能力、默认值和质量预设。它不承载连接地址、鉴权或任意请求
+    # JSON；这些仍由 ``provider_config`` 与 Adapter 代码分别负责。历史 Profile
+    # 可以为空，并由参数服务按已验证的 Adapter 默认能力兼容读取。
+    parameter_config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     evaluations: Mapped[list["ModelEvaluation"]] = relationship(

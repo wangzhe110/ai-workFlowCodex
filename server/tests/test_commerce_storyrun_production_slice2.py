@@ -126,6 +126,94 @@ def _lock(client: TestClient, path: str) -> dict:
     return response.json()
 
 
+def test_commerce_run_freezes_selected_parameter_preset_and_new_retry_can_use_new_profile() -> None:
+    """生产 Run 必须冻结本次参数，后续 Profile 切换只能影响新的人工 retry。"""
+
+    text_parameters = {
+        "schema_version": 1,
+        "capability": "text",
+        "supported_parameters": {"temperature": {}, "max_tokens": {}},
+        "defaults": {"temperature": 0.2, "max_tokens": 256},
+        "presets": {
+            "preview": {"temperature": 0, "max_tokens": 64},
+            "standard": {"temperature": 0.2, "max_tokens": 256},
+            "high": {"temperature": 0.6, "max_tokens": 1024},
+        },
+    }
+    with TestClient(app) as client:
+        story_run_id, _ = _make_story_run(client)
+        db = SessionLocal()
+        created_profile_ids: list[str] = []
+        original_enabled: dict[str, bool] = {}
+        try:
+            slot = db.scalar(select(ModelSlot).where(ModelSlot.slot_key == "CHARACTER_DESIGN"))
+            assert slot is not None
+            existing = list(db.scalars(select(ModelSlotProfileBinding).where(ModelSlotProfileBinding.slot_id == slot.id)).all())
+            original_enabled = {binding.id: binding.is_enabled for binding in existing}
+            for binding in existing:
+                binding.is_enabled = False
+            profile_one = ModelProfile(
+                step_key="CHARACTER_DESIGN", provider_key="openai_compatible", adapter_key="openai_compatible",
+                model_key="frozen-parameter-test-v1", model_version="v1", display_name="冻结参数测试 v1",
+                version=9901, profile_status="ACTIVE",
+                provider_config={"api_base_url": "https://example.invalid/v1", "secret_env_name": "FROZEN_PARAMETER_TEST_KEY"},
+                parameter_config=text_parameters,
+                is_active=False,
+            )
+            db.add(profile_one); db.flush(); created_profile_ids.append(profile_one.id)
+            first_binding = ModelSlotProfileBinding(slot_id=slot.id, model_profile_id=profile_one.id, is_enabled=True, priority=-20)
+            db.add(first_binding); db.commit()
+
+            first, created = create_production_run(
+                db, story_run_id=story_run_id, operation="CHARACTER_DESIGN",
+                parameter_preset="preview", parameter_overrides={"temperature": 0},
+            )
+            assert created is True
+            first_frozen = first.input_snapshot["generation_parameters"]
+            assert first_frozen["selected_preset"] == "preview"
+            assert first_frozen["effective_parameters"] == {"temperature": 0, "max_tokens": 64}
+            assert first.steps[0].model_profile_snapshot["generation_parameters"] == first_frozen
+
+            # 模拟人工确认失败后，切换一个新版本，并且只让新的 retry 使用它。
+            first.status = RunStatus.FAILED
+            first.steps[0].status = RunStatus.FAILED
+            first_binding.is_enabled = False
+            profile_two = ModelProfile(
+                step_key="CHARACTER_DESIGN", provider_key="openai_compatible", adapter_key="openai_compatible",
+                model_key="frozen-parameter-test-v2", model_version="v2", display_name="冻结参数测试 v2",
+                version=9902, profile_status="ACTIVE",
+                provider_config={"api_base_url": "https://example.invalid/v1", "secret_env_name": "FROZEN_PARAMETER_TEST_KEY"},
+                parameter_config={**text_parameters, "presets": {**text_parameters["presets"], "standard": {"temperature": 0.4, "max_tokens": 512}}},
+                is_active=False,
+            )
+            db.add(profile_two); db.flush(); created_profile_ids.append(profile_two.id)
+            db.add(ModelSlotProfileBinding(slot_id=slot.id, model_profile_id=profile_two.id, is_enabled=True, priority=-20))
+            db.commit()
+
+            second, created = create_production_run(
+                db, story_run_id=story_run_id, operation="CHARACTER_DESIGN",
+                retry=True, parameter_preset="standard",
+            )
+            assert created is True
+            assert second.id != first.id
+            assert second.input_snapshot["generation_parameters"]["effective_parameters"] == {"temperature": 0.4, "max_tokens": 512}
+            db.refresh(first)
+            assert first.input_snapshot["generation_parameters"] == first_frozen
+        finally:
+            for binding in list(db.scalars(select(ModelSlotProfileBinding).where(ModelSlotProfileBinding.slot_id == slot.id)).all()):
+                if binding.model_profile_id in created_profile_ids:
+                    db.delete(binding)
+                elif binding.id in original_enabled:
+                    binding.is_enabled = original_enabled[binding.id]
+            db.flush()
+            for profile_id in created_profile_ids:
+                profile = db.get(ModelProfile, profile_id)
+                if profile is not None:
+                    db.delete(profile)
+            db.commit()
+            db.close()
+
+
 def test_storyrun_slice2_mock_chain_preserves_frozen_links_and_requires_locks() -> None:
     """文本导演链、视觉链、视频审核与 Mock 成片均留在一个已冻结 StoryRun。"""
 

@@ -33,6 +33,7 @@ from app.services.analysis_provider import (
 )
 from app.services.storage import LocalImageReference, generated_image_delivery, local_asset_storage
 from app.services.video_frame_service import extract_sampled_video_frames
+from app.services.model_parameter_service import apply_effective_parameters
 
 
 TEXT_TASK_TYPES = {
@@ -103,6 +104,7 @@ def analyze_reference_video(snapshot: dict[str, Any], source: MediaAsset) -> tup
     到 V1 的模型调用审计或前端结果中。
     """
 
+    snapshot = apply_effective_parameters(snapshot)
     assert_supported(snapshot, VIDEO_ANALYSIS_TASK_TYPE)
     if is_mock_adapter(snapshot):
         raise RuntimeError("本地模拟分析由 V1 生产服务处理，不应经过真实视觉 Adapter")
@@ -136,6 +138,7 @@ def generate_structured_text(
 ) -> dict[str, Any]:
     """使用 OpenAI 兼容文本协议获取一个已要求 JSON 的结构化结果。"""
 
+    snapshot = apply_effective_parameters(snapshot)
     assert_supported(snapshot, task_type)
     if is_mock_adapter(snapshot):
         raise RuntimeError("本地模拟文本由 V1 生产服务处理，不应经过真实文本 Adapter")
@@ -166,6 +169,7 @@ def start_image_generation(
     Fal 配置偷偷改走旧协议。
     """
 
+    snapshot = apply_effective_parameters(snapshot)
     assert_supported(snapshot, IMAGE_TASK_TYPE)
     if is_mock_adapter(snapshot):
         raise RuntimeError("本地模拟图片由 V1 生产服务处理，不应经过真实图片 Adapter")
@@ -309,6 +313,7 @@ def persist_v1_image_bytes(
 def video_provider(snapshot: dict[str, Any]) -> VideoGenerationProvider:
     """按冻结配置返回异步视频协议实现，不依赖具体视频模型名称。"""
 
+    snapshot = apply_effective_parameters(snapshot)
     assert_supported(snapshot, VIDEO_TASK_TYPE)
     key = adapter_key(snapshot)
     if key == "volcengine_ark_video":

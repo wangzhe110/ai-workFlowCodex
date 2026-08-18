@@ -36,6 +36,7 @@ from app.models import (
     WorkflowRun,
 )
 from app.services.provider_config_security import normalize_provider_config, redact_provider_config
+from app.services.model_parameter_service import profile_parameter_config, validate_parameter_config
 
 
 V1_WORKFLOW_CODE = "LEMONFLOW_PRODUCTION"
@@ -455,6 +456,7 @@ def create_v1_model_profile(
     display_name: str,
     model_version: Optional[str],
     provider_config: dict[str, Any],
+    parameter_config: Optional[dict[str, Any]] = None,
     enable_in_slot: bool,
     replace_existing: bool,
     priority: int,
@@ -481,6 +483,9 @@ def create_v1_model_profile(
     config = _normalize_v1_provider_config(clean_adapter, provider_config)
     _validate_v1_profile_config(clean_slot, clean_adapter, config)
     _validate_v1_model_key(clean_adapter, clean_model_key)
+    stored_parameter_config, _ = profile_parameter_config(clean_adapter, config, parameter_config or {})
+    if parameter_config:
+        stored_parameter_config = validate_parameter_config(clean_adapter, parameter_config)
     version = db.scalar(select(func.max(ModelProfile.version)).where(ModelProfile.step_key == clean_slot)) or 0
     profile = ModelProfile(
         step_key=clean_slot,
@@ -491,6 +496,7 @@ def create_v1_model_profile(
         display_name=clean_display_name,
         version=version + 1,
         provider_config=config,
+        parameter_config=stored_parameter_config,
         # V1 使用槽位绑定决定启用态，避免旧流程的“活动模型”混入新主流程。
         is_active=False,
         profile_status="DRAFT",
@@ -614,6 +620,7 @@ def update_v1_model_profile(
     display_name: str,
     model_version: Optional[str],
     provider_config: dict[str, Any],
+    parameter_config: Optional[dict[str, Any]] = None,
 ) -> ModelProfile:
     """更新尚未产生调用记录的同一模型版本。
 
@@ -639,6 +646,19 @@ def update_v1_model_profile(
     config = _normalize_v1_provider_config(clean_adapter, provider_config)
     _validate_v1_profile_config(profile.step_key, clean_adapter, config)
     _validate_v1_model_key(clean_adapter, clean_model_key)
+    if parameter_config is not None:
+        requested = validate_parameter_config(clean_adapter, parameter_config)
+        current, current_is_explicit = profile_parameter_config(
+            profile.adapter_key or profile.provider_key, profile.provider_config, profile.parameter_config
+        )
+        needs_parameter_config_write = requested != current or not current_is_explicit
+        if needs_parameter_config_write and profile.profile_status != "DRAFT":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="模型能力、默认参数和质量预设属于版本化配置；请复制创建新版本后修改",
+            )
+        if needs_parameter_config_write:
+            profile.parameter_config = requested
     profile.provider_key = clean_adapter
     profile.adapter_key = clean_adapter
     profile.model_key = clean_model_key
@@ -667,6 +687,13 @@ def copy_v1_model_profile(db: Session, profile_id: str) -> ModelProfile:
         version=version + 1,
         profile_status="DRAFT",
         provider_config=redact_provider_config(source.provider_config),
+        # 历史 Profile 的空 JSON 只代表它早于能力配置字段，并不代表没有能力。
+        # 复制为新 Draft 时将服务端兼容推导结果物化，之后该版本即可被冻结使用。
+        parameter_config=profile_parameter_config(
+            source.adapter_key or source.provider_key,
+            source.provider_config or {},
+            source.parameter_config,
+        )[0],
         is_active=False,
     )
     db.add(copied)
@@ -721,6 +748,7 @@ def bind_profile_to_slot(
     priority: int,
     weight: Optional[float],
     replace_existing: bool = False,
+    replace_profile_id: Optional[str] = None,
 ) -> ModelSlotProfileBinding:
     """把一个已存在的安全模型配置绑定到能力槽位，不在此处读取真实密钥。"""
 
@@ -787,14 +815,25 @@ def bind_profile_to_slot(
         profile.profile_status = "ACTIVE"
     else:
         profile.profile_status = "HISTORICAL" if profile_has_model_invocations(db, profile.id) else "DRAFT"
-    if enabled and replace_existing and slot.selection_mode == ModelSelectionMode.SINGLE:
-        for existing in db.scalars(
-            select(ModelSlotProfileBinding).where(
-                ModelSlotProfileBinding.slot_id == slot.id,
-                ModelSlotProfileBinding.is_enabled.is_(True),
-                ModelSlotProfileBinding.model_profile_id != profile.id,
+    if replace_profile_id is not None and replace_profile_id == profile.id:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="替代目标不能是当前模型版本")
+    if enabled and replace_existing:
+        replacement_query = select(ModelSlotProfileBinding).where(
+            ModelSlotProfileBinding.slot_id == slot.id,
+            ModelSlotProfileBinding.is_enabled.is_(True),
+            ModelSlotProfileBinding.model_profile_id != profile.id,
+        )
+        if replace_profile_id is not None:
+            replacement_query = replacement_query.where(ModelSlotProfileBinding.model_profile_id == replace_profile_id)
+        elif slot.selection_mode == ModelSelectionMode.MULTI_PARALLEL:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="并行模型槽位替换必须明确指定旧模型版本",
             )
-        ):
+        replacements = list(db.scalars(replacement_query).all())
+        if replace_profile_id is not None and not replacements:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="指定的旧模型未在当前槽位启用")
+        for existing in replacements:
             existing.is_enabled = False
             previous_profile = db.get(ModelProfile, existing.model_profile_id)
             if previous_profile is not None:

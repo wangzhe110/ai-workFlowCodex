@@ -648,6 +648,8 @@ export interface V1ModelProfile {
   model_version: string | null
   version: number
   provider_config: Record<string, unknown>
+  parameter_config: ModelParameterConfig
+  parameter_config_complete: boolean
   is_bound: boolean
   is_enabled_in_slot: boolean
   priority: number | null
@@ -660,6 +662,14 @@ export interface V1ModelProfile {
   created_at: string
 }
 
+export interface ModelParameterConfig {
+  schema_version: number
+  capability: 'text' | 'image' | 'video' | 'local_compose'
+  supported_parameters: Record<string, Record<string, unknown>>
+  defaults: Record<string, unknown>
+  presets: Partial<Record<'preview' | 'standard' | 'high', Record<string, unknown>>>
+}
+
 export interface V1ModelProfileCreatePayload {
   slot_key: string
   adapter_key: string
@@ -667,6 +677,7 @@ export interface V1ModelProfileCreatePayload {
   display_name: string
   model_version?: string
   provider_config: Record<string, unknown>
+  parameter_config?: ModelParameterConfig
   enable_in_slot: boolean
   replace_existing: boolean
   priority?: number
@@ -678,6 +689,7 @@ export interface V1ModelProfileUpdatePayload {
   display_name: string
   model_version?: string
   provider_config: Record<string, unknown>
+  parameter_config?: ModelParameterConfig
 }
 
 /** 可版本化的生产 Prompt；真实调用会另外冻结一份快照。 */

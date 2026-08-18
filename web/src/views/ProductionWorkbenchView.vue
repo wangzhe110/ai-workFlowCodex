@@ -24,6 +24,7 @@ import {
   getSceneReferenceImages,
   getShotKeyframes,
   getStoryProposals,
+  getV1ModelProfiles,
   getV1VideoClips,
   lockCharacterReferenceImage,
   confirmCommerceProduct,
@@ -66,6 +67,7 @@ import type {
   ShotKeyframeV1,
   StoryProposalV1,
   VideoClipV1,
+  V1ModelProfile,
 } from '@/types/domain'
 
 const props = defineProps<{ projectId: string }>()
@@ -80,6 +82,7 @@ const commerceStoryRuns = ref<CommerceStoryRun[]>([])
 const selectedCommerceStoryRunId = ref('')
 const commerceOutlines = ref<CommerceOutline[]>([])
 const commerceAssets = ref<CommerceProductionAssets | null>(null)
+const productionProfiles = ref<V1ModelProfile[]>([])
 const characterImages = ref<CharacterReferenceImageV1[]>([])
 const sceneImages = ref<SceneReferenceImageV1[]>([])
 const keyframes = ref<ShotKeyframeV1[]>([])
@@ -102,6 +105,28 @@ const generatingKey = ref('')
 const recoveringClipId = ref('')
 const error = ref('')
 const backgroundNotice = ref('')
+// 生产台只选择质量和少量已经由当前 Profile 声明的生成参数；模型、Key、渠道和
+// Base URL 永远由模型中心槽位决定，不能在这里临时绕过冻结配置。
+const productionParameterOperation = ref('CHARACTER_DESIGN')
+const productionParameterPreset = ref<'preview' | 'standard' | 'high'>('standard')
+const productionParameterOverrides = ref<Record<string, unknown>>({})
+
+const commerceOperationSlots: Record<string, string | null> = {
+  CHARACTER_DESIGN: 'CHARACTER_DESIGN',
+  SCENE_DESIGN: 'SCENE_DESIGN',
+  STORYBOARD: 'DIRECTOR_PLAN',
+  CHARACTER_IMAGES: 'CHARACTER_IMAGE_GENERATE',
+  SCENE_IMAGES: 'SCENE_IMAGE_GENERATE',
+  SHOT_KEYFRAME: 'SHOT_KEYFRAME_GENERATE',
+  VIDEO_PROMPT: 'DIRECTOR_PLAN',
+  VIDEO_RENDER: 'VIDEO_GENERATE',
+  FINAL_COMPOSE: 'FINAL_COMPOSE',
+}
+const commerceOperationLabels: Record<string, string> = {
+  CHARACTER_DESIGN: '角色设定', SCENE_DESIGN: '场景设定', STORYBOARD: 'AI 导演分镜',
+  CHARACTER_IMAGES: '角色图', SCENE_IMAGES: '场景图', SHOT_KEYFRAME: '分镜关键帧',
+  VIDEO_PROMPT: '视频 Prompt', VIDEO_RENDER: '逐镜视频', FINAL_COMPOSE: 'FFmpeg 合成',
+}
 
 /** 正式主链路固定顺序；只用于进度展示，真正的放行规则始终由后端状态机判断。 */
 const stages: Array<{ key: ProductionStage; label: string; description: string }> = [
@@ -131,6 +156,80 @@ const activeCommerceStoryRun = computed(() => (
   ?? null
 ))
 const activeCommerceStoryboard = computed(() => commerceAssets.value?.storyboards.find((item) => item.status === 'LOCKED') ?? null)
+const selectedProductionProfile = computed(() => {
+  const slotKey = commerceOperationSlots[productionParameterOperation.value]
+  if (!slotKey) return null
+  return productionProfiles.value.find((profile) => profile.slot_key === slotKey && profile.is_enabled_in_slot) ?? null
+})
+const selectedProductionParameterConfig = computed(() => selectedProductionProfile.value?.parameter_config ?? null)
+const selectedPresetSupported = computed(() => Boolean(selectedProductionParameterConfig.value?.presets[productionParameterPreset.value]))
+const productionParameterNames = computed(() => Object.keys(selectedProductionParameterConfig.value?.supported_parameters ?? {}))
+const selectedProductionInputMode = computed(() => {
+  const preset = selectedProductionParameterConfig.value?.presets[productionParameterPreset.value] ?? {}
+  return productionParameterOverrides.value.input_mode ?? preset.input_mode ?? selectedProductionParameterConfig.value?.defaults.input_mode
+})
+
+function productionParameterSpec(name: string): Record<string, unknown> {
+  return selectedProductionParameterConfig.value?.supported_parameters[name] ?? {}
+}
+
+function productionParameterEnumValues(name: string): Array<string | number | boolean> {
+  const values = productionParameterSpec(name).values
+  return Array.isArray(values) ? values.filter((value): value is string | number | boolean => ['string', 'number', 'boolean'].includes(typeof value)) : []
+}
+
+function productionParameterMin(name: string): number | undefined {
+  const value = productionParameterSpec(name).minimum
+  return typeof value === 'number' ? value : undefined
+}
+
+function productionParameterMax(name: string): number | undefined {
+  const value = productionParameterSpec(name).maximum
+  return typeof value === 'number' ? value : undefined
+}
+
+function isProductionParameterEnum(name: string): boolean {
+  return productionParameterSpec(name).kind === 'enum'
+}
+
+function productionParameterValue(name: string): unknown {
+  const preset = selectedProductionParameterConfig.value?.presets[productionParameterPreset.value] ?? {}
+  return productionParameterOverrides.value[name]
+    ?? preset[name]
+    ?? selectedProductionParameterConfig.value?.defaults[name]
+}
+
+function setProductionParameterValue(name: string, rawValue: string): void {
+  let value: unknown = rawValue
+  if (isProductionParameterEnum(name)) {
+    value = productionParameterEnumValues(name).find((candidate) => String(candidate) === rawValue)
+  } else if (productionParameterSpec(name).kind === 'integer' || productionParameterSpec(name).kind === 'number') {
+    value = Number(rawValue)
+  }
+  productionParameterOverrides.value = { ...productionParameterOverrides.value, [name]: value }
+}
+
+/** 只从当前 Profile 声明的安全字段中采集 UI 值；首帧视频画幅由后端规则处理。 */
+function productionOverridesFor(operation: string): Record<string, unknown> {
+  const slotKey = commerceOperationSlots[operation]
+  const profile = productionProfiles.value.find((item) => item.slot_key === slotKey && item.is_enabled_in_slot)
+  const supported = profile?.parameter_config.supported_parameters ?? {}
+  const allowedUiFields = new Set(['aspect_ratio', 'size', 'duration', 'resolution', 'generate_audio', 'watermark'])
+  return Object.fromEntries(
+    Object.entries(productionParameterOverrides.value).filter(([name, value]) => (
+      allowedUiFields.has(name) && Object.prototype.hasOwnProperty.call(supported, name) && value !== undefined && value !== ''
+    )),
+  )
+}
+
+function selectProductionParameterOperation(operation: string, resetToProfileDefaults = true): void {
+  productionParameterOperation.value = operation
+  // 新操作不把默认值伪装成本次覆盖。界面通过 productionParameterValue 回显 Profile
+  // 默认/预设，只有用户实际改动的值才会作为 run_override 冻结进任务。
+  if (resetToProfileDefaults) {
+    productionParameterOverrides.value = {}
+  }
+}
 /**
  * 页面只负责把后端前置条件提前说明给制作人；真正的放行仍由 StoryRun 服务端用冻结
  * 版本校验，因此手工改 DOM、刷新页面或多个标签页都不能跳过任何审核闸门。
@@ -170,7 +269,7 @@ async function loadWorkbench() {
   loading.value = true
   error.value = ''
   try {
-    const [nextProject, nextState, nextAnalyses, nextStories, nextCommerceIntakes, nextCommerceCreativeBatches, nextCommerceStoryRuns, nextCharacters, nextScenes, nextDirectorPlan, nextKeyframes, nextClips, nextCharacterLibraryAssets, nextSceneLibraryAssets] = await Promise.all([
+    const [nextProject, nextState, nextAnalyses, nextStories, nextCommerceIntakes, nextCommerceCreativeBatches, nextCommerceStoryRuns, nextCharacters, nextScenes, nextDirectorPlan, nextKeyframes, nextClips, nextCharacterLibraryAssets, nextSceneLibraryAssets, nextProductionProfiles] = await Promise.all([
       getProject(props.projectId),
       getProductionState(props.projectId),
       getReferenceAnalyses(props.projectId),
@@ -185,6 +284,7 @@ async function loadWorkbench() {
       getV1VideoClips(props.projectId),
       getCharacterAssets(),
       getSceneAssets(),
+      getV1ModelProfiles(),
     ])
     project.value = nextProject
     if (!nextProject.assets.some((asset) => asset.id === selectedSourceAssetId.value)) {
@@ -218,6 +318,10 @@ async function loadWorkbench() {
     videoClips.value = nextClips
     characterLibraryAssets.value = nextCharacterLibraryAssets
     sceneLibraryAssets.value = nextSceneLibraryAssets
+    productionProfiles.value = nextProductionProfiles
+    if (!Object.keys(productionParameterOverrides.value).length) {
+      selectProductionParameterOperation(productionParameterOperation.value)
+    }
   } catch (caught) {
     error.value = caught instanceof Error ? caught.message : '加载生产台失败，请刷新后重试'
   } finally {
@@ -377,12 +481,25 @@ async function startCommerceOperation(operation: string, label: string, targetId
     error.value = '请先从固定 10 个创意中选择一个，创建带货 StoryRun'
     return
   }
+  selectProductionParameterOperation(operation, false)
+  const currentProfile = productionProfiles.value.find(
+    (profile) => profile.slot_key === commerceOperationSlots[operation] && profile.is_enabled_in_slot,
+  )
+  if (currentProfile && !currentProfile.parameter_config.presets[productionParameterPreset.value]) {
+    error.value = `当前 ${label} 模型不支持“${productionParameterPreset.value}”质量预设；请在模型中心复制新版本后配置，或选择该模型支持的预设。`
+    return
+  }
   const key = `commerce:${operation}:${targetId || 'all'}:${retry ? 'retry' : 'new'}`
   generatingKey.value = key
   error.value = ''
   backgroundNotice.value = ''
   try {
-    const run = await startCommerceProduction(storyRun.id, operation, { target_id: targetId, retry })
+    const run = await startCommerceProduction(storyRun.id, operation, {
+      target_id: targetId,
+      retry,
+      parameter_preset: productionParameterPreset.value,
+      parameter_overrides: productionOverridesFor(operation),
+    })
     let latest = run
     for (let attempt = 0; attempt < 15 && ['PENDING', 'RUNNING'].includes(latest.status); attempt += 1) {
       await new Promise((resolve) => window.setTimeout(resolve, 2000))
@@ -732,6 +849,47 @@ watch(() => props.projectId, () => void loadWorkbench())
       <p v-if="activeCommerceStoryRun.blocked_reason" class="notice info">当前闸门：{{ activeCommerceStoryRun.blocked_reason }}</p>
       <p v-if="activeCommerceStoryRun.latest_error" class="notice error">最近工作流错误：{{ activeCommerceStoryRun.latest_error }}</p>
 
+      <article class="asset-card stack production-parameters-card">
+        <div class="meta-row"><strong>本次生成配置</strong><span>创建任务时冻结，不会影响已运行任务</span></div>
+        <p class="muted">普通使用只需选择质量和画幅；模型、渠道、密钥和原始模型 ID 由模型中心的正式槽位绑定决定。</p>
+        <div class="parameter-controls">
+          <label class="field">配置面向的下一步
+            <select :value="productionParameterOperation" @change="selectProductionParameterOperation(($event.target as HTMLSelectElement).value)">
+              <option v-for="(label, operation) in commerceOperationLabels" :key="operation" :value="operation">{{ label }}</option>
+            </select>
+          </label>
+          <label class="field">质量预设
+            <select v-model="productionParameterPreset">
+              <option value="preview" :disabled="!selectedProductionParameterConfig?.presets.preview">预览</option>
+              <option value="standard" :disabled="!selectedProductionParameterConfig?.presets.standard">标准生产</option>
+              <option value="high" :disabled="!selectedProductionParameterConfig?.presets.high">高质量</option>
+            </select>
+          </label>
+          <label v-if="selectedProductionParameterConfig?.supported_parameters.aspect_ratio && selectedProductionInputMode !== 'first_frame'" class="field">成片画幅
+            <select :value="productionParameterValue('aspect_ratio')" @change="setProductionParameterValue('aspect_ratio', ($event.target as HTMLSelectElement).value)">
+              <option v-for="value in productionParameterEnumValues('aspect_ratio')" :key="String(value)" :value="value">{{ String(value) }}</option>
+            </select>
+          </label>
+          <p v-else-if="selectedProductionParameterConfig?.capability === 'video'" class="muted parameter-rule">首帧图生视频的画幅跟随已锁定关键帧；系统不会发送或替换画幅参数。</p>
+        </div>
+        <p v-if="selectedProductionProfile" class="muted">当前正式 Profile：{{ selectedProductionProfile.display_name }} · {{ selectedProductionProfile.adapter_key }} · {{ selectedProductionProfile.model_key }}</p>
+        <p v-if="selectedProductionProfile && !selectedProductionProfile.parameter_config_complete" class="notice info">这个旧模型版本仍按原配置运行；建议在模型中心复制新版本后完善能力与预设。</p>
+        <p v-if="selectedProductionParameterConfig && !selectedPresetSupported" class="notice error">当前 Profile 不支持所选质量预设。请换成可用预设，系统不会自动降级。</p>
+        <details class="production-parameters-advanced">
+          <summary>高级设置（仅显示当前模型支持的字段）</summary>
+          <div class="parameter-controls advanced">
+            <template v-for="name in productionParameterNames.filter((item) => !['input_mode', 'aspect_ratio'].includes(item))" :key="name">
+              <label class="field">{{ name }}
+                <select v-if="isProductionParameterEnum(name)" :value="productionParameterValue(name)" @change="setProductionParameterValue(name, ($event.target as HTMLSelectElement).value)">
+                  <option v-for="value in productionParameterEnumValues(name)" :key="String(value)" :value="value">{{ String(value) }}</option>
+                </select>
+                <input v-else type="number" :value="productionParameterValue(name)" :min="productionParameterMin(name)" :max="productionParameterMax(name)" :step="productionParameterSpec(name).kind === 'number' ? 0.1 : 1" @input="setProductionParameterValue(name, ($event.target as HTMLInputElement).value)" />
+              </label>
+            </template>
+          </div>
+        </details>
+      </article>
+
       <article class="asset-card stack">
         <div class="meta-row"><strong>0. 大纲与商品融入方案</strong><span>{{ commerceOutlines.length }} 个版本</span></div>
         <template v-if="commerceOutlines.length">
@@ -921,6 +1079,12 @@ watch(() => props.projectId, () => void loadWorkbench())
 .review-fields { display: grid; grid-template-columns: minmax(160px, .5fr) minmax(240px, 1.5fr); gap: 12px; }
 .asset-card { border: 1px solid #dbe3ef; border-radius: 10px; padding: 16px; }
 .commerce-production { border-color: #bfdbfe; }
+.production-parameters-card { background: #fbfdff; }
+.parameter-controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; align-items: end; }
+.parameter-controls.advanced { margin-top: 12px; }
+.parameter-controls select, .parameter-controls input { width: 100%; margin-top: 5px; }
+.parameter-rule { align-self: end; margin: 0; }
+.production-parameters-advanced { margin-top: 4px; background: #fff; }
 .sub-card { padding: 12px; border: 1px solid #e2e8f0; border-radius: 8px; background: #fcfdff; }
 .shot-production-card { padding: 13px; border-left: 3px solid #60a5fa; background: #f8fbff; }
 .media-row { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 14px; align-items: start; padding: 12px; border: 1px solid #e2e8f0; border-radius: 8px; }

@@ -624,6 +624,9 @@ class ModelSlotBindingRequest(BaseModel):
     # 只有用户在模型中心明确确认时，单模型槽位才会停用旧绑定并切换到新配置。
     # 它不是模型质量系统的自动切换开关。
     replace_existing: bool = False
+    # ``MULTI_PARALLEL`` 槽位存在多个候选时，版本化替换必须明确指出要替代的
+    # 旧 Profile，避免一次模型升级误停用其他并行候选。
+    replace_profile_id: Optional[str] = Field(default=None, min_length=1, max_length=36)
     priority: int = Field(default=100, ge=0, le=10_000)
     weight: Optional[float] = Field(default=None, gt=0, le=1)
 
@@ -649,6 +652,7 @@ class V1ModelProfileCreateRequest(BaseModel):
     display_name: str = Field(min_length=1, max_length=160)
     model_version: Optional[str] = Field(default=None, max_length=160)
     provider_config: dict[str, Any] = Field(default_factory=dict)
+    parameter_config: dict[str, Any] = Field(default_factory=dict)
     enable_in_slot: bool = False
     replace_existing: bool = False
     priority: int = Field(default=100, ge=0, le=10_000)
@@ -665,6 +669,8 @@ class V1ModelProfileResponse(BaseModel):
     model_version: Optional[str]
     version: int
     provider_config: dict[str, Any]
+    parameter_config: dict[str, Any]
+    parameter_config_complete: bool
     is_bound: bool
     is_enabled_in_slot: bool
     priority: Optional[int]
@@ -685,6 +691,8 @@ class V1ModelProfileUpdateRequest(BaseModel):
     display_name: str = Field(min_length=1, max_length=160)
     model_version: Optional[str] = Field(default=None, max_length=160)
     provider_config: dict[str, Any] = Field(default_factory=dict)
+    # 能力/默认值/预设属于版本化生产事实，不能通过 PATCH 覆盖；必须复制新版本。
+    parameter_config: Optional[dict[str, Any]] = None
 
 
 class ModelQualityEvaluationResponse(BaseModel):
@@ -879,6 +887,10 @@ class CommerceProductionActionRequest(BaseModel):
 
     target_id: Optional[str] = Field(default=None, min_length=1, max_length=80)
     retry: bool = False
+    # 只允许当前 Adapter 已声明的参数。后端在创建任务前解析、校验并冻结；浏览器
+    # 不得传入任意 Header、URL、字段名或供应商请求体。
+    parameter_preset: str = Field(default="standard", pattern="^(preview|standard|high)$")
+    parameter_overrides: dict[str, Any] = Field(default_factory=dict)
 
 
 class CommerceProductionReviewRequest(BaseModel):

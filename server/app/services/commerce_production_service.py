@@ -69,6 +69,10 @@ from app.services.v1_model_adapter_service import (
     wait_for_video_result,
 )
 from app.services.provider_config_security import redact_provider_config
+from app.services.model_parameter_service import (
+    profile_parameter_config,
+    resolve_effective_model_parameters,
+)
 from app.services.sensitive_data import sanitize_error_summary
 
 
@@ -242,7 +246,7 @@ def _profile_snapshot(db: Session, binding, slot_key: str) -> dict[str, Any]:
     slot = db.get(ModelSlot, binding.slot_id)
     if profile is None or slot is None:
         _error("模型中心存在无效绑定", status.HTTP_503_SERVICE_UNAVAILABLE)
-    return {
+    profile_snapshot = {
         "slot_id": slot.id,
         "slot_key": slot_key,
         "model_profile_id": profile.id,
@@ -256,9 +260,22 @@ def _profile_snapshot(db: Session, binding, slot_key: str) -> dict[str, Any]:
             "provider_config": redact_provider_config(profile.provider_config),
         },
     }
+    parameter_config, _ = profile_parameter_config(
+        profile_snapshot["profile_snapshot"]["adapter_key"],
+        profile_snapshot["profile_snapshot"]["provider_config"],
+        profile.parameter_config,
+    )
+    profile_snapshot["profile_snapshot"]["parameter_config"] = parameter_config
+    return profile_snapshot
 
 
-def _freeze_model_and_prompt(db: Session, operation: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+def _freeze_model_and_prompt(
+    db: Session,
+    operation: str,
+    *,
+    parameter_preset: str = "standard",
+    parameter_overrides: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     slot_key, task_type = OPERATION_SPECS[operation]
     if slot_key is None:
         return None, None
@@ -266,6 +283,15 @@ def _freeze_model_and_prompt(db: Session, operation: str) -> tuple[dict[str, Any
     if not bindings:
         _error(f"模型槽位 {slot_key} 未启用模型配置", status.HTTP_503_SERVICE_UNAVAILABLE)
     binding = _profile_snapshot(db, bindings[0], slot_key)
+    execution_context = {"operation": operation}
+    if operation == "VIDEO_RENDER":
+        execution_context["input_mode"] = "first_frame"
+    binding["profile_snapshot"]["parameter_resolution"] = resolve_effective_model_parameters(
+        binding["profile_snapshot"],
+        preset=parameter_preset,
+        run_overrides=parameter_overrides or {},
+        execution_context=execution_context,
+    )
     prompt = db.scalars(
         select(PromptTemplate)
         .where(PromptTemplate.task_type == task_type, PromptTemplate.status == PromptTemplateStatus.ACTIVE)
@@ -358,7 +384,14 @@ def _active_run_for_context(db: Session, *, project_id: str, workflow_key: str, 
 
 
 def create_production_run(
-    db: Session, *, story_run_id: str, operation: str, target_id: str | None = None, retry: bool = False
+    db: Session,
+    *,
+    story_run_id: str,
+    operation: str,
+    target_id: str | None = None,
+    retry: bool = False,
+    parameter_preset: str = "standard",
+    parameter_overrides: dict[str, Any] | None = None,
 ) -> tuple[WorkflowRun, bool]:
     """创建一个冻结的 Slice 2 子任务，重复点击只返回同一个活动任务。"""
 
@@ -367,7 +400,9 @@ def create_production_run(
         _error("未知的 Commerce 生产操作", status.HTTP_422_UNPROCESSABLE_CONTENT)
     story_run = _story_run(db, story_run_id)
     context = _operation_prerequisites(db, story_run, operation, target_id)
-    binding, prompt = _freeze_model_and_prompt(db, operation)
+    binding, prompt = _freeze_model_and_prompt(
+        db, operation, parameter_preset=parameter_preset, parameter_overrides=parameter_overrides
+    )
     definition = ensure_commerce_foundation(db)
     semantic = _fingerprint(context, retry=retry)
     key = f"commerce-production:{story_run.id}:{operation}:{target_id or 'all'}:{semantic}"
@@ -385,6 +420,9 @@ def create_production_run(
         "commerce_production": context,
         "model_binding": deepcopy(binding),
         "prompt_template": deepcopy(prompt),
+        "generation_parameters": deepcopy(
+            ((binding or {}).get("profile_snapshot") or {}).get("parameter_resolution") or {}
+        ),
     }
     run_row = WorkflowRun(
         project_id=story_run.project_id,
@@ -401,7 +439,13 @@ def create_production_run(
         position=1,
         attempt=1,
         input_payload=deepcopy(snapshot),
-        model_profile_snapshot={"binding": deepcopy(binding), "prompt_template": deepcopy(prompt)},
+        model_profile_snapshot={
+            "binding": deepcopy(binding),
+            "prompt_template": deepcopy(prompt),
+            "generation_parameters": deepcopy(
+                ((binding or {}).get("profile_snapshot") or {}).get("parameter_resolution") or {}
+            ),
+        },
         idempotency_key=f"step:{sha256((idempotency_key + ':step').encode()).hexdigest()}",
     )
     db.add_all([run_row, step])
@@ -633,6 +677,11 @@ def _start_invocation(
         profile_snapshot.get("provider_config")
     )
     input_snapshot = deepcopy((run_row.input_snapshot or {}).get("commerce_production") or {})
+    # 调用审计也保存同一份运行时参数冻结，不能只依赖父 Run 的 JSON。
+    # 这样某次图片/视频/文本调用可在不回读当前模型中心的前提下单独复现。
+    input_snapshot["generation_parameters"] = deepcopy(
+        (run_row.input_snapshot or {}).get("generation_parameters") or {}
+    )
     recovery = _provider_task_recovery(run_row.input_snapshot or {})
     if recovery is not None:
         input_snapshot["provider_task_recovery"] = {

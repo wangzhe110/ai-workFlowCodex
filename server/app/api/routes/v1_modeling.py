@@ -42,6 +42,7 @@ from app.services.v1_configuration_service import (
 )
 from app.services.v1_quality_service import list_latest_quality_evaluations, refresh_quality_evaluations
 from app.services.provider_config_security import redact_provider_config
+from app.services.model_parameter_service import profile_parameter_config
 
 
 router = APIRouter(prefix="/api/v1/production", tags=["V1 模型与 Prompt 配置"])
@@ -77,6 +78,9 @@ def _v1_profile_response(db: Session, profile, binding) -> V1ModelProfileRespons
 
     has_model_invocations = profile_has_model_invocations(db, profile.id)
     active_run_count, delete_block_reason = model_profile_deletion_status(db, profile)
+    parameter_config, complete = profile_parameter_config(
+        profile.adapter_key or profile.provider_key, profile.provider_config, profile.parameter_config
+    )
     return V1ModelProfileResponse(
         id=profile.id,
         slot_key=profile.step_key,
@@ -86,6 +90,8 @@ def _v1_profile_response(db: Session, profile, binding) -> V1ModelProfileRespons
         model_version=profile.model_version,
         version=profile.version,
         provider_config=redact_provider_config(profile.provider_config),
+        parameter_config=parameter_config,
+        parameter_config_complete=complete,
         is_bound=binding is not None,
         is_enabled_in_slot=bool(binding and binding.is_enabled),
         priority=binding.priority if binding is not None else None,
@@ -199,6 +205,7 @@ def bind_model_profile_endpoint(
             priority=payload.priority,
             weight=payload.weight,
             replace_existing=payload.replace_existing,
+            replace_profile_id=payload.replace_profile_id,
         )
     )
 
@@ -250,6 +257,7 @@ def create_v1_model_profile_endpoint(
         display_name=payload.display_name,
         model_version=payload.model_version,
         provider_config=payload.provider_config,
+        parameter_config=payload.parameter_config,
         enable_in_slot=payload.enable_in_slot,
         replace_existing=payload.replace_existing,
         priority=payload.priority,
@@ -277,6 +285,7 @@ def update_v1_model_profile_endpoint(
         display_name=payload.display_name,
         model_version=payload.model_version,
         provider_config=payload.provider_config,
+        parameter_config=payload.parameter_config,
     )
     binding = next(
         (item for item_profile, item in list_v1_model_profiles(db) if item_profile.id == profile.id),

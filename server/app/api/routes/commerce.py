@@ -490,7 +490,13 @@ def create_production_action_endpoint(
     db: Session = Depends(get_db),
 ) -> CommerceWorkflowRunResponse:
     run, created = create_production_run(
-        db, story_run_id=story_run_id, operation=operation, target_id=payload.target_id, retry=payload.retry
+        db,
+        story_run_id=story_run_id,
+        operation=operation,
+        target_id=payload.target_id,
+        retry=payload.retry,
+        parameter_preset=payload.parameter_preset,
+        parameter_overrides=payload.parameter_overrides,
     )
     if created:
         _dispatch_or_service_unavailable(background_tasks, run)

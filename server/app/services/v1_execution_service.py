@@ -86,6 +86,7 @@ from app.services.v1_model_adapter_service import (
 )
 from app.services.storage import LocalImageReference, local_asset_storage
 from app.services.provider_config_security import redact_provider_config
+from app.services.model_parameter_service import profile_parameter_config, resolve_effective_model_parameters
 from app.services.sensitive_data import sanitize_error_summary
 from app.services.final_video_service import _compose_real_video
 from app.services.workflow_service import get_project_or_404
@@ -717,7 +718,7 @@ def _profile_snapshot(profile_id: str, db: Session) -> dict[str, Any]:
     profile = db.get(ModelProfile, profile_id)
     if profile is None:
         raise RuntimeError("模型槽位绑定引用的模型配置不存在")
-    return {
+    snapshot = {
         "profile_id": profile.id,
         "adapter_key": profile.adapter_key or profile.provider_key,
         "provider_key": profile.provider_key,
@@ -727,6 +728,12 @@ def _profile_snapshot(profile_id: str, db: Session) -> dict[str, Any]:
         "version": profile.version,
         "provider_config": redact_provider_config(profile.provider_config),
     }
+    parameter_config, _ = profile_parameter_config(
+        snapshot["adapter_key"], snapshot["provider_config"], profile.parameter_config
+    )
+    snapshot["parameter_config"] = parameter_config
+    snapshot["parameter_resolution"] = resolve_effective_model_parameters(snapshot, preset="standard")
+    return snapshot
 
 
 def _active_prompt(db: Session, task_type: str) -> PromptTemplate:
@@ -801,6 +808,12 @@ def _invoke(
     safe_profile_snapshot = deepcopy(profile_snapshot)
     safe_profile_snapshot["provider_config"] = redact_provider_config(profile_snapshot.get("provider_config"))
     prompt = _frozen_prompt(run, task_type)
+    safe_input_snapshot = deepcopy(input_snapshot)
+    # 与 WorkflowRun 的绑定快照保持同一份可追溯参数事实。调用审计不能通过
+    # “当前 Profile”反推参数，否则模型中心切换后会失去历史可复现性。
+    safe_input_snapshot["generation_parameters"] = deepcopy(
+        profile_snapshot.get("parameter_resolution") or {}
+    )
     invocation = ModelInvocation(
         project_id=run.project_id,
         workflow_run_id=run.id,
@@ -811,7 +824,7 @@ def _invoke(
         task_type=task_type,
         model_profile_snapshot=safe_profile_snapshot,
         prompt_snapshot=deepcopy(prompt),
-        input_snapshot=deepcopy(input_snapshot),
+        input_snapshot=safe_input_snapshot,
         idempotency_key=idempotency_key,
         status=RunStatus.RUNNING,
     )

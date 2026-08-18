@@ -11,7 +11,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
-from time import sleep
+from time import perf_counter, sleep
 from typing import Any, Protocol
 
 from fastapi import HTTPException, status
@@ -31,6 +31,7 @@ from app.models import (
     CommerceWorkflowLink,
     CommerceWorkflowStep,
     DialogueLine,
+    ModelInvocation,
     ModelProfile,
     ModelSlot,
     OutlineVersionStatus,
@@ -83,6 +84,7 @@ from app.services.commerce_domain_service import (
 )
 from app.services.v1_configuration_service import enabled_profiles_for_slot
 from app.services.v1_model_adapter_service import assert_supported, generate_structured_text, is_mock_adapter
+from app.services.model_parameter_service import profile_parameter_config, resolve_effective_model_parameters
 from app.services.provider_config_security import redact_provider_config
 
 
@@ -161,7 +163,13 @@ def _require_not_terminal(story_run: StoryRun) -> None:
         _error("已完成或已取消的 StoryRun 不能再修改")
 
 
-def _profile_snapshot(db: Session, binding, slot_key: str) -> dict[str, Any]:
+def _profile_snapshot(
+    db: Session,
+    binding,
+    slot_key: str,
+    *,
+    execution_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     # ModelSlotProfileBinding 保持轻量外键模型，没有 ORM relationship；在冻结点显式
     # 读取后将完整快照写进 WorkflowRun，Worker 后续不再回查。
     profile = db.get(ModelProfile, binding.model_profile_id)
@@ -170,6 +178,27 @@ def _profile_snapshot(db: Session, binding, slot_key: str) -> dict[str, Any]:
     slot = db.get(ModelSlot, binding.slot_id)
     if slot is None:
         _error("模型槽位绑定引用的槽位不存在", status.HTTP_503_SERVICE_UNAVAILABLE)
+    profile_snapshot = {
+        "profile_id": profile.id,
+        "adapter_key": profile.adapter_key or profile.provider_key,
+        "provider_key": profile.provider_key,
+        "model_key": profile.model_key,
+        "model_version": profile.model_version or profile.model_key,
+        "display_name": profile.display_name or profile.model_key,
+        "version": profile.version,
+        "provider_config": redact_provider_config(profile.provider_config),
+    }
+    parameter_config, _ = profile_parameter_config(
+        profile_snapshot["adapter_key"],
+        profile_snapshot["provider_config"],
+        profile.parameter_config,
+    )
+    profile_snapshot["parameter_config"] = parameter_config
+    profile_snapshot["parameter_resolution"] = resolve_effective_model_parameters(
+        profile_snapshot,
+        preset="standard",
+        execution_context=execution_context,
+    )
     return {
         "position": binding.priority,
         "slot_id": binding.slot_id,
@@ -182,16 +211,7 @@ def _profile_snapshot(db: Session, binding, slot_key: str) -> dict[str, Any]:
             "description": slot.description,
         },
         "model_profile_id": profile.id,
-        "profile_snapshot": {
-            "profile_id": profile.id,
-            "adapter_key": profile.adapter_key or profile.provider_key,
-            "provider_key": profile.provider_key,
-            "model_key": profile.model_key,
-            "model_version": profile.model_version or profile.model_key,
-            "display_name": profile.display_name or profile.model_key,
-            "version": profile.version,
-            "provider_config": redact_provider_config(profile.provider_config),
-        },
+        "profile_snapshot": profile_snapshot,
         # Adapter 是业务能力到供应商协议的唯一边界，必须随任务冻结，不能仅靠
         # 后续的 profile.adapter_key 再推导。
         "adapter_snapshot": {
@@ -214,7 +234,15 @@ def _freeze_execution_snapshot(db: Session, story_run: StoryRun, stage: StoryRun
         raw_bindings = enabled_profiles_for_slot(db, slot_key)
         if not raw_bindings:
             _error(f"模型槽位 {slot_key} 没有启用的模型配置", status.HTTP_503_SERVICE_UNAVAILABLE)
-        bindings = [_profile_snapshot(db, binding, slot_key) for binding in raw_bindings]
+        bindings = [
+            _profile_snapshot(
+                db,
+                binding,
+                slot_key,
+                execution_context={"operation": stage.value},
+            )
+            for binding in raw_bindings
+        ]
         active_prompt = db.scalars(
             select(PromptTemplate)
             .where(PromptTemplate.task_type == task_type, PromptTemplate.status == PromptTemplateStatus.ACTIVE)
@@ -1342,6 +1370,7 @@ class MockCommerceNodeExecutor:
         if not all(isinstance(item, dict) for item in (product, script, idea)):
             raise RuntimeError("大纲节点缺少冻结脚本、商品或创意")
         content = idea.get("content") if isinstance(idea.get("content"), dict) else {}
+        invocation: ModelInvocation | None = None
         if _is_mock(context):
             outline_payload = {
                 "title": str(content.get("title") or "带货短剧大纲"),
@@ -1364,21 +1393,71 @@ class MockCommerceNodeExecutor:
             prompt = prompts.get("STORY_GENERATE") or {}
             if not isinstance(profile, dict) or not isinstance(prompt, dict):
                 raise RuntimeError("大纲节点冻结模型或 Prompt 无效")
-            assert_supported(profile, "STORY_GENERATE")
-            outline_payload = generate_structured_text(
-                profile,
-                task_type="STORY_GENERATE",
-                system_instruction=(
-                    f"{str(prompt.get('content') or '').strip()}\n\n"
-                    "基于冻结脚本、冻结商品和已选创意生成原创故事大纲与结构化商品融入方案。"
-                    "禁止创造冻结商品分析中不存在的功效、包装、使用方法或宣传结论。"
-                ),
-                user_payload={"frozen_input": deepcopy(frozen_input)},
-                output_contract=(
-                    '{"title":"string","premise":"string","story_beats":[{"beat":"string","content":"string"}],'
-                    '"product_placement_strategy":{"method":"string"}}'
-                ),
+            invocation_key = f"{context.workflow_step.idempotency_key}:model:{items[0].get('model_profile_id')}"
+            invocation = context.db.scalar(
+                select(ModelInvocation).where(ModelInvocation.idempotency_key == invocation_key)
             )
+            if invocation is None:
+                invocation = ModelInvocation(
+                    project_id=context.story_run.project_id,
+                    workflow_run_id=context.workflow_run.id,
+                    workflow_step_id=context.workflow_step.id,
+                    model_slot_id=items[0].get("slot_id"),
+                    model_profile_id=items[0].get("model_profile_id"),
+                    prompt_template_id=prompt.get("id"),
+                    task_type="STORY_GENERATE",
+                    model_profile_snapshot=deepcopy(profile),
+                    prompt_snapshot=deepcopy(prompt),
+                    input_snapshot={
+                        "execution_mode": "commerce_workflow",
+                        "story_run_id": context.story_run.id,
+                        "workflow_step_id": context.workflow_step.id,
+                        "generation_parameters": deepcopy(profile.get("parameter_resolution") or {}),
+                    },
+                    idempotency_key=invocation_key,
+                    status=RunStatus.RUNNING,
+                )
+                context.db.add(invocation)
+                # 在真正调用前先落库审计。Worker 中断或供应商异常时，调用事实和冻结
+                # 参数仍可追溯；这不会重新读取模型中心，也不会产生第二次请求。
+                context.db.commit()
+            started = perf_counter()
+            try:
+                assert_supported(profile, "STORY_GENERATE")
+                outline_payload = generate_structured_text(
+                    profile,
+                    task_type="STORY_GENERATE",
+                    system_instruction=(
+                        f"{str(prompt.get('content') or '').strip()}\n\n"
+                        "基于冻结脚本、冻结商品和已选创意生成原创故事大纲与结构化商品融入方案。"
+                        "禁止创造冻结商品分析中不存在的功效、包装、使用方法或宣传结论。"
+                    ),
+                    user_payload={"frozen_input": deepcopy(frozen_input)},
+                    output_contract=(
+                        '{"title":"string","premise":"string","story_beats":[{"beat":"string","content":"string"}],'
+                        '"product_placement_strategy":{"method":"string"}}'
+                    ),
+                )
+            except Exception:
+                invocation.status = RunStatus.FAILED
+                invocation.error_code = "COMMERCE_WORKFLOW_MODEL_FAILED"
+                invocation.output_reference = {
+                    "failure": {
+                        "code": "COMMERCE_WORKFLOW_MODEL_FAILED",
+                        "message": "冻结模型调用未成功完成；请检查模型配置后重试",
+                    }
+                }
+                invocation.latency_ms = max(0, int((perf_counter() - started) * 1000))
+                invocation.finished_at = utcnow()
+                context.db.commit()
+                raise
+            # 模型调用和后续领域契约校验是两个可区分事实：模型正常返回但结构不合规
+            # 时，审计仍应如实标记模型调用成功，由 WorkflowStep 记录契约失败。
+            invocation.status = RunStatus.SUCCEEDED
+            invocation.output_reference = {"workflow_step_id": context.workflow_step.id, "result": "structured_response_received"}
+            invocation.latency_ms = max(0, int((perf_counter() - started) * 1000))
+            invocation.finished_at = utcnow()
+            context.db.commit()
         title = outline_payload.get("title") if isinstance(outline_payload, dict) else None
         premise = outline_payload.get("premise") if isinstance(outline_payload, dict) else None
         beats = outline_payload.get("story_beats") if isinstance(outline_payload, dict) else None

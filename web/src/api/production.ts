@@ -113,7 +113,7 @@ export function confirmCommerceStage(storyRunId: string, stage: string, payload:
 export function startCommerceProduction(
   storyRunId: string,
   operation: string,
-  payload: { target_id?: string; retry?: boolean } = {},
+  payload: { target_id?: string; retry?: boolean; parameter_preset?: 'preview' | 'standard' | 'high'; parameter_overrides?: Record<string, unknown> } = {},
 ): Promise<WorkflowRun> {
   return jsonPost<WorkflowRun>(`/commerce/story-runs/${storyRunId}/production/${encodeURIComponent(operation)}`, payload)
 }
